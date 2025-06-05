@@ -2,4 +2,5 @@ gunicorn==23.0.0
 packaging==25.0
 python-dotenv
 flask
+flask_cors
 requests

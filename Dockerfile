@@ -20,4 +20,4 @@ EXPOSE 8080
 # Command to run the Flask app using Gunicorn
 # 'app:app' means 'from app.py, run the Flask app instance named app'
 # '$PORT' ensures gunicorn listens on the port provided by Cloud Run
-# CMD ["gunicorn", "--bind", "0.0.0.0:$PORT", "app:app"]
+

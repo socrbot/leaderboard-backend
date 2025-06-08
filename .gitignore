@@ -2,3 +2,4 @@
 venv/
 __pycache__/
 *.pyc
+.alumni-golf-tournament-firebase-adminsdk-fbsvc-616b01659d.json

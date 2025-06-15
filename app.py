@@ -4,7 +4,9 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
 import time
+from datetime import datetime
 
+# --- Firebase Admin SDK Imports ---
 import firebase_admin
 from firebase_admin import credentials
 from firebase_admin import firestore
@@ -13,31 +15,46 @@ from firebase_admin import firestore
 load_dotenv()
 
 app = Flask(__name__)
+
+# --- CORS Configuration ---
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
+# --- Firebase Initialization ---
 FIREBASE_SERVICE_ACCOUNT_KEY_PATH = os.getenv("FIREBASE_SERVICE_ACCOUNT_KEY_PATH")
-if FIREBASE_SERVICE_ACCOUNT_KEY_PATH:
-    try:
-        cred = credentials.Certificate(FIREBASE_SERVICE_ACCOUNT_KEY_PATH)
-        firebase_admin.initialize_app(cred)
-        db = firestore.client()
-        app.logger.info("Firebase Admin SDK initialized successfully.")
-    except Exception as e:
-        app.logger.error(f"Error initializing Firebase Admin SDK: {e}")
-        db = None
-else:
-    app.logger.warning("FIREBASE_SERVICE_ACCOUNT_KEY_PATH not set, skipping Firebase init.")
+
+if not FIREBASE_SERVICE_ACCOUNT_KEY_PATH:
+    app.logger.critical("FIREBASE_SERVICE_ACCOUNT_KEY_PATH environment variable not set. Exiting.")
+    raise EnvironmentError("FIREBASE_SERVICE_ACCOUNT_KEY_PATH environment variable not set.")
+
+try:
+    cred = credentials.Certificate(FIREBASE_SERVICE_ACCOUNT_KEY_PATH)
+    firebase_admin.initialize_app(cred)
+    db = firestore.client()
+    app.logger.info("Firebase Admin SDK initialized successfully.")
+except Exception as e:
+    app.logger.error(f"Error initializing Firebase Admin SDK: {e}")
     db = None
 
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "dummy_rapidapi_key")
+# RapidAPI credentials for leaderboard
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
 RAPIDAPI_HOST = "live-golf-data.p.rapidapi.com"
 LEADERBOARD_API_ENDPOINT = "https://live-golf-data.p.rapidapi.com/leaderboard"
 
-SPORTSDATA_IO_API_KEY = os.getenv("SPORTSDATA_IO_API_KEY", "dummy_sportsdataio_key")
+# SportsData.io credentials for odds
+SPORTSDATA_IO_API_KEY = os.getenv("SPORTSDATA_IO_API_KEY")
 
+if not RAPIDAPI_KEY:
+    app.logger.warning("RAPIDAPI_KEY environment variable not set. Using dummy key.")
+    RAPIDAPI_KEY = "dummy_rapidapi_key"
+if not SPORTSDATA_IO_API_KEY:
+    app.logger.warning("SPORTSDATA_IO_API_KEY environment variable not set. Using dummy key.")
+    SPORTSDATA_IO_API_KEY = "dummy_sportsdataio_key"
+
+# --- Cache variables (for both APIs) ---
 CACHE = {}
 CACHE_TTL_SECONDS = 5 * 60
 
+# Helper function to calculate average odds (unchanged)
 def calculate_average_odds(player_odds_data):
     player_odds_map = {}
     for player_entry in player_odds_data:
@@ -64,6 +81,7 @@ def calculate_average_odds(player_odds_data):
     averaged_odds.sort(key=lambda x: x['averageOdds'] if x['averageOdds'] is not None else float('inf'))
     return averaged_odds
 
+# --- Cut Player Penalty Logic ---
 def parse_score_to_par(stp):
     if stp is None:
         return 0
@@ -201,6 +219,7 @@ def apply_cut_penalty_to_leaderboard(data, course_par=72):
 
     return data
 
+# --- Leaderboard API Route (with cut logic) ---
 @app.route('/api/leaderboard', methods=['GET'])
 def get_leaderboard():
     cache_key_params = request.args.to_dict()
@@ -214,10 +233,7 @@ def get_leaderboard():
     org_id = request.args.get('orgId', '1')
     tourn_id = request.args.get('tournId', '033')
     year = request.args.get('year', '2025')
-    round_id = request.args.get('roundId', None)
     rapidapi_url = f"{LEADERBOARD_API_ENDPOINT}?orgId={org_id}&tournId={tourn_id}&year={year}"
-    if round_id:
-        rapidapi_url += f"&roundId={round_id}"
     headers = {
         "X-RapidAPI-Key": RAPIDAPI_KEY,
         "X-RapidAPI-Host": RAPIDAPI_HOST
@@ -226,7 +242,6 @@ def get_leaderboard():
         response = requests.get(rapidapi_url, headers=headers)
         response.raise_for_status()
         data = response.json()
-        # --- Apply CUT penalty logic here ---
         data = apply_cut_penalty_to_leaderboard(data)
         CACHE[cache_key] = (data, time.time())
         return jsonify(data)
@@ -240,6 +255,278 @@ def get_leaderboard():
         app.logger.error("Failed to parse JSON response from RapidAPI (leaderboard)")
         return jsonify({"error": "Invalid JSON response from external API"}), 500
 
+# --- Player Odds API Route (unchanged) ---
+@app.route('/api/player_odds', methods=['GET'])
+def get_player_odds():
+    odds_id = request.args.get('oddsId')
+    if not odds_id:
+        app.logger.error("Missing 'oddsId' parameter for player odds API.")
+        return jsonify({"error": "Missing oddsId parameter"}), 400
+
+    try:
+        tournaments_ref = db.collection('tournaments').where('oddsId', '==', odds_id).limit(1).get()
+        tournament_doc = None
+        for doc in tournaments_ref:
+            tournament_doc = doc
+            break
+
+        if tournament_doc and tournament_doc.exists:
+            tournament_data = tournament_doc.to_dict()
+            if tournament_data.get('IsDraftStarted') and tournament_data.get('DraftLockedOdds'):
+                app.logger.info(f"Returning LOCKED draft odds for tournament with oddsId: {odds_id}")
+                return jsonify(tournament_data['DraftLockedOdds'])
+
+    except Exception as e:
+        app.logger.error(f"Error checking Firestore for locked odds for oddsId {odds_id}: {e}")
+
+    cache_key_params = request.args.to_dict()
+    cache_key = ('player_odds', tuple(sorted(cache_key_params.items())))
+
+    if cache_key in CACHE:
+        cached_data, timestamp = CACHE[cache_key]
+        if (time.time() - timestamp) < CACHE_TTL_SECONDS:
+            app.logger.info("Returning cached data for player odds (live).")
+            return jsonify(cached_data)
+
+    app.logger.info("Fetching fresh player odds from SportsData.io.")
+
+    dynamic_odds_api_endpoint = f"https://api.sportsdata.io/v3/golf/odds/json/TournamentOdds/{odds_id}"
+    app.logger.info(f"Fetching player odds from SportsData.io URL: {dynamic_odds_api_endpoint}")
+
+    headers = {
+        "Ocp-Apim-Subscription-Key": SPORTSDATA_IO_API_KEY
+    }
+    try:
+        response = requests.get(dynamic_odds_api_endpoint, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        if not data or not data.get("PlayerTournamentOdds"):
+            app.logger.warning("SportsData.io response missing PlayerTournamentOdds for oddsId: %s", odds_id)
+            return jsonify({"error": "Unexpected API response structure for player odds."}), 500
+
+        raw_player_odds = data["PlayerTournamentOdds"]
+        averaged_odds_list = calculate_average_odds(raw_player_odds)
+        CACHE[cache_key] = (averaged_odds_list, time.time())
+        return jsonify(averaged_odds_list)
+    except requests.exceptions.RequestException as e:
+        app.logger.error(f"Error fetching player odds from SportsData.io for oddsId {odds_id}: {e}")
+        details = str(e)
+        if e.response is not None:
+            details += f" | Status: {e.response.status_code} | Content: {e.response.text}"
+        return jsonify({"error": "Failed to fetch player odds data", "details": details}), 500
+    except ValueError:
+        app.logger.error("Failed to parse JSON response from SportsData.io (player odds) for oddsId %s", odds_id)
+        return jsonify({"error": "Invalid JSON response from external API"}), 500
+
+# --- Tournament Management API Routes (unchanged) ---
+@app.route('/api/tournaments', methods=['POST'])
+def create_tournament():
+    if not db:
+        app.logger.error("Firestore DB not initialized.")
+        return jsonify({"error": "Firestore not initialized"}), 500
+    try:
+        data = request.json
+        if not data or 'name' not in data:
+            return jsonify({"error": "Missing 'name' for new tournament"}), 400
+
+        tournament_name = data['name'].strip()
+        org_id = data.get('orgId', '').strip()
+        tourn_id = data.get('tournId', '').strip()
+        year = data.get('year', '').strip()
+        odds_id = data.get('oddsId', '').strip()
+
+        if not tournament_name or not org_id or not tourn_id or not year or not odds_id:
+            return jsonify({"error": "Missing tournament name, Org ID, Tourn ID, Year, or Odds ID in request data"}), 400
+
+        new_tournament_data = {
+            "name": tournament_name,
+            "orgId": org_id,
+            "tournId": tourn_id,
+            "year": year,
+            "oddsId": odds_id,
+            "teams": [],
+            "IsDraftStarted": False,
+            "DraftLockedOdds": [],
+            "createdAt": firestore.SERVER_TIMESTAMP
+        }
+        doc_ref = db.collection('tournaments').add(new_tournament_data)
+        return jsonify({"message": "Tournament created successfully", "id": doc_ref[1].id, "name": tournament_name}), 201
+    except Exception as e:
+        app.logger.error(f"Error creating tournament: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/tournaments', methods=['GET'])
+def get_tournaments():
+    if not db:
+        app.logger.error("Firestore DB not initialized.")
+        return jsonify({"error": "Firestore not initialized"}), 500
+    try:
+        tournaments_ref = db.collection('tournaments').order_by('createdAt').get()
+        tournaments_list = []
+        for doc in tournaments_ref:
+            tournament_data = doc.to_dict()
+            tournaments_list.append({
+                "id": doc.id,
+                "name": tournament_data.get("name", "Unnamed Tournament"),
+            })
+        return jsonify(tournaments_list), 200
+    except Exception as e:
+        app.logger.error(f"Error fetching tournaments: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/tournaments/<tournament_id>', methods=['GET'])
+def get_single_tournament(tournament_id):
+    if not db:
+        app.logger.error("Firestore DB not initialized.")
+        return jsonify({"error": "Firestore not initialized"}), 500
+
+    try:
+        doc_ref = db.collection('tournaments').document(tournament_id)
+        doc = doc_ref.get()
+
+        if not doc.exists:
+            return jsonify({"error": "Tournament not found"}), 404
+
+        tournament_data = doc.to_dict()
+        odds_id = tournament_data.get("oddsId")
+
+        is_in_progress_from_api = False
+        is_over_from_api = False
+        tournament_par = tournament_data.get("par", 71)
+
+        if odds_id:
+            sportsdata_io_tournament_odds_endpoint = f"https://api.sportsdata.io/v3/golf/odds/json/TournamentOdds/{odds_id}"
+            headers = {
+                "Ocp-Apim-Subscription-Key": SPORTSDATA_IO_API_KEY
+            }
+            try:
+                cache_key = ('sportsdata_tournament_details', odds_id)
+                if cache_key in CACHE:
+                    cached_odds_data, timestamp = CACHE[cache_key]
+                    if (time.time() - timestamp) < CACHE_TTL_SECONDS:
+                        app.logger.info(f"Returning cached SportsData.io tournament details for oddsId {odds_id}.")
+                        odds_api_data = cached_odds_data
+                    else:
+                        del CACHE[cache_key]
+                        app.logger.warning(f"Cached SportsData.io data for {odds_id} expired, refetching.")
+                        response = requests.get(sportsdata_io_tournament_odds_endpoint, headers=headers)
+                        response.raise_for_status()
+                        odds_api_data = response.json()
+                        CACHE[cache_key] = (odds_api_data, time.time())
+                else:
+                    app.logger.info(f"Fetching live SportsData.io tournament details for oddsId {odds_id}.")
+                    response = requests.get(sportsdata_io_tournament_odds_endpoint, headers=headers)
+                    response.raise_for_status()
+                    odds_api_data = response.json()
+                    CACHE[cache_key] = (odds_api_data, time.time())
+
+                if odds_api_data and odds_api_data.get("Tournament"):
+                    is_in_progress_from_api = odds_api_data["Tournament"].get("IsInProgress", False)
+                    is_over_from_api = odds_api_data["Tournament"].get("IsOver", False)
+                    tournament_par = odds_api_data["Tournament"].get("Par", tournament_par)
+                else:
+                    app.logger.warning(f"SportsData.io response missing 'Tournament' info for oddsId: {odds_id}")
+
+            except requests.exceptions.RequestException as e:
+                app.logger.error(f"Error fetching live tournament status from SportsData.io for oddsId {odds_id}: {e}")
+            except ValueError:
+                app.logger.error(f"Failed to parse JSON response from SportsData.io (tournament status) for oddsId {odds_id}")
+
+        show_leaderboard_on_frontend = is_in_progress_from_api or is_over_from_api
+
+        response_data = {
+            "id": doc.id,
+            **tournament_data,
+            "IsInProgress": show_leaderboard_on_frontend,
+            "IsOver": is_over_from_api,
+            "par": tournament_par,
+            "IsDraftStarted": tournament_data.get('IsDraftStarted', False)
+        }
+        return jsonify(response_data), 200
+
+    except Exception as e:
+        app.logger.error(f"Error fetching single tournament {tournament_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/tournaments/<tournament_id>/teams', methods=['PUT'])
+def update_tournament_teams(tournament_id):
+    if not db:
+        app.logger.error("Firestore DB not initialized.")
+        return jsonify({"error": "Firestore not initialized"}), 500
+    try:
+        data = request.json
+        if not data or 'teams' not in data or not isinstance(data['teams'], list):
+            return jsonify({"error": "Invalid data format. Expected JSON with a 'teams' array."}), 400
+        doc_ref = db.collection('tournaments').document(tournament_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return jsonify({"error": "Tournament not found"}), 404
+        doc_ref.update({"teams": data['teams']})
+        return jsonify({"message": f"Teams for tournament {tournament_id} updated successfully"}), 200
+    except Exception as e:
+        app.logger.error(f"Error updating teams for tournament {tournament_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/tournaments/<tournament_id>/start_draft', methods=['POST'])
+def start_draft(tournament_id):
+    if not db:
+        app.logger.error("Firestore DB not initialized.")
+        return jsonify({"error": "Firestore not initialized"}), 500
+
+    try:
+        doc_ref = db.collection('tournaments').document(tournament_id)
+        doc = doc_ref.get()
+
+        if not doc.exists:
+            return jsonify({"error": "Tournament not found"}), 404
+
+        tournament_data = doc.to_dict()
+        if tournament_data.get('IsDraftStarted'):
+            return jsonify({"message": "Draft has already started for this tournament."}), 409
+
+        odds_id = tournament_data.get("oddsId")
+        if not odds_id:
+            return jsonify({"error": "Tournament does not have an Odds ID configured."}), 400
+
+        app.logger.info(f"Fetching live player odds to lock in for tournament {tournament_id} (oddsId: {odds_id}).")
+        dynamic_odds_api_endpoint = f"https://api.sportsdata.io/v3/golf/odds/json/TournamentOdds/{odds_id}"
+        headers = {
+            "Ocp-Apim-Subscription-Key": SPORTSDATA_IO_API_KEY
+        }
+        try:
+            response = requests.get(dynamic_odds_api_endpoint, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            if not data or not data.get("PlayerTournamentOdds"):
+                app.logger.warning("SportsData.io response missing PlayerTournamentOdds when trying to lock odds for oddsId: %s", odds_id)
+                return jsonify({"error": "Could not retrieve live odds to lock in. API response missing player data."}), 500
+
+            raw_player_odds = data["PlayerTournamentOdds"]
+            averaged_odds_list = calculate_average_odds(raw_player_odds)
+
+            doc_ref.update({
+                "IsDraftStarted": True,
+                "DraftLockedOdds": averaged_odds_list,
+                "DraftStartedAt": firestore.SERVER_TIMESTAMP
+            })
+
+            return jsonify({"message": f"Draft started and odds locked for tournament {tournament_id}."}), 200
+
+        except requests.exceptions.RequestException as e:
+            app.logger.error(f"Error fetching live odds to lock in from SportsData.io for oddsId {odds_id}: {e}")
+            details = str(e)
+            if e.response is not None:
+                details += f" | Status: {e.response.status_code} | Content: {e.response.text}"
+            return jsonify({"error": f"Failed to fetch live odds to lock in: {details}"}), 500
+        except ValueError:
+            app.logger.error("Failed to parse JSON response from SportsData.io (locking odds) for oddsId %s", odds_id)
+            return jsonify({"error": "Invalid JSON response from external API when locking odds."}), 500
+
+    except Exception as e:
+        app.logger.error(f"Error starting draft for tournament {tournament_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# --- Flask App Run ---
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)

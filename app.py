@@ -4,6 +4,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
 import time
+import json
 from datetime import datetime
 
 # --- Firebase Admin SDK Imports ---
@@ -50,6 +51,7 @@ if not SPORTSDATA_IO_API_KEY:
     app.logger.warning("SPORTSDATA_IO_API_KEY environment variable not set. Using dummy key.")
     SPORTSDATA_IO_API_KEY = "dummy_sportsdataio_key"
 
+
 # --- Cache variables (for both APIs) ---
 CACHE = {}
 CACHE_TTL_SECONDS = 5 * 60
@@ -81,145 +83,7 @@ def calculate_average_odds(player_odds_data):
     averaged_odds.sort(key=lambda x: x['averageOdds'] if x['averageOdds'] is not None else float('inf'))
     return averaged_odds
 
-# --- Cut Player Penalty Logic ---
-def parse_score_to_par(stp):
-    if stp is None:
-        return 0
-    if isinstance(stp, int):
-        return stp
-    stp = str(stp).strip().upper()
-    if stp in ("E", ""):
-        return 0
-    try:
-        return int(stp)
-    except ValueError:
-        if stp.startswith("+"):
-            try:
-                return int(stp[1:])
-            except Exception:
-                return 0
-        elif stp.startswith("-"):
-            try:
-                return int(stp)
-            except Exception:
-                return 0
-    return 0
-
-def format_score_to_par(value):
-    if value == 0:
-        return "E"
-    elif value > 0:
-        return f"+{value}"
-    else:
-        return str(value)
-
-def apply_cut_penalty_to_leaderboard(data, course_par=72):
-    """
-    For each CUT player missing a round score, assign them:
-    - strokes: (max strokes in that round among all active players) + 1
-    - scoreToPar: (max scoreToPar in that round among all active players as int) + 1, formatted as string
-    Keeps other fields matching actives.
-    Handles BSON-like {"$numberInt": "N"} values.
-    """
-    if not data or "leaderboardRows" not in data:
-        return data
-
-    rows = data["leaderboardRows"]
-    num_rounds = 4
-
-    # Gather max strokes and max scoreToPar for each round, considering only active players
-    round_strokes = {rnd: [] for rnd in range(1, num_rounds + 1)}
-    round_scoretopar = {rnd: [] for rnd in range(1, num_rounds + 1)}
-    for player in rows:
-        status = str(player.get("status", "")).strip().lower()
-        if status != "active":
-            continue
-        for round_info in player.get("rounds", []):
-            round_id = round_info.get("roundId")
-            round_num = None
-            if isinstance(round_id, dict):
-                round_num = int(round_id.get("$numberInt"))
-            elif round_id is not None:
-                round_num = int(round_id)
-            if round_num is None or not (1 <= round_num <= num_rounds):
-                continue
-            # strokes
-            strokes = round_info.get("strokes")
-            strokes_val = None
-            if isinstance(strokes, dict):
-                strokes_val = strokes.get("$numberInt")
-                if strokes_val is not None:
-                    strokes_val = int(strokes_val)
-            elif strokes is not None:
-                try:
-                    strokes_val = int(strokes)
-                except Exception:
-                    strokes_val = None
-            if strokes_val is not None:
-                round_strokes[round_num].append(strokes_val)
-            # scoreToPar
-            stp_val = round_info.get("scoreToPar")
-            stp_int = parse_score_to_par(stp_val)
-            round_scoretopar[round_num].append(stp_int)
-
-    max_strokes = {rnd: (max(round_strokes[rnd]) if round_strokes[rnd] else 0) for rnd in range(1, num_rounds + 1)}
-    max_scoretopar = {rnd: (max(round_scoretopar[rnd]) if round_scoretopar[rnd] else 0) for rnd in range(1, num_rounds + 1)}
-
-    for player in rows:
-        if str(player.get("status", "")).strip().lower() != "cut":
-            continue
-        existing_rounds = set()
-        for r in player.get("rounds", []):
-            round_id = r.get("roundId")
-            round_num = None
-            if isinstance(round_id, dict):
-                round_num = int(round_id.get("$numberInt"))
-            elif round_id is not None:
-                round_num = int(round_id)
-            if round_num is not None:
-                existing_rounds.add(round_num)
-        # Use courseId and courseName from player's first round (or set defaults)
-        first_round = player.get("rounds", [{}])[0]
-        course_id = first_round.get("courseId", "UNKNOWN")
-        course_name = first_round.get("courseName", "UNKNOWN")
-        for rnd in range(1, num_rounds + 1):
-            if rnd not in existing_rounds and max_strokes[rnd] > 0:
-                penalty_strokes = max_strokes[rnd] + 1
-                penalty_scoretopar = max_scoretopar[rnd] + 1
-                player.setdefault("rounds", []).append({
-                    "courseId": course_id,
-                    "courseName": course_name,
-                    "roundId": {"$numberInt": str(rnd)},
-                    "strokes": {"$numberInt": str(penalty_strokes)},
-                    "scoreToPar": format_score_to_par(penalty_scoretopar),
-                    "isPenalty": True
-                })
-        # Sort rounds
-        player["rounds"] = sorted(
-            player.get("rounds", []),
-            key=lambda r: int(r.get("roundId", {}).get("$numberInt", r.get("roundId") or 0))
-        )
-        # Update totalStrokesFromCompletedRounds
-        total_strokes = 0
-        for r in player["rounds"]:
-            strokes = r.get("strokes")
-            strokes_val = None
-            if isinstance(strokes, dict):
-                strokes_val = strokes.get("$numberInt")
-                if strokes_val is not None:
-                    strokes_val = int(strokes_val)
-            elif strokes is not None:
-                try:
-                    strokes_val = int(strokes)
-                except Exception:
-                    strokes_val = None
-            if strokes_val is not None:
-                total_strokes += strokes_val
-        player["totalStrokesFromCompletedRounds"] = str(total_strokes)
-
-    return data
-
-# --- Leaderboard API Route (with cut logic) ---
+# --- Leaderboard API Route (unchanged) ---
 @app.route('/api/leaderboard', methods=['GET'])
 def get_leaderboard():
     cache_key_params = request.args.to_dict()
@@ -242,7 +106,6 @@ def get_leaderboard():
         response = requests.get(rapidapi_url, headers=headers)
         response.raise_for_status()
         data = response.json()
-        data = apply_cut_penalty_to_leaderboard(data)
         CACHE[cache_key] = (data, time.time())
         return jsonify(data)
     except requests.exceptions.RequestException as e:
@@ -255,7 +118,7 @@ def get_leaderboard():
         app.logger.error("Failed to parse JSON response from RapidAPI (leaderboard)")
         return jsonify({"error": "Invalid JSON response from external API"}), 500
 
-# --- Player Odds API Route (unchanged) ---
+# --- Player Odds API Route (MODIFIED) ---
 @app.route('/api/player_odds', methods=['GET'])
 def get_player_odds():
     odds_id = request.args.get('oddsId')
@@ -263,10 +126,12 @@ def get_player_odds():
         app.logger.error("Missing 'oddsId' parameter for player odds API.")
         return jsonify({"error": "Missing oddsId parameter"}), 400
 
+    # NEW: Check if the draft has started and locked odds are available in Firestore
     try:
+        # Find the tournament by oddsId (assuming oddsId is unique per tournament)
         tournaments_ref = db.collection('tournaments').where('oddsId', '==', odds_id).limit(1).get()
         tournament_doc = None
-        for doc in tournaments_ref:
+        for doc in tournaments_ref: # Iterate to get the single document
             tournament_doc = doc
             break
 
@@ -278,7 +143,9 @@ def get_player_odds():
 
     except Exception as e:
         app.logger.error(f"Error checking Firestore for locked odds for oddsId {odds_id}: {e}")
+        # Continue to fetch live if Firestore check fails
 
+    # Original logic: Fetch fresh player odds from SportsData.io if not locked
     cache_key_params = request.args.to_dict()
     cache_key = ('player_odds', tuple(sorted(cache_key_params.items())))
 
@@ -318,7 +185,8 @@ def get_player_odds():
         app.logger.error("Failed to parse JSON response from SportsData.io (player odds) for oddsId %s", odds_id)
         return jsonify({"error": "Invalid JSON response from external API"}), 500
 
-# --- Tournament Management API Routes (unchanged) ---
+# --- Tournament Management API Routes (MODIFIED) ---
+
 @app.route('/api/tournaments', methods=['POST'])
 def create_tournament():
     if not db:
@@ -345,8 +213,8 @@ def create_tournament():
             "year": year,
             "oddsId": odds_id,
             "teams": [],
-            "IsDraftStarted": False,
-            "DraftLockedOdds": [],
+            "IsDraftStarted": False, # NEW: Initialize IsDraftStarted to false
+            "DraftLockedOdds": [],   # NEW: Initialize empty array for locked odds
             "createdAt": firestore.SERVER_TIMESTAMP
         }
         doc_ref = db.collection('tournaments').add(new_tournament_data)
@@ -354,6 +222,7 @@ def create_tournament():
     except Exception as e:
         app.logger.error(f"Error creating tournament: {e}")
         return jsonify({"error": str(e)}), 500
+
 
 @app.route('/api/tournaments', methods=['GET'])
 def get_tournaments():
@@ -390,10 +259,12 @@ def get_single_tournament(tournament_id):
         tournament_data = doc.to_dict()
         odds_id = tournament_data.get("oddsId")
 
+        # Initialize default values for API-derived status
         is_in_progress_from_api = False
         is_over_from_api = False
         tournament_par = tournament_data.get("par", 71)
 
+        # Fetch IsInProgress and IsOver from SportsData.io Tournament Odds API
         if odds_id:
             sportsdata_io_tournament_odds_endpoint = f"https://api.sportsdata.io/v3/golf/odds/json/TournamentOdds/{odds_id}"
             headers = {
@@ -420,6 +291,7 @@ def get_single_tournament(tournament_id):
                     odds_api_data = response.json()
                     CACHE[cache_key] = (odds_api_data, time.time())
 
+
                 if odds_api_data and odds_api_data.get("Tournament"):
                     is_in_progress_from_api = odds_api_data["Tournament"].get("IsInProgress", False)
                     is_over_from_api = odds_api_data["Tournament"].get("IsOver", False)
@@ -432,15 +304,17 @@ def get_single_tournament(tournament_id):
             except ValueError:
                 app.logger.error(f"Failed to parse JSON response from SportsData.io (tournament status) for oddsId {odds_id}")
 
+        # Combine logic: Frontend should show leaderboard if in progress OR over
         show_leaderboard_on_frontend = is_in_progress_from_api or is_over_from_api
 
+        # Combine Firestore data with the live status and potential updated Par
         response_data = {
             "id": doc.id,
             **tournament_data,
             "IsInProgress": show_leaderboard_on_frontend,
             "IsOver": is_over_from_api,
             "par": tournament_par,
-            "IsDraftStarted": tournament_data.get('IsDraftStarted', False)
+            "IsDraftStarted": tournament_data.get('IsDraftStarted', False) # NEW: Return IsDraftStarted
         }
         return jsonify(response_data), 200
 
@@ -467,6 +341,7 @@ def update_tournament_teams(tournament_id):
         app.logger.error(f"Error updating teams for tournament {tournament_id}: {e}")
         return jsonify({"error": str(e)}), 500
 
+# NEW: API endpoint to start the draft and lock in odds
 @app.route('/api/tournaments/<tournament_id>/start_draft', methods=['POST'])
 def start_draft(tournament_id):
     if not db:
@@ -482,12 +357,13 @@ def start_draft(tournament_id):
 
         tournament_data = doc.to_dict()
         if tournament_data.get('IsDraftStarted'):
-            return jsonify({"message": "Draft has already started for this tournament."}), 409
+            return jsonify({"message": "Draft has already started for this tournament."}), 409 # Conflict
 
         odds_id = tournament_data.get("oddsId")
         if not odds_id:
             return jsonify({"error": "Tournament does not have an Odds ID configured."}), 400
 
+        # Fetch current live player odds
         app.logger.info(f"Fetching live player odds to lock in for tournament {tournament_id} (oddsId: {odds_id}).")
         dynamic_odds_api_endpoint = f"https://api.sportsdata.io/v3/golf/odds/json/TournamentOdds/{odds_id}"
         headers = {
@@ -504,10 +380,11 @@ def start_draft(tournament_id):
             raw_player_odds = data["PlayerTournamentOdds"]
             averaged_odds_list = calculate_average_odds(raw_player_odds)
 
+            # Store the locked odds and set the flag
             doc_ref.update({
                 "IsDraftStarted": True,
                 "DraftLockedOdds": averaged_odds_list,
-                "DraftStartedAt": firestore.SERVER_TIMESTAMP
+                "DraftStartedAt": firestore.SERVER_TIMESTAMP # Optional: Timestamp when draft started
             })
 
             return jsonify({"message": f"Draft started and odds locked for tournament {tournament_id}."}), 200

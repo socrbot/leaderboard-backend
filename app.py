@@ -4,9 +4,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
 import time
-from datetime import datetime
 
-# --- Firebase Admin SDK Imports ---
 import firebase_admin
 from firebase_admin import credentials
 from firebase_admin import firestore
@@ -17,7 +15,6 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# --- Firebase Initialization ---
 FIREBASE_SERVICE_ACCOUNT_KEY_PATH = os.getenv("FIREBASE_SERVICE_ACCOUNT_KEY_PATH")
 if FIREBASE_SERVICE_ACCOUNT_KEY_PATH:
     try:
@@ -32,15 +29,12 @@ else:
     app.logger.warning("FIREBASE_SERVICE_ACCOUNT_KEY_PATH not set, skipping Firebase init.")
     db = None
 
-# RapidAPI credentials for leaderboard
 RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "dummy_rapidapi_key")
 RAPIDAPI_HOST = "live-golf-data.p.rapidapi.com"
 LEADERBOARD_API_ENDPOINT = "https://live-golf-data.p.rapidapi.com/leaderboard"
 
-# SportsData.io credentials for odds
 SPORTSDATA_IO_API_KEY = os.getenv("SPORTSDATA_IO_API_KEY", "dummy_sportsdataio_key")
 
-# --- Cache variables (for both APIs) ---
 CACHE = {}
 CACHE_TTL_SECONDS = 5 * 60
 
@@ -70,91 +64,140 @@ def calculate_average_odds(player_odds_data):
     averaged_odds.sort(key=lambda x: x['averageOdds'] if x['averageOdds'] is not None else float('inf'))
     return averaged_odds
 
-def apply_cut_penalty_to_leaderboard(data):
+def parse_score_to_par(stp):
+    if stp is None:
+        return 0
+    if isinstance(stp, int):
+        return stp
+    stp = str(stp).strip().upper()
+    if stp in ("E", ""):
+        return 0
+    try:
+        return int(stp)
+    except ValueError:
+        if stp.startswith("+"):
+            try:
+                return int(stp[1:])
+            except Exception:
+                return 0
+        elif stp.startswith("-"):
+            try:
+                return int(stp)
+            except Exception:
+                return 0
+    return 0
+
+def format_score_to_par(value):
+    if value == 0:
+        return "E"
+    elif value > 0:
+        return f"+{value}"
+    else:
+        return str(value)
+
+def apply_cut_penalty_to_leaderboard(data, course_par=72):
     """
-    For each CUT player missing a round score, assign them
-    (max score in that round among all players) + 1 stroke,
-    but only for rounds that are complete (all non-cut/non-withdrawn/non-dq players have a score).
+    For each CUT player missing a round score, assign them:
+    - strokes: (max strokes in that round among all active players) + 1
+    - scoreToPar: (max scoreToPar in that round among all active players as int) + 1, formatted as string
+    Keeps other fields matching actives.
     Handles BSON-like {"$numberInt": "N"} values.
     """
     if not data or "leaderboardRows" not in data:
         return data
 
     rows = data["leaderboardRows"]
-    num_rounds = 4  # Adjust if needed
+    num_rounds = 4
 
-    # Step 1: Find which rounds are 'complete'
-    complete_rounds = set()
-    round_scores = {rnd: [] for rnd in range(1, num_rounds + 1)}
-    for rnd in range(1, num_rounds + 1):
-        all_scored = True
-        for player in rows:
-            status = player.get("status", "").strip().lower()
-            if status in ["cut", "wd", "dq", "withdrawn", "disqualified"]:
-                continue
-            found_score = False
-            for round_info in player.get("rounds", []):
-                # Handle both dict and int roundId
-                round_num = None
-                round_id = round_info.get("roundId")
-                if isinstance(round_id, dict):
-                    round_num = int(round_id.get("$numberInt"))
-                elif round_id is not None:
-                    round_num = int(round_id)
-                strokes = round_info.get("strokes")
-                if isinstance(strokes, dict):
-                    strokes = int(strokes.get("$numberInt"))
-                elif strokes is not None:
-                    strokes = int(strokes)
-                if round_num == rnd and strokes is not None:
-                    round_scores[rnd].append(strokes)
-                    found_score = True
-                    break
-            if not found_score:
-                all_scored = False
-                break
-        if all_scored and round_scores[rnd]:
-            complete_rounds.add(rnd)
-
-    # Step 2: Compute max scores per complete round
-    max_scores = {}
-    for rnd in complete_rounds:
-        scores = round_scores[rnd]
-        max_scores[rnd] = max(scores) if scores else None
-
-    # Step 3: For each CUT player, fill in missing scores for complete rounds with (max + 1)
+    # Gather max strokes and max scoreToPar for each round, considering only active players
+    round_strokes = {rnd: [] for rnd in range(1, num_rounds + 1)}
+    round_scoretopar = {rnd: [] for rnd in range(1, num_rounds + 1)}
     for player in rows:
-        if player.get("status", "").strip().lower() != "cut":
+        status = str(player.get("status", "")).strip().lower()
+        if status != "active":
             continue
-        existing_rounds = set()
-        for r in player.get("rounds", []):
-            round_id = r.get("roundId")
+        for round_info in player.get("rounds", []):
+            round_id = round_info.get("roundId")
+            round_num = None
             if isinstance(round_id, dict):
                 round_num = int(round_id.get("$numberInt"))
             elif round_id is not None:
                 round_num = int(round_id)
-            else:
+            if round_num is None or not (1 <= round_num <= num_rounds):
                 continue
-            strokes = r.get("strokes")
+            # strokes
+            strokes = round_info.get("strokes")
+            strokes_val = None
             if isinstance(strokes, dict):
-                strokes = int(strokes.get("$numberInt"))
+                strokes_val = strokes.get("$numberInt")
+                if strokes_val is not None:
+                    strokes_val = int(strokes_val)
             elif strokes is not None:
-                strokes = int(strokes)
-            else:
-                continue
-            existing_rounds.add(round_num)
-        for rnd in complete_rounds:
-            if rnd not in existing_rounds and max_scores[rnd] is not None:
-                penalty_score = max_scores[rnd] + 1
+                try:
+                    strokes_val = int(strokes)
+                except Exception:
+                    strokes_val = None
+            if strokes_val is not None:
+                round_strokes[round_num].append(strokes_val)
+            # scoreToPar
+            stp_val = round_info.get("scoreToPar")
+            stp_int = parse_score_to_par(stp_val)
+            round_scoretopar[round_num].append(stp_int)
+
+    max_strokes = {rnd: (max(round_strokes[rnd]) if round_strokes[rnd] else 0) for rnd in range(1, num_rounds + 1)}
+    max_scoretopar = {rnd: (max(round_scoretopar[rnd]) if round_scoretopar[rnd] else 0) for rnd in range(1, num_rounds + 1)}
+
+    for player in rows:
+        if str(player.get("status", "")).strip().lower() != "cut":
+            continue
+        existing_rounds = set()
+        for r in player.get("rounds", []):
+            round_id = r.get("roundId")
+            round_num = None
+            if isinstance(round_id, dict):
+                round_num = int(round_id.get("$numberInt"))
+            elif round_id is not None:
+                round_num = int(round_id)
+            if round_num is not None:
+                existing_rounds.add(round_num)
+        # Use courseId and courseName from player's first round (or set defaults)
+        first_round = player.get("rounds", [{}])[0]
+        course_id = first_round.get("courseId", "UNKNOWN")
+        course_name = first_round.get("courseName", "UNKNOWN")
+        for rnd in range(1, num_rounds + 1):
+            if rnd not in existing_rounds and max_strokes[rnd] > 0:
+                penalty_strokes = max_strokes[rnd] + 1
+                penalty_scoretopar = max_scoretopar[rnd] + 1
                 player.setdefault("rounds", []).append({
+                    "courseId": course_id,
+                    "courseName": course_name,
                     "roundId": {"$numberInt": str(rnd)},
-                    "strokes": {"$numberInt": str(penalty_score)},
+                    "strokes": {"$numberInt": str(penalty_strokes)},
+                    "scoreToPar": format_score_to_par(penalty_scoretopar),
                     "isPenalty": True
                 })
+        # Sort rounds
         player["rounds"] = sorted(
             player.get("rounds", []),
             key=lambda r: int(r.get("roundId", {}).get("$numberInt", r.get("roundId") or 0))
         )
+        # Update totalStrokesFromCompletedRounds
+        total_strokes = 0
+        for r in player["rounds"]:
+            strokes = r.get("strokes")
+            strokes_val = None
+            if isinstance(strokes, dict):
+                strokes_val = strokes.get("$numberInt")
+                if strokes_val is not None:
+                    strokes_val = int(strokes_val)
+            elif strokes is not None:
+                try:
+                    strokes_val = int(strokes)
+                except Exception:
+                    strokes_val = None
+            if strokes_val is not None:
+                total_strokes += strokes_val
+        player["totalStrokesFromCompletedRounds"] = str(total_strokes)
 
     return data
 
@@ -196,8 +239,6 @@ def get_leaderboard():
     except ValueError:
         app.logger.error("Failed to parse JSON response from RapidAPI (leaderboard)")
         return jsonify({"error": "Invalid JSON response from external API"}), 500
-
-# (Other endpoints related to odds, teams, etc. would go here; unchanged from your previous code.)
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))

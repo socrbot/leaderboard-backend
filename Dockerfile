@@ -21,3 +21,5 @@ EXPOSE 8080
 # 'app:app' means 'from app.py, run the Flask app instance named app'
 # '$PORT' ensures gunicorn listens on the port provided by Cloud Run
 
+#Cloud Run and most Docker-based platforms ignore Procfile by default. They only use the Dockerfile’s CMD or ENTRYPOINT.
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--threads", "8", "--log-level", "debug", "app:app"]

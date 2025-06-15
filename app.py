@@ -82,12 +82,12 @@ def calculate_average_odds(player_odds_data):
     averaged_odds.sort(key=lambda x: x['averageOdds'] if x['averageOdds'] is not None else float('inf'))
     return averaged_odds
 
-# --- CUT Penalty Transformation ---
+# --- CUT Penalty Transformation (round completion based) ---
 def apply_cut_penalty_to_leaderboard(data):
     """
     For each CUT player missing a round score, assign them
-    (max score in that round among all players) + 1 stroke.
-    Assumes 'leaderboardRows' is a list of players, each with 'status' and 'rounds'.
+    (max score in that round among all players) + 1 stroke,
+    but only for rounds that are complete (all non-cut/non-withdrawn/non-dq players have a score).
     """
     if not data or "leaderboardRows" not in data:
         return data
@@ -95,34 +95,43 @@ def apply_cut_penalty_to_leaderboard(data):
     rows = data["leaderboardRows"]
     num_rounds = 4  # Adjust if your tournament uses a different number
 
-    # Step 1: Gather all scores for each round
+    # Step 1: Find which rounds are "complete"
+    complete_rounds = set()
     round_scores = {rnd: [] for rnd in range(1, num_rounds + 1)}
-    for player in rows:
-        for round_info in player.get("rounds", []):
-            try:
+    for rnd in range(1, num_rounds + 1):
+        all_scored = True
+        for player in rows:
+            status = player.get("status", "").lower()
+            if status in ["cut", "wd", "dq", "withdrawn", "disqualified"]:
+                continue  # skip cut, wd, dq, etc.
+            # Check if player has a round entry for this round with a valid strokes value
+            found_score = False
+            for round_info in player.get("rounds", []):
                 round_num = int(round_info.get("roundId") or round_info.get("roundId", {}).get("$numberInt"))
                 strokes = round_info.get("strokes")
-                # Unwrap MongoDB style integer if present
                 if isinstance(strokes, dict):
                     strokes = int(strokes.get("$numberInt"))
                 elif strokes is not None:
                     strokes = int(strokes)
-                else:
-                    strokes = None
-                if strokes is not None:
-                    round_scores[round_num].append(strokes)
-            except Exception:
-                continue
+                if round_num == rnd and strokes is not None:
+                    round_scores[rnd].append(strokes)
+                    found_score = True
+                    break
+            if not found_score:
+                all_scored = False
+                break
+        if all_scored and round_scores[rnd]:
+            complete_rounds.add(rnd)
 
-    # Step 2: Compute max scores per round
+    # Step 2: Compute max scores per complete round
     max_scores = {}
-    for rnd in range(1, num_rounds + 1):
+    for rnd in complete_rounds:
         scores = round_scores[rnd]
         max_scores[rnd] = max(scores) if scores else None
 
-    # Step 3: For each CUT player, fill in missing round scores with (max + 1)
+    # Step 3: For each CUT player, fill in missing scores for complete rounds with (max + 1)
     for player in rows:
-        if player.get("status", "").upper() != "CUT":
+        if player.get("status", "").lower() != "cut":
             continue
         # Map of round numbers that already exist for this player
         existing_rounds = {
@@ -130,14 +139,13 @@ def apply_cut_penalty_to_leaderboard(data):
             for r in player.get("rounds", [])
             if r.get("strokes") is not None
         }
-        for rnd in range(1, num_rounds + 1):
+        for rnd in complete_rounds:
             if rnd not in existing_rounds and max_scores[rnd] is not None:
                 penalty_score = max_scores[rnd] + 1
-                # Append new round with penalty
                 player.setdefault("rounds", []).append({
                     "roundId": rnd,
                     "strokes": penalty_score,
-                    "isPenalty": True  # Optional: mark as penalty for frontend
+                    "isPenalty": True  # Mark as penalty for frontend
                 })
         # Sort rounds for display order
         player["rounds"] = sorted(
@@ -161,7 +169,10 @@ def get_leaderboard():
     org_id = request.args.get('orgId', '1')
     tourn_id = request.args.get('tournId', '033')
     year = request.args.get('year', '2025')
+    round_id = request.args.get('roundId', None)
     rapidapi_url = f"{LEADERBOARD_API_ENDPOINT}?orgId={org_id}&tournId={tourn_id}&year={year}"
+    if round_id:
+        rapidapi_url += f"&roundId={round_id}"
     headers = {
         "X-RapidAPI-Key": RAPIDAPI_KEY,
         "X-RapidAPI-Host": RAPIDAPI_HOST

@@ -314,7 +314,9 @@ def get_single_tournament(tournament_id):
             "IsInProgress": show_leaderboard_on_frontend,
             "IsOver": is_over_from_api,
             "par": tournament_par,
-            "IsDraftStarted": tournament_data.get('IsDraftStarted', False) # NEW: Return IsDraftStarted
+            "IsDraftStarted": tournament_data.get('IsDraftStarted', False),
+            "Tournament": odds_api_data.get("Tournament", {}),
+            "status": odds_api_data.get("Tournament", {}).get("Status", "")
         }
         return jsonify(response_data), 200
 
@@ -401,6 +403,105 @@ def start_draft(tournament_id):
 
     except Exception as e:
         app.logger.error(f"Error starting draft for tournament {tournament_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/tournaments/<tournament_id>/start_draft_flag', methods=['POST'])
+def start_draft_flag(tournament_id):
+    if not db:
+        app.logger.error("Firestore DB not initialized.")
+        return jsonify({"error": "Firestore not initialized"}), 500
+    try:
+        doc_ref = db.collection('tournaments').document(tournament_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return jsonify({"error": "Tournament not found"}), 404
+        tournament_data = doc.to_dict()
+        if tournament_data.get('IsDraftStarted'):
+            return jsonify({"message": "Draft has already started for this tournament."}), 409
+        doc_ref.update({
+            "IsDraftStarted": True,
+            "DraftStartedAt": firestore.SERVER_TIMESTAMP
+        })
+        return jsonify({"message": f"Draft started for tournament {tournament_id}."}), 200
+    except Exception as e:
+        app.logger.error(f"Error starting draft flag for tournament {tournament_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/tournaments/<tournament_id>/lock_draft_odds', methods=['POST'])
+def lock_draft_odds(tournament_id):
+    if not db:
+        app.logger.error("Firestore DB not initialized.")
+        return jsonify({"error": "Firestore not initialized"}), 500
+    try:
+        doc_ref = db.collection('tournaments').document(tournament_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return jsonify({"error": "Tournament not found"}), 404
+        tournament_data = doc.to_dict()
+        odds_id = tournament_data.get("oddsId")
+        if not odds_id:
+            return jsonify({"error": "Tournament does not have an Odds ID configured."}), 400
+        dynamic_odds_api_endpoint = f"https://api.sportsdata.io/v3/golf/odds/json/TournamentOdds/{odds_id}"
+        headers = {
+            "Ocp-Apim-Subscription-Key": SPORTSDATA_IO_API_KEY
+        }
+        response = requests.get(dynamic_odds_api_endpoint, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        if not data or not data.get("PlayerTournamentOdds"):
+            return jsonify({"error": "Could not retrieve live odds to lock in. API response missing player data."}), 500
+        raw_player_odds = data["PlayerTournamentOdds"]
+        averaged_odds_list = calculate_average_odds(raw_player_odds)
+        doc_ref.update({
+            "DraftLockedOdds": averaged_odds_list,
+            "DraftOddsLockedAt": firestore.SERVER_TIMESTAMP
+        })
+        return jsonify({"message": f"Draft odds locked for tournament {tournament_id}."}), 200
+    except Exception as e:
+        app.logger.error(f"Error locking draft odds for tournament {tournament_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/tournaments/<tournament_id>/draft_status', methods=['GET'])
+def get_draft_status(tournament_id):
+    if not db:
+        app.logger.error("Firestore DB not initialized.")
+        return jsonify({"error": "Firestore not initialized"}), 500
+    try:
+        doc_ref = db.collection('tournaments').document(tournament_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return jsonify({"error": "Tournament not found"}), 404
+        tournament_data = doc.to_dict()
+        is_draft_started = tournament_data.get('IsDraftStarted', False)
+        draft_locked_odds = tournament_data.get('DraftLockedOdds', [])
+        is_draft_locked = bool(draft_locked_odds and len(draft_locked_odds) > 0)
+        is_draft_complete = tournament_data.get('IsDraftComplete', False)
+        return jsonify({
+            "IsDraftStarted": is_draft_started,
+            "IsDraftLocked": is_draft_locked,
+            "IsDraftComplete": is_draft_complete
+        }), 200
+    except Exception as e:
+        app.logger.error(f"Error fetching draft status for tournament {tournament_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/tournaments/<tournament_id>/complete_draft', methods=['POST'])
+def complete_draft(tournament_id):
+    if not db:
+        app.logger.error("Firestore DB not initialized.")
+        return jsonify({"error": "Firestore not initialized"}), 500
+    try:
+        doc_ref = db.collection('tournaments').document(tournament_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return jsonify({"error": "Tournament not found"}), 404
+        doc_ref.update({
+            "IsDraftComplete": True,
+            "DraftCompletedAt": firestore.SERVER_TIMESTAMP
+        })
+        return jsonify({"message": f"Draft marked complete for tournament {tournament_id}."}), 200
+    except Exception as e:
+        app.logger.error(f"Error marking draft complete for tournament {tournament_id}: {e}")
         return jsonify({"error": str(e)}), 500
 
 # --- Flask App Run ---

@@ -9,11 +9,10 @@ from datetime import datetime
 
 # --- Firebase Admin SDK Imports ---
 import firebase_admin
-from firebase_admin import credentials
-from firebase_admin import firestore
+from firebase_admin import credentials, firestore
 
 # Load environment variables from .env file
-load_dotenv()
+# load_dotenv()
 
 app = Flask(__name__)
 

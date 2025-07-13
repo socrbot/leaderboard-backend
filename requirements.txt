@@ -1,5 +1,7 @@
 Flask
 Flask-Cors
+Flask-Compress
+Flask-Caching
 requests
 python-dotenv
 firebase-admin

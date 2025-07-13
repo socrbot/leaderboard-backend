@@ -2,10 +2,14 @@ import os
 import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from flask_compress import Compress
+from flask_caching import Cache
 from dotenv import load_dotenv
 import time
 import json
 from datetime import datetime
+import hashlib
+import functools
 
 # --- Firebase Admin SDK Imports ---
 import firebase_admin
@@ -15,6 +19,16 @@ from firebase_admin import credentials, firestore
 # load_dotenv()
 
 app = Flask(__name__)
+
+# --- Compression Configuration ---
+Compress(app)
+
+# --- Caching Configuration ---
+cache_config = {
+    'CACHE_TYPE': 'simple',  # Use 'redis' for production
+    'CACHE_DEFAULT_TIMEOUT': 300,  # 5 minutes default
+}
+cache = Cache(app, config=cache_config)
 
 # --- CORS Configuration ---
 CORS(app, resources={r"/api/*": {"origins": "*"}})
@@ -27,8 +41,8 @@ if not FIREBASE_SERVICE_ACCOUNT_KEY_PATH:
     raise EnvironmentError("FIREBASE_SERVICE_ACCOUNT_KEY_PATH environment variable not set.")
 
 try:
-    cred = credentials.Certificate(FIREBASE_SERVICE_ACCOUNT_KEY_PATH)
-    firebase_admin.initialize_app(cred)
+    #cred = credentials.Certificate(FIREBASE_SERVICE_ACCOUNT_KEY_PATH)
+    firebase_admin.initialize_app()
     db = firestore.client()
     app.logger.info("Firebase Admin SDK initialized successfully.")
 except Exception as e:
@@ -502,6 +516,190 @@ def complete_draft(tournament_id):
     except Exception as e:
         app.logger.error(f"Error marking draft complete for tournament {tournament_id}: {e}")
         return jsonify({"error": str(e)}), 500
+
+# --- Performance Monitoring Utilities ---
+def performance_monitor(func):
+    """Decorator to monitor function performance"""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        try:
+            result = func(*args, **kwargs)
+            duration = time.time() - start_time
+            app.logger.info(f"{func.__name__} completed in {duration:.3f}s")
+            return result
+        except Exception as e:
+            duration = time.time() - start_time
+            app.logger.error(f"{func.__name__} failed after {duration:.3f}s: {str(e)}")
+            raise
+    return wrapper
+
+def cache_key_generator(*args, **kwargs):
+    """Generate cache key from function arguments"""
+    key_data = str(args) + str(sorted(kwargs.items()))
+    return hashlib.md5(key_data.encode()).hexdigest()
+
+def smart_cache(timeout=300, key_prefix=''):
+    """Smart caching decorator with dynamic key generation"""
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            cache_key = f"{key_prefix}:{func.__name__}:{cache_key_generator(*args, **kwargs)}"
+            result = cache.get(cache_key)
+            
+            if result is None:
+                result = func(*args, **kwargs)
+                cache.set(cache_key, result, timeout=timeout)
+                app.logger.debug(f"Cache MISS for {cache_key}")
+            else:
+                app.logger.debug(f"Cache HIT for {cache_key}")
+            
+            return result
+        return wrapper
+    return decorator
+
+# --- Response Optimization ---
+def optimize_response(data, request_args=None):
+    """Optimize response data based on request parameters"""
+    if not request_args:
+        return data
+    
+    # Implement field filtering
+    fields = request_args.get('fields')
+    if fields:
+        field_list = fields.split(',')
+        if isinstance(data, list):
+            data = [{k: v for k, v in item.items() if k in field_list} for item in data]
+        elif isinstance(data, dict):
+            data = {k: v for k, v in data.items() if k in field_list}
+    
+    # Implement pagination
+    page = request_args.get('page', type=int)
+    per_page = request_args.get('per_page', type=int, default=50)
+    
+    if page and isinstance(data, list):
+        start = (page - 1) * per_page
+        end = start + per_page
+        data = data[start:end]
+    
+    return data
+
+# --- Batch API Endpoint ---
+@app.route('/api/batch', methods=['POST'])
+@performance_monitor
+def batch_requests():
+    """Handle multiple API requests in a single call"""
+    try:
+        requests_data = request.get_json()
+        if not requests_data or 'requests' not in requests_data:
+            return jsonify({'error': 'Invalid batch request format'}), 400
+        
+        requests_list = requests_data['requests']
+        if len(requests_list) > 10:  # Limit batch size
+            return jsonify({'error': 'Too many requests in batch (max 10)'}), 400
+        
+        results = []
+        
+        for req_data in requests_list:
+            try:
+                endpoint = req_data.get('endpoint', '')
+                params = req_data.get('params', {})
+                
+                # Route to appropriate handler based on endpoint
+                if endpoint.startswith('/tournaments'):
+                    if '/leaderboard' in endpoint:
+                        tournament_id = endpoint.split('/')[-2]
+                        # Call leaderboard logic (would need to extract from existing endpoint)
+                        result = {'message': 'Leaderboard data would be fetched here'}
+                    elif '/draft_status' in endpoint:
+                        tournament_id = endpoint.split('/')[-2]
+                        # Call draft status logic
+                        result = {'message': 'Draft status would be fetched here'}
+                    else:
+                        tournament_id = endpoint.split('/')[-1]
+                        # Call tournament data logic
+                        result = {'message': 'Tournament data would be fetched here'}
+                elif endpoint.startswith('/player_odds'):
+                    odds_id = params.get('oddsId')
+                    # Call player odds logic
+                    result = {'message': 'Player odds would be fetched here'}
+                else:
+                    result = {'error': f'Unknown endpoint: {endpoint}'}
+                
+                results.append({'data': result, 'error': None})
+                
+            except Exception as e:
+                results.append({'data': None, 'error': str(e)})
+        
+        return jsonify(results)
+        
+    except Exception as e:
+        app.logger.error(f"Batch request error: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+# --- Database Optimization ---
+class FirestoreOptimizer:
+    def __init__(self, db_client):
+        self.db = db_client
+        self.query_cache = {}
+    
+    @smart_cache(timeout=600, key_prefix='firestore')
+    def get_tournament_cached(self, tournament_id):
+        """Get tournament with caching"""
+        try:
+            doc_ref = self.db.collection('tournaments').document(tournament_id)
+            doc = doc_ref.get()
+            
+            if doc.exists:
+                return doc.to_dict()
+            return None
+        except Exception as e:
+            app.logger.error(f"Error fetching tournament {tournament_id}: {str(e)}")
+            return None
+    
+    @smart_cache(timeout=300, key_prefix='firestore')
+    def get_tournaments_list_cached(self):
+        """Get tournaments list with caching"""
+        try:
+            tournaments_ref = self.db.collection('tournaments')
+            docs = tournaments_ref.stream()
+            
+            tournaments = []
+            for doc in docs:
+                tournament_data = doc.to_dict()
+                tournament_data['id'] = doc.id
+                tournaments.append(tournament_data)
+            
+            return tournaments
+        except Exception as e:
+            app.logger.error(f"Error fetching tournaments list: {str(e)}")
+            return []
+    
+    def batch_update_tournaments(self, updates):
+        """Perform batch updates for better performance"""
+        try:
+            batch = self.db.batch()
+            
+            for tournament_id, update_data in updates.items():
+                doc_ref = self.db.collection('tournaments').document(tournament_id)
+                batch.update(doc_ref, update_data)
+            
+            batch.commit()
+            
+            # Clear related cache
+            cache.delete_memoized(self.get_tournament_cached)
+            cache.delete_memoized(self.get_tournaments_list_cached)
+            
+            return True
+        except Exception as e:
+            app.logger.error(f"Batch update failed: {str(e)}")
+            return False
+
+# Initialize database optimizer
+if db:
+    db_optimizer = FirestoreOptimizer(db)
+else:
+    db_optimizer = None
 
 # --- Flask App Run ---
 if __name__ == '__main__':

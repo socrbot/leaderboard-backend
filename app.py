@@ -27,8 +27,8 @@ if not FIREBASE_SERVICE_ACCOUNT_KEY_PATH:
     raise EnvironmentError("FIREBASE_SERVICE_ACCOUNT_KEY_PATH environment variable not set.")
 
 try:
-    cred = credentials.Certificate(FIREBASE_SERVICE_ACCOUNT_KEY_PATH)
-    firebase_admin.initialize_app(cred)
+    #cred = credentials.Certificate(FIREBASE_SERVICE_ACCOUNT_KEY_PATH)
+    firebase_admin.initialize_app()
     db = firestore.client()
     app.logger.info("Firebase Admin SDK initialized successfully.")
 except Exception as e:

@@ -227,6 +227,7 @@ def create_tournament():
             "oddsId": odds_id,
             "teams": [],
             "IsDraftStarted": False, # NEW: Initialize IsDraftStarted to false
+            "IsDraftComplete": False, # NEW: Initialize IsDraftComplete to false
             "DraftLockedOdds": [],   # NEW: Initialize empty array for locked odds
             "createdAt": firestore.SERVER_TIMESTAMP
         }
@@ -346,6 +347,26 @@ def update_tournament_teams(tournament_id):
         data = request.json
         if not data or 'teams' not in data or not isinstance(data['teams'], list):
             return jsonify({"error": "Invalid data format. Expected JSON with a 'teams' array."}), 400
+        
+        # Validate draft order uniqueness and range
+        teams = data['teams']
+        draft_orders = []
+        for team in teams:
+            if 'draftOrder' in team and team['draftOrder'] is not None:
+                draft_order = team['draftOrder']
+                if not isinstance(draft_order, int) or draft_order < 1:
+                    return jsonify({"error": f"Invalid draft order for team {team.get('name', 'Unknown')}: {draft_order}. Must be a positive integer."}), 400
+                if draft_order in draft_orders:
+                    return jsonify({"error": f"Duplicate draft order: {draft_order}. Each team must have a unique draft order."}), 400
+                draft_orders.append(draft_order)
+        
+        # Check for gaps in draft order sequence (optional strict validation)
+        if draft_orders:
+            draft_orders.sort()
+            expected_max = len([team for team in teams if team.get('draftOrder') is not None])
+            if draft_orders[-1] > expected_max:
+                app.logger.warning(f"Draft order gap detected. Highest order: {draft_orders[-1]}, Expected max: {expected_max}")
+        
         doc_ref = db.collection('tournaments').document(tournament_id)
         doc = doc_ref.get()
         if not doc.exists:
@@ -515,6 +536,47 @@ def complete_draft(tournament_id):
         return jsonify({"message": f"Draft marked complete for tournament {tournament_id}."}), 200
     except Exception as e:
         app.logger.error(f"Error marking draft complete for tournament {tournament_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# NEW: API endpoint to get draft order information
+@app.route('/api/tournaments/<tournament_id>/draft_order', methods=['GET'])
+def get_draft_order(tournament_id):
+    if not db:
+        app.logger.error("Firestore DB not initialized.")
+        return jsonify({"error": "Firestore not initialized"}), 500
+    try:
+        doc_ref = db.collection('tournaments').document(tournament_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return jsonify({"error": "Tournament not found"}), 404
+        
+        tournament_data = doc.to_dict()
+        teams = tournament_data.get('teams', [])
+        
+        # Extract draft order information
+        draft_order_info = []
+        for team in teams:
+            if 'draftOrder' in team and team['draftOrder'] is not None:
+                team_info = {
+                    'name': team.get('name', 'Unknown'),
+                    'draftOrder': team['draftOrder'],
+                    'playersCount': len(team.get('players', [])),
+                    'id': team.get('id')
+                }
+                draft_order_info.append(team_info)
+        
+        # Sort by draft order
+        draft_order_info.sort(key=lambda x: x['draftOrder'])
+        
+        return jsonify({
+            "draftOrder": draft_order_info,
+            "totalTeams": len(draft_order_info),
+            "isDraftStarted": tournament_data.get('IsDraftStarted', False),
+            "isDraftComplete": tournament_data.get('IsDraftComplete', False)
+        }), 200
+        
+    except Exception as e:
+        app.logger.error(f"Error fetching draft order for tournament {tournament_id}: {e}")
         return jsonify({"error": str(e)}), 500
 
 # --- Performance Monitoring Utilities ---

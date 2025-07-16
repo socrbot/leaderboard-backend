@@ -198,6 +198,181 @@ def get_player_odds():
         app.logger.error("Failed to parse JSON response from SportsData.io (player odds) for oddsId %s", odds_id)
         return jsonify({"error": "Invalid JSON response from external API"}), 500
 
+# --- Global Teams Management API Routes ---
+
+@app.route('/api/global_teams', methods=['GET'])
+def get_global_teams():
+    """Get all global teams"""
+    if not db:
+        app.logger.error("Firestore DB not initialized.")
+        return jsonify({"error": "Firestore not initialized"}), 500
+    try:
+        teams_ref = db.collection('global_teams').order_by('name').get()
+        teams_list = []
+        for doc in teams_ref:
+            team_data = doc.to_dict()
+            teams_list.append({
+                "id": doc.id,
+                **team_data
+            })
+        return jsonify(teams_list), 200
+    except Exception as e:
+        app.logger.error(f"Error fetching global teams: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/global_teams', methods=['POST'])
+def create_global_team():
+    """Create a new global team"""
+    if not db:
+        app.logger.error("Firestore DB not initialized.")
+        return jsonify({"error": "Firestore not initialized"}), 500
+    try:
+        data = request.json
+        if not data or 'name' not in data:
+            return jsonify({"error": "Missing 'name' for new team"}), 400
+
+        team_name = data['name'].strip()
+        if not team_name:
+            return jsonify({"error": "Team name cannot be empty"}), 400
+
+        # Check if team name already exists
+        existing_teams = db.collection('global_teams').where('name', '==', team_name).limit(1).get()
+        if len(list(existing_teams)) > 0:
+            return jsonify({"error": "Team name already exists"}), 409
+
+        new_team_data = {
+            "name": team_name,
+            "golferNames": data.get('golferNames', []),
+            "participatesInAnnual": data.get('participatesInAnnual', True),
+            "draftOrder": data.get('draftOrder', 0),
+            "createdAt": firestore.SERVER_TIMESTAMP
+        }
+        
+        doc_ref = db.collection('global_teams').add(new_team_data)
+        return jsonify({"message": "Global team created successfully", "id": doc_ref[1].id, "name": team_name}), 201
+    except Exception as e:
+        app.logger.error(f"Error creating global team: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/global_teams/<team_id>', methods=['PUT'])
+def update_global_team(team_id):
+    """Update a global team"""
+    if not db:
+        app.logger.error("Firestore DB not initialized.")
+        return jsonify({"error": "Firestore not initialized"}), 500
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+
+        doc_ref = db.collection('global_teams').document(team_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return jsonify({"error": "Team not found"}), 404
+
+        # Prepare update data
+        update_data = {}
+        if 'name' in data:
+            team_name = data['name'].strip()
+            if not team_name:
+                return jsonify({"error": "Team name cannot be empty"}), 400
+            # Check if new name conflicts with existing teams (excluding current team)
+            existing_teams = db.collection('global_teams').where('name', '==', team_name).get()
+            for existing_doc in existing_teams:
+                if existing_doc.id != team_id:
+                    return jsonify({"error": "Team name already exists"}), 409
+            update_data['name'] = team_name
+
+        if 'golferNames' in data:
+            update_data['golferNames'] = data['golferNames']
+        if 'participatesInAnnual' in data:
+            update_data['participatesInAnnual'] = data['participatesInAnnual']
+        if 'draftOrder' in data:
+            update_data['draftOrder'] = data['draftOrder']
+
+        update_data['updatedAt'] = firestore.SERVER_TIMESTAMP
+        doc_ref.update(update_data)
+        
+        return jsonify({"message": f"Global team {team_id} updated successfully"}), 200
+    except Exception as e:
+        app.logger.error(f"Error updating global team {team_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/global_teams/<team_id>', methods=['DELETE'])
+def delete_global_team(team_id):
+    """Delete a global team"""
+    if not db:
+        app.logger.error("Firestore DB not initialized.")
+        return jsonify({"error": "Firestore not initialized"}), 500
+    try:
+        doc_ref = db.collection('global_teams').document(team_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return jsonify({"error": "Team not found"}), 404
+
+        doc_ref.delete()
+        return jsonify({"message": f"Global team {team_id} deleted successfully"}), 200
+    except Exception as e:
+        app.logger.error(f"Error deleting global team {team_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# --- Tournament Team Assignment API Routes ---
+
+@app.route('/api/tournaments/<tournament_id>/team_assignments', methods=['GET'])
+def get_tournament_team_assignments(tournament_id):
+    """Get team assignments for a tournament"""
+    if not db:
+        app.logger.error("Firestore DB not initialized.")
+        return jsonify({"error": "Firestore not initialized"}), 500
+    try:
+        doc_ref = db.collection('tournaments').document(tournament_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return jsonify({"error": "Tournament not found"}), 404
+        
+        tournament_data = doc.to_dict()
+        team_assignments = tournament_data.get('teamAssignments', [])
+        return jsonify(team_assignments), 200
+    except Exception as e:
+        app.logger.error(f"Error fetching team assignments for tournament {tournament_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/tournaments/<tournament_id>/team_assignments', methods=['PUT'])
+def update_tournament_team_assignments(tournament_id):
+    """Update team assignments for a tournament (which global teams participate)"""
+    if not db:
+        app.logger.error("Firestore DB not initialized.")
+        return jsonify({"error": "Firestore not initialized"}), 500
+    try:
+        data = request.json
+        if not data or 'teamAssignments' not in data:
+            return jsonify({"error": "Missing 'teamAssignments' in request data"}), 400
+
+        doc_ref = db.collection('tournaments').document(tournament_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return jsonify({"error": "Tournament not found"}), 404
+
+        # Validate that all referenced team IDs exist in global_teams
+        team_assignments = data['teamAssignments']
+        if team_assignments:
+            team_ids = [assignment.get('globalTeamId') for assignment in team_assignments if assignment.get('globalTeamId')]
+            if team_ids:
+                existing_teams = db.collection('global_teams').where('__name__', 'in', team_ids).get()
+                existing_team_ids = {doc.id for doc in existing_teams}
+                missing_teams = set(team_ids) - existing_team_ids
+                if missing_teams:
+                    return jsonify({"error": f"Referenced teams not found: {list(missing_teams)}"}), 400
+
+        doc_ref.update({
+            "teamAssignments": team_assignments,
+            "updatedAt": firestore.SERVER_TIMESTAMP
+        })
+        return jsonify({"message": f"Team assignments for tournament {tournament_id} updated successfully"}), 200
+    except Exception as e:
+        app.logger.error(f"Error updating team assignments for tournament {tournament_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
 # --- Tournament Management API Routes (MODIFIED) ---
 
 @app.route('/api/tournaments', methods=['POST'])
@@ -225,7 +400,8 @@ def create_tournament():
             "tournId": tourn_id,
             "year": year,
             "oddsId": odds_id,
-            "teams": [],
+            "teams": [],  # Legacy field for backward compatibility
+            "teamAssignments": [],  # New field for global team references
             "IsDraftStarted": False, # NEW: Initialize IsDraftStarted to false
             "DraftLockedOdds": [],   # NEW: Initialize empty array for locked odds
             "createdAt": firestore.SERVER_TIMESTAMP
@@ -346,11 +522,23 @@ def update_tournament_teams(tournament_id):
         data = request.json
         if not data or 'teams' not in data or not isinstance(data['teams'], list):
             return jsonify({"error": "Invalid data format. Expected JSON with a 'teams' array."}), 400
+        
+        # Optional: Normalize teams data to ensure participatesInAnnual field exists
+        normalized_teams = []
+        for team in data['teams']:
+            if isinstance(team, dict):
+                # Ensure participatesInAnnual field exists (default to True for backward compatibility)
+                if 'participatesInAnnual' not in team:
+                    team['participatesInAnnual'] = True
+                normalized_teams.append(team)
+            else:
+                normalized_teams.append(team)  # Keep non-dict items as-is for flexibility
+        
         doc_ref = db.collection('tournaments').document(tournament_id)
         doc = doc_ref.get()
         if not doc.exists:
             return jsonify({"error": "Tournament not found"}), 404
-        doc_ref.update({"teams": data['teams']})
+        doc_ref.update({"teams": normalized_teams})
         return jsonify({"message": f"Teams for tournament {tournament_id} updated successfully"}), 200
     except Exception as e:
         app.logger.error(f"Error updating teams for tournament {tournament_id}: {e}")

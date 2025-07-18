@@ -1,9 +1,11 @@
-Flask
-Flask-Cors
-Flask-Compress
-Flask-Caching
-requests
-python-dotenv
-firebase-admin
-google-cloud-firestore
-gunicorn # NEW: Gunicorn is the WSGI server for production
+Flask==2.3.3
+Flask-Cors==4.0.0
+Flask-Compress==1.13
+Flask-Caching==2.1.0
+requests==2.31.0
+python-dotenv==1.0.0
+firebase-admin==6.2.0
+google-cloud-firestore==2.12.0
+gunicorn==21.2.0
+schedule==1.2.0
+APScheduler==3.10.4

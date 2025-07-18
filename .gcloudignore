@@ -1,9 +1,7 @@
-# Environment variables
-.env
-.env.local
-.env.production
+# .gcloudignore
+# This file tells gcloud which files to ignore when deploying to Cloud Run
 
-# Python
+# Python files
 __pycache__/
 *.py[cod]
 *$py.class
@@ -24,15 +22,13 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-MANIFEST
 
 # Virtual environments
 venv/
 env/
 ENV/
-.venv/
 
-# IDEs
+# IDE files
 .vscode/
 .idea/
 *.swp
@@ -42,25 +38,22 @@ ENV/
 .DS_Store
 Thumbs.db
 
-# Logs
+# Git
+.git/
+.gitignore
+
+# Development files
+.env.local
+.env.development
 *.log
-logs/
-
-# Firebase credentials
-*-firebase-adminsdk-*.json
-service-account*.json
-
-# Testing
 .pytest_cache/
 .coverage
 htmlcov/
-.tox/
 
-# Temporary files
-*.tmp
-*.temp
-.cache/
+# Documentation
+README.md
+docs/
+*.md
 
-# Local development
-sample
-test_*.py
+# Other
+.gcloudignore

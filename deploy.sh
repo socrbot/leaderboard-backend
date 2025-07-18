@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Google Cloud deployment script for Leaderboard Backend
-# Make sure you're authenticated with gcloud and have the correct project set
+# Optimized Golf Leaderboard Backend Deployment Script
+# This script deploys the backend to Google Cloud Run with optimizations
 
 set -e
 
@@ -11,7 +11,7 @@ REGION="us-east1"
 SERVICE_NAME="leaderboard-backend"
 IMAGE_NAME="gcr.io/$PROJECT_ID/$SERVICE_NAME"
 
-echo "🚀 Starting deployment to Google Cloud Run..."
+echo "🏌️ Starting optimized deployment to Google Cloud Run..."
 echo "Project: $PROJECT_ID"
 echo "Region: $REGION"
 echo "Service: $SERVICE_NAME"
@@ -23,6 +23,21 @@ if ! gcloud auth list --filter=status:ACTIVE --format="value(account)" | grep -q
     echo "Please run: gcloud auth login"
     exit 1
 fi
+
+# Check if required environment variables are set
+if [ -z "$RAPIDAPI_KEY" ]; then
+    echo "❌ Error: RAPIDAPI_KEY environment variable not set"
+    echo "Please set it with: export RAPIDAPI_KEY=your_key_here"
+    exit 1
+fi
+
+if [ -z "$SPORTSDATA_IO_API_KEY" ]; then
+    echo "❌ Error: SPORTSDATA_IO_API_KEY environment variable not set"
+    echo "Please set it with: export SPORTSDATA_IO_API_KEY=your_key_here"
+    exit 1
+fi
+
+echo "✅ Environment variables verified"
 
 # Enable required APIs
 echo "📋 Enabling required Google Cloud APIs..."

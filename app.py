@@ -112,34 +112,21 @@ def log_api_call():
 
 def check_rate_limit():
     """Check if we can make an API call within rate limits"""
-    with API_CALL_LOCK:
-        now = datetime.now()
-        # Clean up old entries
-        cutoff_daily = now - timedelta(hours=24)
-        cutoff_monthly = now - timedelta(days=30)
-        
-        daily_calls = len([call_time for call_time in API_CALL_LOG if call_time > cutoff_daily])
-        monthly_calls = len([call_time for call_time in API_CALL_LOG if call_time > cutoff_monthly])
-        
-        return daily_calls < MAX_DAILY_CALLS and monthly_calls < MAX_MONTHLY_CALLS
+    # TEMPORARY: Disable rate limiting due to container restart issues
+    # TODO: Move to persistent storage (Firestore) for production
+    return True
 
 def get_rate_limit_status():
     """Get current rate limit status"""
-    with API_CALL_LOCK:
-        now = datetime.now()
-        cutoff_daily = now - timedelta(hours=24)
-        cutoff_monthly = now - timedelta(days=30)
-        
-        daily_calls = len([call_time for call_time in API_CALL_LOG if call_time > cutoff_daily])
-        monthly_calls = len([call_time for call_time in API_CALL_LOG if call_time > cutoff_monthly])
-        
-        return {
-            'daily_calls': daily_calls,
-            'monthly_calls': monthly_calls,
-            'daily_limit': MAX_DAILY_CALLS,
-            'monthly_limit': MAX_MONTHLY_CALLS,
-            'can_make_call': daily_calls < MAX_DAILY_CALLS and monthly_calls < MAX_MONTHLY_CALLS
-        }
+    # TEMPORARY: Return permissive status since rate limiting is disabled
+    return {
+        'daily_calls': 0,
+        'monthly_calls': 0,
+        'daily_limit': MAX_DAILY_CALLS,
+        'monthly_limit': MAX_MONTHLY_CALLS,
+        'can_make_call': True,
+        'note': 'Rate limiting temporarily disabled due to container restart issues'
+    }
 
 # --- Tournament Status Detection Functions ---
 def get_tournament_status_from_api(api_response):

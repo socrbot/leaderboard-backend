@@ -146,11 +146,21 @@ def check_rate_limit():
     with API_CALL_LOCK:
         # If we don't have rate limit info yet, allow the call
         if RATE_LIMIT_INFO['remaining'] is None:
+            app.logger.info("No rate limit info available, allowing API call")
             return True
         
         # Check if we have remaining calls
         if RATE_LIMIT_INFO['remaining'] > 0:
+            app.logger.info(f"Rate limit check passed: {RATE_LIMIT_INFO['remaining']} calls remaining")
             return True
+        
+        # Even if we appear to be at limit, check if it's been more than an hour since last update
+        # This handles cases where the rate limit may have reset but we haven't made a call to know
+        if RATE_LIMIT_INFO['last_updated']:
+            time_since_update = datetime.now() - RATE_LIMIT_INFO['last_updated']
+            if time_since_update.total_seconds() > 3600:  # More than 1 hour
+                app.logger.info("Rate limit data is old (>1 hour), allowing call to refresh")
+                return True
         
         # Check if the rate limit has reset (if reset time provided)
         if RATE_LIMIT_INFO['reset'] and RATE_LIMIT_INFO['last_updated']:
@@ -164,12 +174,14 @@ def check_rate_limit():
                     reset_time = datetime.fromtimestamp(int(RATE_LIMIT_INFO['reset']))
                 
                 if datetime.now() > reset_time:
+                    app.logger.info("Rate limit has reset, allowing call")
                     return True
             except (ValueError, TypeError) as e:
                 app.logger.warning(f"Error parsing reset time: {e}")
-                # If we can't parse reset time, be conservative but allow some calls
+                # If we can't parse reset time, be permissive
                 return True
         
+        app.logger.warning(f"Rate limit exceeded: {RATE_LIMIT_INFO['remaining']} calls remaining")
         return False
 
 def get_rate_limit_status():
@@ -531,11 +543,11 @@ def calculate_team_scores(players, team_assignments, current_par):
     return list(teams_map.values())
 
 # --- Optimized RapidAPI Integration Functions ---
-def make_rapidapi_request(endpoint, params=None):
+def make_rapidapi_request(endpoint, params=None, bypass_rate_limit=False, request_source="api_call"):
     """Make a rate-limited request to RapidAPI using response headers for rate limiting"""
-    if not check_rate_limit():
+    if not bypass_rate_limit and not check_rate_limit():
         rate_status = get_rate_limit_status()
-        app.logger.warning(f"Rate limit exceeded: {rate_status}")
+        app.logger.warning(f"Rate limit exceeded for {request_source}: {rate_status}")
         return None, f"Rate limit exceeded. Remaining: {rate_status['rapidapi_remaining']}/{rate_status['rapidapi_limit']}"
     
     headers = {
@@ -545,15 +557,17 @@ def make_rapidapi_request(endpoint, params=None):
     
     try:
         log_api_call()  # For compatibility (now a no-op)
+        app.logger.info(f"Making RapidAPI request to {endpoint} (source: {request_source})")
         response = requests.get(f"{RAPIDAPI_BASE_URL}{endpoint}", headers=headers, params=params)
         
         # Update rate limit info from response headers
         update_rate_limit_info(response.headers)
         
         response.raise_for_status()
+        app.logger.info(f"RapidAPI request successful: {response.status_code}")
         return response.json(), None
     except requests.exceptions.RequestException as e:
-        error_msg = f"RapidAPI request failed: {e}"
+        error_msg = f"RapidAPI request failed for {request_source}: {e}"
         if hasattr(e, 'response') and e.response is not None:
             error_msg += f" | Status: {e.response.status_code} | Content: {e.response.text}"
             # Still try to update rate limit info even on error
@@ -620,7 +634,8 @@ def get_tournament_schedule():
     year = request.args.get('year', '2025')
     org_id = request.args.get('orgId', '1')
     
-    data, error = make_rapidapi_request('/schedule', {'year': year, 'orgId': org_id})
+    data, error = make_rapidapi_request('/schedule', {'year': year, 'orgId': org_id}, 
+                                       request_source="user_schedule_request")
     if error:
         return jsonify({"error": error}), 429 if "Rate limit" in error else 500
     
@@ -641,7 +656,7 @@ def get_tournament_info():
         'orgId': org_id,
         'tournId': tourn_id,
         'year': year
-    })
+    }, request_source="user_tournament_info_request")
     if error:
         return jsonify({"error": error}), 429 if "Rate limit" in error else 500
     
@@ -657,6 +672,7 @@ def get_optimized_leaderboard():
     round_id = request.args.get('roundId')  # Optional
     calculate_teams = request.args.get('calculateTeams', 'false').lower() == 'true'
     tournament_id = request.args.get('tournamentId')  # For team calculations
+    force_refresh = request.args.get('forceRefresh', 'false').lower() == 'true'
     
     # Create cache key
     cache_key_params = {
@@ -669,21 +685,32 @@ def get_optimized_leaderboard():
     }
     cache_key = ('optimized_leaderboard', tuple(sorted(cache_key_params.items())))
     
-    # Check cache
-    if cache_key in CACHE:
+    # Check cache unless force refresh is requested
+    if not force_refresh and cache_key in CACHE:
         cached_data, timestamp = CACHE[cache_key]
         if (time.time() - timestamp) < LEADERBOARD_CACHE_TTL:
             app.logger.info("Returning cached leaderboard data")
             return jsonify(cached_data)
+        else:
+            app.logger.info("Cache expired, fetching fresh data")
+    else:
+        app.logger.info("No cache data or force refresh requested, fetching fresh data")
     
     # Prepare RapidAPI request parameters
     params = {'orgId': org_id, 'tournId': tourn_id, 'year': year}
     if round_id:
         params['roundId'] = round_id
     
-    # Fetch leaderboard data
-    data, error = make_rapidapi_request('/leaderboard', params)
+    # Fetch leaderboard data - always try if user requested it
+    data, error = make_rapidapi_request('/leaderboard', params, 
+                                       bypass_rate_limit=False, 
+                                       request_source="user_leaderboard_request")
     if error:
+        # If we hit rate limits, try to return cached data even if expired
+        if "Rate limit" in error and cache_key in CACHE:
+            cached_data, timestamp = CACHE[cache_key]
+            app.logger.warning(f"Rate limited, returning expired cache data from {timestamp}")
+            return jsonify({**cached_data, 'fromExpiredCache': True, 'cacheWarning': 'Data may be outdated due to API rate limits'})
         return jsonify({"error": error}), 429 if "Rate limit" in error else 500
     
     # Add tournament status information
@@ -691,7 +718,9 @@ def get_optimized_leaderboard():
     enhanced_data = {
         **data,
         'tournamentStatus': tournament_status,
-        'isOfficiallyComplete': tournament_status['isOfficialComplete']
+        'isOfficiallyComplete': tournament_status['isOfficialComplete'],
+        'dataFreshness': 'live',
+        'fetchedAt': datetime.now().isoformat()
     }
     
     # Calculate team scores if requested and tournament_id provided
@@ -728,7 +757,8 @@ def get_optimized_leaderboard():
                         'teamCount': len(team_scores),
                         'playerCount': len(leaderboard_rows),
                         'calculatedAt': datetime.now().isoformat(),
-                        'fromStorage': False
+                        'fromStorage': False,
+                        'requestSource': 'user_request'
                     }
                     
                     enhanced_data['teamScores'] = team_scores
@@ -787,7 +817,8 @@ def get_tournament_leaderboard(tournament_id):
                 return jsonify(cached_data)
         
         # Fetch leaderboard data from API
-        data, error = make_rapidapi_request('/leaderboard', params)
+        data, error = make_rapidapi_request('/leaderboard', params, 
+                                           request_source=f"tournament_leaderboard_{tournament_id}")
         if error:
             return jsonify({"error": error}), 429 if "Rate limit" in error else 500
         

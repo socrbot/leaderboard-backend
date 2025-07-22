@@ -48,7 +48,13 @@ RAPIDAPI_BASE_URL = "https://live-golf-data.p.rapidapi.com"
 
 # --- API Rate Limiting Configuration ---
 API_CALL_LOCK = Lock()
-API_CALL_LOG = []  # Track API calls for rate limiting
+# Store the latest rate limit info from RapidAPI headers
+RATE_LIMIT_INFO = {
+    'remaining': None,
+    'limit': None,
+    'reset': None,
+    'last_updated': None
+}
 MAX_DAILY_CALLS = 20
 MAX_MONTHLY_CALLS = 200
 CALL_INTERVAL_MINUTES = 45  # 45 minutes between calls for optimal distribution
@@ -101,32 +107,103 @@ if not SPORTSDATA_IO_API_KEY:
 CACHE = {}
 
 # --- API Rate Limiting Functions ---
-def log_api_call():
-    """Log an API call for rate limiting tracking"""
+def update_rate_limit_info(response_headers):
+    """Update rate limit info from RapidAPI response headers"""
+    global RATE_LIMIT_INFO
+    
     with API_CALL_LOCK:
-        now = datetime.now()
-        API_CALL_LOG.append(now)
-        # Clean up old entries (older than 24 hours)
-        cutoff = now - timedelta(hours=24)
-        API_CALL_LOG[:] = [call_time for call_time in API_CALL_LOG if call_time > cutoff]
+        # Check for common RapidAPI rate limit headers
+        remaining = response_headers.get('X-RateLimit-Remaining') or \
+                   response_headers.get('x-ratelimit-remaining') or \
+                   response_headers.get('X-RapidAPI-RateLimit-Remaining')
+        
+        limit = response_headers.get('X-RateLimit-Limit') or \
+               response_headers.get('x-ratelimit-limit') or \
+               response_headers.get('X-RapidAPI-RateLimit-Limit')
+        
+        reset = response_headers.get('X-RateLimit-Reset') or \
+               response_headers.get('x-ratelimit-reset') or \
+               response_headers.get('X-RapidAPI-RateLimit-Reset')
+        
+        if remaining is not None:
+            RATE_LIMIT_INFO['remaining'] = int(remaining)
+        if limit is not None:
+            RATE_LIMIT_INFO['limit'] = int(limit)
+        if reset is not None:
+            RATE_LIMIT_INFO['reset'] = reset
+        RATE_LIMIT_INFO['last_updated'] = datetime.now()
+        
+        app.logger.info(f"Rate limit updated: {RATE_LIMIT_INFO}")
+
+def log_api_call():
+    """Log API call (now handled by update_rate_limit_info)"""
+    pass  # This is now handled by reading RapidAPI headers
 
 def check_rate_limit():
-    """Check if we can make an API call within rate limits"""
-    # TEMPORARY: Disable rate limiting due to container restart issues
-    # TODO: Move to persistent storage (Firestore) for production
-    return True
+    """Check if we can make an API call based on RapidAPI headers"""
+    global RATE_LIMIT_INFO
+    
+    with API_CALL_LOCK:
+        # If we don't have rate limit info yet, allow the call
+        if RATE_LIMIT_INFO['remaining'] is None:
+            return True
+        
+        # Check if we have remaining calls
+        if RATE_LIMIT_INFO['remaining'] > 0:
+            return True
+        
+        # Check if the rate limit has reset (if reset time provided)
+        if RATE_LIMIT_INFO['reset'] and RATE_LIMIT_INFO['last_updated']:
+            try:
+                # Handle different reset time formats
+                if isinstance(RATE_LIMIT_INFO['reset'], str):
+                    # If it's a timestamp string
+                    reset_time = datetime.fromtimestamp(int(RATE_LIMIT_INFO['reset']))
+                else:
+                    # If it's already a number
+                    reset_time = datetime.fromtimestamp(int(RATE_LIMIT_INFO['reset']))
+                
+                if datetime.now() > reset_time:
+                    return True
+            except (ValueError, TypeError) as e:
+                app.logger.warning(f"Error parsing reset time: {e}")
+                # If we can't parse reset time, be conservative but allow some calls
+                return True
+        
+        return False
 
 def get_rate_limit_status():
-    """Get current rate limit status"""
-    # TEMPORARY: Return permissive status since rate limiting is disabled
-    return {
-        'daily_calls': 0,
-        'monthly_calls': 0,
-        'daily_limit': MAX_DAILY_CALLS,
-        'monthly_limit': MAX_MONTHLY_CALLS,
-        'can_make_call': True,
-        'note': 'Rate limiting temporarily disabled due to container restart issues'
-    }
+    """Get current rate limit status from RapidAPI headers"""
+    global RATE_LIMIT_INFO
+    
+    with API_CALL_LOCK:
+        if RATE_LIMIT_INFO['remaining'] is None:
+            return {
+                'daily_calls': 0,
+                'monthly_calls': 0,
+                'daily_limit': MAX_DAILY_CALLS,
+                'monthly_limit': MAX_MONTHLY_CALLS,
+                'can_make_call': True,
+                'note': 'No rate limit data available yet - using RapidAPI headers',
+                'rapidapi_remaining': None,
+                'rapidapi_limit': None,
+                'rapidapi_reset': None
+            }
+        
+        can_make_call = check_rate_limit()
+        
+        return {
+            'daily_calls': max(0, (RATE_LIMIT_INFO['limit'] or 0) - (RATE_LIMIT_INFO['remaining'] or 0)),
+            'monthly_calls': 0,  # RapidAPI typically tracks daily/monthly separately
+            'daily_limit': RATE_LIMIT_INFO['limit'] or MAX_DAILY_CALLS,
+            'monthly_limit': MAX_MONTHLY_CALLS,
+            'can_make_call': can_make_call,
+            'note': 'Using RapidAPI rate limit headers',
+            'rapidapi_remaining': RATE_LIMIT_INFO['remaining'],
+            'rapidapi_limit': RATE_LIMIT_INFO['limit'],
+            'rapidapi_reset': RATE_LIMIT_INFO['reset'],
+            'last_updated': RATE_LIMIT_INFO['last_updated'].isoformat() if RATE_LIMIT_INFO['last_updated'] else None
+        }
 
 # --- Tournament Status Detection Functions ---
 def get_tournament_status_from_api(api_response):
@@ -455,11 +532,11 @@ def calculate_team_scores(players, team_assignments, current_par):
 
 # --- Optimized RapidAPI Integration Functions ---
 def make_rapidapi_request(endpoint, params=None):
-    """Make a rate-limited request to RapidAPI"""
+    """Make a rate-limited request to RapidAPI using response headers for rate limiting"""
     if not check_rate_limit():
         rate_status = get_rate_limit_status()
         app.logger.warning(f"Rate limit exceeded: {rate_status}")
-        return None, f"Rate limit exceeded. Daily: {rate_status['daily_calls']}/{rate_status['daily_limit']}, Monthly: {rate_status['monthly_calls']}/{rate_status['monthly_limit']}"
+        return None, f"Rate limit exceeded. Remaining: {rate_status['rapidapi_remaining']}/{rate_status['rapidapi_limit']}"
     
     headers = {
         "X-RapidAPI-Key": RAPIDAPI_KEY,
@@ -467,14 +544,21 @@ def make_rapidapi_request(endpoint, params=None):
     }
     
     try:
-        log_api_call()
+        log_api_call()  # For compatibility (now a no-op)
         response = requests.get(f"{RAPIDAPI_BASE_URL}{endpoint}", headers=headers, params=params)
+        
+        # Update rate limit info from response headers
+        update_rate_limit_info(response.headers)
+        
         response.raise_for_status()
         return response.json(), None
     except requests.exceptions.RequestException as e:
         error_msg = f"RapidAPI request failed: {e}"
         if hasattr(e, 'response') and e.response is not None:
             error_msg += f" | Status: {e.response.status_code} | Content: {e.response.text}"
+            # Still try to update rate limit info even on error
+            if hasattr(e, 'response') and e.response is not None:
+                update_rate_limit_info(e.response.headers)
         app.logger.error(error_msg)
         return None, error_msg
 
@@ -484,6 +568,50 @@ def make_rapidapi_request(endpoint, params=None):
 def get_api_rate_limit_status():
     """Get current API rate limit status"""
     return jsonify(get_rate_limit_status())
+
+@app.route('/api/debug_rate_limit', methods=['GET'])
+def debug_rate_limit():
+    """Debug endpoint to test RapidAPI rate limit headers"""
+    try:
+        headers = {
+            "X-RapidAPI-Key": RAPIDAPI_KEY,
+            "X-RapidAPI-Host": RAPIDAPI_HOST
+        }
+        
+        # Make a lightweight request to check headers
+        response = requests.get(f"{RAPIDAPI_BASE_URL}/schedule", 
+                              headers=headers, 
+                              params={'year': '2025', 'orgId': '1'},
+                              timeout=10)
+        
+        # Log all response headers for debugging
+        app.logger.info(f"All response headers: {dict(response.headers)}")
+        
+        # Update rate limit info
+        update_rate_limit_info(response.headers)
+        
+        return jsonify({
+            'success': True,
+            'status_code': response.status_code,
+            'all_headers': dict(response.headers),
+            'rate_limit_headers': {
+                'X-RateLimit-Remaining': response.headers.get('X-RateLimit-Remaining'),
+                'X-RateLimit-Limit': response.headers.get('X-RateLimit-Limit'),
+                'X-RateLimit-Reset': response.headers.get('X-RateLimit-Reset'),
+                'x-ratelimit-remaining': response.headers.get('x-ratelimit-remaining'),
+                'x-ratelimit-limit': response.headers.get('x-ratelimit-limit'),
+                'x-ratelimit-reset': response.headers.get('x-ratelimit-reset'),
+                'X-RapidAPI-RateLimit-Remaining': response.headers.get('X-RapidAPI-RateLimit-Remaining'),
+                'X-RapidAPI-RateLimit-Limit': response.headers.get('X-RapidAPI-RateLimit-Limit'),
+            },
+            'updated_rate_limit_info': RATE_LIMIT_INFO
+        })
+    except requests.exceptions.RequestException as e:
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'headers': dict(e.response.headers) if hasattr(e, 'response') and e.response else None
+        }), 500
 
 @app.route('/api/schedule', methods=['GET'])
 @cache.cached(timeout=TOURNAMENT_CACHE_TTL)

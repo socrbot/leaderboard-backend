@@ -43,6 +43,13 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # --- RapidAPI Configuration ---
 RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
+if RAPIDAPI_KEY:
+    # Strip any whitespace, newlines, or carriage returns that might be injected by Secret Manager
+    RAPIDAPI_KEY = RAPIDAPI_KEY.strip().replace('\r', '').replace('\n', '')
+    app.logger.info(f"RapidAPI key loaded and cleaned (length: {len(RAPIDAPI_KEY)})")
+else:
+    app.logger.warning("RAPIDAPI_KEY environment variable not found")
+    
 RAPIDAPI_HOST = "live-golf-data.p.rapidapi.com"
 RAPIDAPI_BASE_URL = "https://live-golf-data.p.rapidapi.com"
 
@@ -95,6 +102,12 @@ else:
 
 # SportsData.io credentials for odds
 SPORTSDATA_IO_API_KEY = os.getenv("SPORTSDATA_IO_API_KEY")
+if SPORTSDATA_IO_API_KEY:
+    # Strip any whitespace, newlines, or carriage returns that might be injected by Secret Manager
+    SPORTSDATA_IO_API_KEY = SPORTSDATA_IO_API_KEY.strip().replace('\r', '').replace('\n', '')
+    app.logger.info(f"SportsData.io API key loaded and cleaned (length: {len(SPORTSDATA_IO_API_KEY)})")
+else:
+    app.logger.warning("SPORTSDATA_IO_API_KEY environment variable not found")
 
 if not RAPIDAPI_KEY:
     app.logger.warning("RAPIDAPI_KEY environment variable not set. Using dummy key.")

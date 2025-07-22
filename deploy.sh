@@ -24,20 +24,7 @@ if ! gcloud auth list --filter=status:ACTIVE --format="value(account)" | grep -q
     exit 1
 fi
 
-# Check if required environment variables are set
-if [ -z "$RAPIDAPI_KEY" ]; then
-    echo "❌ Error: RAPIDAPI_KEY environment variable not set"
-    echo "Please set it with: export RAPIDAPI_KEY=your_key_here"
-    exit 1
-fi
-
-if [ -z "$SPORTSDATA_IO_API_KEY" ]; then
-    echo "❌ Error: SPORTSDATA_IO_API_KEY environment variable not set"
-    echo "Please set it with: export SPORTSDATA_IO_API_KEY=your_key_here"
-    exit 1
-fi
-
-echo "✅ Environment variables verified"
+echo "✅ Environment verified"
 
 # Enable required APIs
 echo "📋 Enabling required Google Cloud APIs..."
@@ -68,8 +55,7 @@ gcloud run deploy $SERVICE_NAME \
     --execution-environment gen2 \
     --ingress all \
     --service-account "628169335141-compute@developer.gserviceaccount.com" \
-    --set-env-vars "RAPIDAPI_KEY=ed588908c5mshd39b6ec2c9168a5p142e26jsnd2c9925b5e53,SPORTSDATA_IO_API_KEY=3281e31df787425a9da2bc39e7c2889b" \
-    --set-secrets "FIREBASE_SERVICE_ACCOUNT_KEY_PATH=FireBase_Admin:latest" \
+    --set-secrets "RAPIDAPI_KEY=rapidapi-key:latest,SPORTSDATA_IO_API_KEY=sportsdata-api-key:latest,FIREBASE_SERVICE_ACCOUNT_KEY_PATH=FireBase_Admin:latest" \
     --project=$PROJECT_ID
 
 # Get the service URL

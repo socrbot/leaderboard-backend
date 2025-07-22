@@ -1406,6 +1406,7 @@ def get_single_tournament(tournament_id):
         is_in_progress_from_api = False
         is_over_from_api = False
         tournament_par = tournament_data.get("par", 71)
+        odds_api_data = {}  # Initialize to prevent UnboundLocalError
 
         # Fetch IsInProgress and IsOver from SportsData.io Tournament Odds API
         if odds_id:

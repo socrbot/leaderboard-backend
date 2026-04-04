@@ -1646,9 +1646,53 @@ def create_tournament():
             "createdAt": firestore.SERVER_TIMESTAMP
         }
         doc_ref = db.collection('tournaments').add(new_tournament_data)
-        return jsonify({"message": "Tournament created successfully", "id": doc_ref[1].id, "name": tournament_name}), 201
+        tournament_id = doc_ref[1].id
+
+        # Auto-assign all global teams to the new tournament
+        try:
+            global_teams_ref = db.collection('global_teams').order_by('name').get()
+            team_assignments = []
+            legacy_teams = []
+            for team_doc in global_teams_ref:
+                team_data = team_doc.to_dict()
+                team_assignments.append({"globalTeamId": team_doc.id})
+                legacy_teams.append({
+                    "name": team_data.get("name", "Unknown"),
+                    "golferNames": team_data.get("golferNames", []),
+                    "participatesInAnnual": team_data.get("participatesInAnnual", True),
+                    "draftOrder": team_data.get("draftOrder", 0)
+                })
+            if team_assignments:
+                db.collection('tournaments').document(tournament_id).update({
+                    "teamAssignments": team_assignments,
+                    "teams": legacy_teams
+                })
+                app.logger.info(f"Auto-assigned {len(team_assignments)} global teams to tournament {tournament_id}")
+        except Exception as team_error:
+            app.logger.warning(f"Could not auto-assign global teams: {team_error}")
+
+        return jsonify({"message": "Tournament created successfully", "id": tournament_id, "name": tournament_name, "teamsAssigned": len(team_assignments) if 'team_assignments' in dir() else 0}), 201
     except Exception as e:
         app.logger.error(f"Error creating tournament: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/tournaments/years', methods=['GET'])
+def get_tournament_years():
+    """Get distinct years from all tournaments"""
+    if not db:
+        return jsonify({"error": "Firestore not initialized"}), 500
+    try:
+        tournaments_ref = db.collection('tournaments').get()
+        years = set()
+        for doc in tournaments_ref:
+            year = doc.to_dict().get('year', '')
+            if year:
+                years.add(year)
+        sorted_years = sorted(years, reverse=True)
+        return jsonify(sorted_years), 200
+    except Exception as e:
+        app.logger.error(f"Error fetching tournament years: {e}")
         return jsonify({"error": str(e)}), 500
 
 
@@ -1658,13 +1702,18 @@ def get_tournaments():
         app.logger.error("Firestore DB not initialized.")
         return jsonify({"error": "Firestore not initialized"}), 500
     try:
+        year_filter = request.args.get('year')
         tournaments_ref = db.collection('tournaments').order_by('createdAt').get()
         tournaments_list = []
         for doc in tournaments_ref:
             tournament_data = doc.to_dict()
+            tournament_year = tournament_data.get('year', '')
+            if year_filter and tournament_year != year_filter:
+                continue
             tournaments_list.append({
                 "id": doc.id,
                 "name": tournament_data.get("name", "Unnamed Tournament"),
+                "year": tournament_year,
             })
         return jsonify(tournaments_list), 200
     except Exception as e:

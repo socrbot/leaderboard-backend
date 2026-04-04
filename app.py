@@ -20,7 +20,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 
 # Load environment variables from .env file (only for local development)
-# load_dotenv()
+load_dotenv()
 
 app = Flask(__name__)
 
@@ -87,18 +87,26 @@ FIREBASE_SERVICE_ACCOUNT_KEY_PATH = os.getenv("FIREBASE_SERVICE_ACCOUNT_KEY_PATH
 
 # Initialize Firebase
 db = None
-if not FIREBASE_SERVICE_ACCOUNT_KEY_PATH:
-    app.logger.critical("FIREBASE_SERVICE_ACCOUNT_KEY_PATH environment variable not set. Exiting.")
-    raise EnvironmentError("FIREBASE_SERVICE_ACCOUNT_KEY_PATH environment variable not set.")
-else:
-    try:
-        #cred = credentials.Certificate(FIREBASE_SERVICE_ACCOUNT_KEY_PATH)
+try:
+    # Deployed environment: Use default credentials from the environment
+    if not FIREBASE_SERVICE_ACCOUNT_KEY_PATH:
+        app.logger.info("FIREBASE_SERVICE_ACCOUNT_KEY_PATH not set. Assuming deployed environment and using default credentials.")
         firebase_admin.initialize_app()
-        db = firestore.client()
-        app.logger.info("Firebase Admin SDK initialized successfully.")
-    except Exception as e:
-        app.logger.error(f"Error initializing Firebase Admin SDK: {e}")
-        raise
+        app.logger.info("Firebase Admin SDK initialized with default credentials.")
+    # Local environment: Use the service account key file
+    else:
+        app.logger.info(f"Found FIREBASE_SERVICE_ACCOUNT_KEY_PATH. Initializing with key file: {FIREBASE_SERVICE_ACCOUNT_KEY_PATH}")
+        cred = credentials.Certificate(FIREBASE_SERVICE_ACCOUNT_KEY_PATH)
+        firebase_admin.initialize_app(cred)
+        app.logger.info("Firebase Admin SDK initialized with service account key file.")
+    
+    db = firestore.client()
+
+except Exception as e:
+    app.logger.error(f"Error initializing Firebase Admin SDK: {e}")
+    # Depending on the desired behavior, you might want to raise the exception
+    # to prevent the app from running without a database connection.
+    raise
 
 # SportsData.io credentials for odds
 SPORTSDATA_IO_API_KEY = os.getenv("SPORTSDATA_IO_API_KEY")
@@ -445,6 +453,12 @@ def calculate_team_scores(players, team_assignments, current_par):
     """Calculate team scores with correct cut player penalty"""
     teams_map = {}
     
+    # Debug logging
+    app.logger.info(f"Team assignments structure: {team_assignments}")
+    app.logger.info(f"Number of teams: {len(team_assignments) if team_assignments else 0}")
+    if team_assignments:
+        app.logger.info(f"First team structure: {team_assignments[0]}")
+    
     # First, find the highest scoring non-cut player for penalty calculation
     highest_non_cut_score = None
     for player in players or []:
@@ -541,8 +555,15 @@ def calculate_team_scores(players, team_assignments, current_par):
                 'validScores': len([s for s in round_scores if s and s.get('score') is not None])
             }
         
-        teams_map[team_def.get('teamName', 'Unknown Team')] = {
-            'teamName': team_def.get('teamName', 'Unknown Team'),
+        # Get team name from various possible field names
+        team_name = (team_def.get('teamName') or 
+                    team_def.get('name') or 
+                    team_def.get('team_name') or 
+                    team_def.get('team') or 
+                    'Unknown Team')
+        
+        teams_map[team_name] = {
+            'teamName': team_name,
             'totalScore': team_total_score if valid_round_count > 0 else None,
             'players': team_players,
             'cutPlayersCount': cut_players_count,
@@ -958,10 +979,10 @@ def get_player_odds():
 
     app.logger.info("Fetching fresh player odds from SportsData.io.")
     dynamic_odds_api_endpoint = f"https://api.sportsdata.io/v3/golf/odds/json/TournamentOdds/{odds_id}"
-    headers = {"Ocp-Apim-Subscription-Key": SPORTSDATA_IO_API_KEY}
+    params = {"key": SPORTSDATA_IO_API_KEY}
     
     try:
-        response = requests.get(dynamic_odds_api_endpoint, headers=headers)
+        response = requests.get(dynamic_odds_api_endpoint, params=params)
         response.raise_for_status()
         data = response.json()
         if not data or not data.get("PlayerTournamentOdds"):
@@ -985,7 +1006,7 @@ def get_player_odds():
 # --- Annual Championship Calculation API ---
 @app.route('/api/annual_championship', methods=['GET'])
 @cache.cached(timeout=TOURNAMENT_CACHE_TTL)
-def get_annual_championship():
+def get_annual_championship_data():
     """Calculate annual championship standings from completed tournaments"""
     if not db:
         return jsonify({"error": "Firestore not initialized"}), 500
@@ -1054,9 +1075,7 @@ def get_annual_championship():
                         annual_standings[team_name] = {
                             'teamName': team_name,
                             'totalPoints': 0,
-                            'tournaments': [],
-                            'wins': 0,
-                            'top3': 0
+                            'tournaments': []
                         }
                     
                     annual_standings[team_name]['totalPoints'] += points
@@ -1067,11 +1086,6 @@ def get_annual_championship():
                         'points': points,
                         'score': team['totalScore']
                     })
-                    
-                    if position == 1:
-                        annual_standings[team_name]['wins'] += 1
-                    if position <= 3:
-                        annual_standings[team_name]['top3'] += 1
                     
                     tournament_info['teamResults'].append({
                         'teamName': team_name,
@@ -1099,6 +1113,35 @@ def get_annual_championship():
     except Exception as e:
         app.logger.error(f"Error calculating annual championship: {e}")
         return jsonify({"error": str(e)}), 500
+
+# --- Debug API Routes ---
+@app.route('/api/tournaments/<tournament_id>/debug', methods=['GET'])
+def debug_tournament_structure(tournament_id):
+    """Debug endpoint to see the actual tournament structure in Firestore"""
+    if not db:
+        return jsonify({"error": "Firestore not initialized"}), 500
+    
+    try:
+        # Get tournament details
+        doc_ref = db.collection('tournaments').document(tournament_id)
+        doc = doc_ref.get()
+        
+        if not doc.exists:
+            return jsonify({'error': 'Tournament not found'}), 404
+        
+        tournament_data = doc.to_dict()
+        
+        return jsonify({
+            'tournament_id': tournament_id,
+            'full_tournament_data': tournament_data,
+            'teams': tournament_data.get('teams', []),
+            'team_count': len(tournament_data.get('teams', [])),
+            'first_team_structure': tournament_data.get('teams', [{}])[0] if tournament_data.get('teams') else None
+        })
+        
+    except Exception as e:
+        app.logger.error(f"Error debugging tournament structure for {tournament_id}: {e}")
+        return jsonify({'error': str(e)}), 500
 
 # --- Stored Scores Management API ---
 @app.route('/api/tournaments/<tournament_id>/stored_scores', methods=['GET'])
@@ -1163,7 +1206,7 @@ def force_recalculate_scores(tournament_id):
         enhanced_data = {
             **leaderboard_data,
             'tournamentStatus': tournament_status,
-            'isOfficiallyComplete': tournament_status['isOfficialComplete']
+            'isOfficialComplete': tournament_status['isOfficialComplete']
         }
         
         # Calculate team scores
@@ -1242,6 +1285,7 @@ def create_global_team():
             "golferNames": data.get('golferNames', []),
             "participatesInAnnual": data.get('participatesInAnnual', True),
             "draftOrder": data.get('draftOrder', 0),
+            "preferredTournaments": data.get('preferredTournaments', []),
             "createdAt": firestore.SERVER_TIMESTAMP
         }
         
@@ -1286,6 +1330,17 @@ def update_global_team(team_id):
             update_data['participatesInAnnual'] = data['participatesInAnnual']
         if 'draftOrder' in data:
             update_data['draftOrder'] = data['draftOrder']
+        if 'preferredTournaments' in data:
+            preferred_tournaments = data['preferredTournaments']
+            # Validate that tournament IDs exist
+            if preferred_tournaments:
+                tournament_ids = list(set(preferred_tournaments))  # Remove duplicates
+                existing_tournaments = db.collection('tournaments').where('__name__', 'in', tournament_ids).get()
+                existing_ids = [doc.id for doc in existing_tournaments]
+                invalid_ids = [tid for tid in tournament_ids if tid not in existing_ids]
+                if invalid_ids:
+                    return jsonify({"error": f"Invalid tournament IDs: {invalid_ids}"}), 400
+            update_data['preferredTournaments'] = preferred_tournaments if preferred_tournaments else []
 
         update_data['updatedAt'] = firestore.SERVER_TIMESTAMP
         doc_ref.update(update_data)
@@ -1311,6 +1366,174 @@ def delete_global_team(team_id):
         return jsonify({"message": f"Global team {team_id} deleted successfully"}), 200
     except Exception as e:
         app.logger.error(f"Error deleting global team {team_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# --- Team Preferred Tournaments Management ---
+
+@app.route('/api/global_teams/<team_id>/preferred_tournaments', methods=['GET'])
+def get_team_preferred_tournaments(team_id):
+    """Get preferred tournaments for a specific team"""
+    if not db:
+        app.logger.error("Firestore DB not initialized.")
+        return jsonify({"error": "Firestore not initialized"}), 500
+    
+    try:
+        doc_ref = db.collection('global_teams').document(team_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return jsonify({"error": "Team not found"}), 404
+        
+        team_data = doc.to_dict()
+        preferred_tournaments = team_data.get('preferredTournaments', [])
+        
+        # Get tournament details for the preferred tournaments
+        tournament_details = []
+        if preferred_tournaments:
+            tournaments_ref = db.collection('tournaments').where('__name__', 'in', preferred_tournaments).get()
+            for tournament_doc in tournaments_ref:
+                tournament_data = tournament_doc.to_dict()
+                tournament_details.append({
+                    "id": tournament_doc.id,
+                    "name": tournament_data.get("name", "Unnamed Tournament"),
+                    "status": tournament_data.get("status", "Unknown")
+                })
+        
+        return jsonify({
+            "teamId": team_id,
+            "teamName": team_data.get("name"),
+            "preferredTournaments": preferred_tournaments,
+            "tournamentDetails": tournament_details
+        }), 200
+        
+    except Exception as e:
+        app.logger.error(f"Error fetching preferred tournaments for team {team_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/global_teams/<team_id>/preferred_tournaments', methods=['PUT'])
+def update_team_preferred_tournaments(team_id):
+    """Update preferred tournaments for a specific team"""
+    if not db:
+        app.logger.error("Firestore DB not initialized.")
+        return jsonify({"error": "Firestore not initialized"}), 500
+    
+    try:
+        data = request.json
+        if not data or 'preferredTournaments' not in data:
+            return jsonify({"error": "Missing 'preferredTournaments' field"}), 400
+        
+        doc_ref = db.collection('global_teams').document(team_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return jsonify({"error": "Team not found"}), 404
+        
+        preferred_tournaments = data['preferredTournaments']
+        
+        # Validate tournament IDs
+        if preferred_tournaments:
+            tournament_ids = list(set(preferred_tournaments))  # Remove duplicates
+            existing_tournaments = db.collection('tournaments').where('__name__', 'in', tournament_ids).get()
+            existing_ids = [doc.id for doc in existing_tournaments]
+            invalid_ids = [tid for tid in tournament_ids if tid not in existing_ids]
+            if invalid_ids:
+                return jsonify({"error": f"Invalid tournament IDs: {invalid_ids}"}), 400
+            preferred_tournaments = tournament_ids
+        
+        # Update the team document
+        doc_ref.update({
+            'preferredTournaments': preferred_tournaments,
+            'updatedAt': firestore.SERVER_TIMESTAMP
+        })
+        
+        return jsonify({
+            "message": f"Preferred tournaments updated for team {team_id}",
+            "preferredTournaments": preferred_tournaments
+        }), 200
+        
+    except Exception as e:
+        app.logger.error(f"Error updating preferred tournaments for team {team_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/global_teams/<team_id>/preferred_tournaments/<tournament_id>', methods=['POST'])
+def add_preferred_tournament(team_id, tournament_id):
+    """Add a tournament to team's preferred tournaments"""
+    if not db:
+        app.logger.error("Firestore DB not initialized.")
+        return jsonify({"error": "Firestore not initialized"}), 500
+    
+    try:
+        # Validate team exists
+        team_ref = db.collection('global_teams').document(team_id)
+        team_doc = team_ref.get()
+        if not team_doc.exists:
+            return jsonify({"error": "Team not found"}), 404
+        
+        # Validate tournament exists
+        tournament_ref = db.collection('tournaments').document(tournament_id)
+        tournament_doc = tournament_ref.get()
+        if not tournament_doc.exists:
+            return jsonify({"error": "Tournament not found"}), 404
+        
+        team_data = team_doc.to_dict()
+        preferred_tournaments = team_data.get('preferredTournaments', [])
+        
+        # Check if tournament is already in preferred list
+        if tournament_id in preferred_tournaments:
+            return jsonify({"message": "Tournament already in preferred list"}), 200
+        
+        # Add tournament to preferred list
+        preferred_tournaments.append(tournament_id)
+        team_ref.update({
+            'preferredTournaments': preferred_tournaments,
+            'updatedAt': firestore.SERVER_TIMESTAMP
+        })
+        
+        tournament_data = tournament_doc.to_dict()
+        return jsonify({
+            "message": f"Tournament '{tournament_data.get('name', 'Unknown')}' added to preferred tournaments",
+            "tournamentId": tournament_id,
+            "preferredTournaments": preferred_tournaments
+        }), 200
+        
+    except Exception as e:
+        app.logger.error(f"Error adding preferred tournament {tournament_id} to team {team_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/global_teams/<team_id>/preferred_tournaments/<tournament_id>', methods=['DELETE'])
+def remove_preferred_tournament(team_id, tournament_id):
+    """Remove a tournament from team's preferred tournaments"""
+    if not db:
+        app.logger.error("Firestore DB not initialized.")
+        return jsonify({"error": "Firestore not initialized"}), 500
+    
+    try:
+        # Validate team exists
+        team_ref = db.collection('global_teams').document(team_id)
+        team_doc = team_ref.get()
+        if not team_doc.exists:
+            return jsonify({"error": "Team not found"}), 404
+        
+        team_data = team_doc.to_dict()
+        preferred_tournaments = team_data.get('preferredTournaments', [])
+        
+        # Check if tournament is in preferred list
+        if tournament_id not in preferred_tournaments:
+            return jsonify({"message": "Tournament not in preferred list"}), 200
+        
+        # Remove tournament from preferred list
+        preferred_tournaments.remove(tournament_id)
+        team_ref.update({
+            'preferredTournaments': preferred_tournaments,
+            'updatedAt': firestore.SERVER_TIMESTAMP
+        })
+        
+        return jsonify({
+            "message": "Tournament removed from preferred tournaments",
+            "tournamentId": tournament_id,
+            "preferredTournaments": preferred_tournaments
+        }), 200
+        
+    except Exception as e:
+        app.logger.error(f"Error removing preferred tournament {tournament_id} from team {team_id}: {e}")
         return jsonify({"error": str(e)}), 500
 
 # --- Tournament Team Assignment API Routes ---
@@ -1455,9 +1678,7 @@ def get_single_tournament(tournament_id):
         # Fetch IsInProgress and IsOver from SportsData.io Tournament Odds API
         if odds_id:
             sportsdata_io_tournament_odds_endpoint = f"https://api.sportsdata.io/v3/golf/odds/json/TournamentOdds/{odds_id}"
-            headers = {
-                "Ocp-Apim-Subscription-Key": SPORTSDATA_IO_API_KEY
-            }
+            params = {"key": SPORTSDATA_IO_API_KEY}
             try:
                 cache_key = ('sportsdata_tournament_details', odds_id)
                 if cache_key in CACHE:
@@ -1468,13 +1689,13 @@ def get_single_tournament(tournament_id):
                     else:
                         del CACHE[cache_key]
                         app.logger.warning(f"Cached SportsData.io data for {odds_id} expired, refetching.")
-                        response = requests.get(sportsdata_io_tournament_odds_endpoint, headers=headers)
+                        response = requests.get(sportsdata_io_tournament_odds_endpoint, params=params)
                         response.raise_for_status()
                         odds_api_data = response.json()
                         CACHE[cache_key] = (odds_api_data, time.time())
                 else:
                     app.logger.info(f"Fetching live SportsData.io tournament details for oddsId {odds_id}.")
-                    response = requests.get(sportsdata_io_tournament_odds_endpoint, headers=headers)
+                    response = requests.get(sportsdata_io_tournament_odds_endpoint, params=params)
                     response.raise_for_status()
                     odds_api_data = response.json()
                     CACHE[cache_key] = (odds_api_data, time.time())
@@ -1588,11 +1809,9 @@ def start_draft(tournament_id):
         # Fetch current live player odds
         app.logger.info(f"Fetching live player odds to lock in for tournament {tournament_id} (oddsId: {odds_id}).")
         dynamic_odds_api_endpoint = f"https://api.sportsdata.io/v3/golf/odds/json/TournamentOdds/{odds_id}"
-        headers = {
-            "Ocp-Apim-Subscription-Key": SPORTSDATA_IO_API_KEY
-        }
+        params = {"key": SPORTSDATA_IO_API_KEY}
         try:
-            response = requests.get(dynamic_odds_api_endpoint, headers=headers)
+            response = requests.get(dynamic_odds_api_endpoint, params=params)
             response.raise_for_status()
             data = response.json()
             if not data or not data.get("PlayerTournamentOdds"):
@@ -1662,10 +1881,8 @@ def lock_draft_odds(tournament_id):
         if not odds_id:
             return jsonify({"error": "Tournament does not have an Odds ID configured."}), 400
         dynamic_odds_api_endpoint = f"https://api.sportsdata.io/v3/golf/odds/json/TournamentOdds/{odds_id}"
-        headers = {
-            "Ocp-Apim-Subscription-Key": SPORTSDATA_IO_API_KEY
-        }
-        response = requests.get(dynamic_odds_api_endpoint, headers=headers)
+        params = {"key": SPORTSDATA_IO_API_KEY}
+        response = requests.get(dynamic_odds_api_endpoint, params=params)
         response.raise_for_status()
         data = response.json()
         if not data or not data.get("PlayerTournamentOdds"):
@@ -2146,7 +2363,112 @@ else:
 # Start tournament monitoring
 start_tournament_monitoring()
 
-# --- Flask App Run ---
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port, debug=False)
+@app.route('/api/annual_championship', methods=['GET'])
+@cache.cached(timeout=TOURNAMENT_CACHE_TTL)
+def get_annual_championship():
+    """Calculate annual championship standings from completed tournaments"""
+    if not db:
+        return jsonify({"error": "Firestore not initialized"}), 500
+    
+    try:
+        # Fetch all tournaments
+        tournaments_ref = db.collection('tournaments').get()
+        annual_standings = {}
+        processed_tournaments = []
+        
+        for doc in tournaments_ref:
+            tournament_data = doc.to_dict()
+            tournament_id = doc.id
+            
+            # Skip if team assignments don't participate in annual championship
+            team_assignments = tournament_data.get('teams', [])
+            annual_teams = [team for team in team_assignments if team.get('participatesInAnnual', True)]
+            
+            if not annual_teams:
+                continue
+            
+            # Get tournament parameters
+            org_id = tournament_data.get('orgId', '1')
+            tourn_id = tournament_data.get('tournId')
+            year = tournament_data.get('year', '2025')
+            current_par = tournament_data.get('par', 71)
+            
+            if not tourn_id:
+                continue
+            
+            # Fetch leaderboard data
+            params = {'orgId': org_id, 'tournId': tourn_id, 'year': year}
+            leaderboard_data, error = make_rapidapi_request('/leaderboard', params)
+            
+            if error or not leaderboard_data:
+                app.logger.warning(f"Could not fetch leaderboard for tournament {tournament_id}: {error}")
+                continue
+            
+            # Check if tournament is officially complete
+            tournament_status = get_tournament_status_from_api(leaderboard_data)
+            if not tournament_status['isOfficialComplete']:
+                app.logger.info(f"Skipping incomplete tournament {tournament_id} (status: {tournament_status['status']})")
+                continue
+            
+            # Calculate team scores for this tournament
+            leaderboard_rows = leaderboard_data.get('leaderboardRows', [])
+            team_scores = calculate_team_scores(leaderboard_rows, annual_teams, current_par)
+            
+            # Sort teams by score and assign points
+            team_scores.sort(key=lambda x: x['totalScore'] if x['totalScore'] is not None else float('inf'))
+            
+            tournament_info = {
+                'tournamentId': tournament_id,
+                'name': tournament_data.get('name', 'Unknown Tournament'),
+                'completedAt': tournament_status['lastUpdated'],
+                'teamResults': []
+            }
+            
+            for position, team in enumerate(team_scores, 1):
+                if team['totalScore'] is not None:
+                    # Award points based on position (adjust as needed)
+                    points = max(0, len(team_scores) - position + 1)
+                    
+                    team_name = team['teamName']
+                    if team_name not in annual_standings:
+                        annual_standings[team_name] = {
+                            'teamName': team_name,
+                            'totalPoints': 0,
+                            'tournaments': []
+                        }
+                    
+                    annual_standings[team_name]['totalPoints'] += points
+                    annual_standings[team_name]['tournaments'].append({
+                        'tournamentId': tournament_id,
+                        'name': tournament_data.get('name'),
+                        'position': position,
+                        'points': points,
+                        'score': team['totalScore']
+                    })
+                    
+                    tournament_info['teamResults'].append({
+                        'teamName': team_name,
+                        'position': position,
+                        'score': team['totalScore'],
+                        'points': points
+                    })
+            
+            processed_tournaments.append(tournament_info)
+        
+        # Sort annual standings by total points
+        final_standings = sorted(annual_standings.values(), 
+                               key=lambda x: x['totalPoints'], reverse=True)
+        
+        return jsonify({
+            'standings': final_standings,
+            'tournaments': processed_tournaments,
+            'metadata': {
+                'calculatedAt': datetime.now().isoformat(),
+                'tournamentCount': len(processed_tournaments),
+                'teamCount': len(final_standings)
+            }
+        })
+        
+    except Exception as e:
+        app.logger.error(f"Error calculating annual championship: {e}")
+        return jsonify({"error": str(e)}), 500

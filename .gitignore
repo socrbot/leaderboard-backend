@@ -50,6 +50,9 @@ logs/
 *-firebase-adminsdk-*.json
 service-account*.json
 
+# Service account keys
+.secrets/
+
 # Testing
 .pytest_cache/
 .coverage

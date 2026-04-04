@@ -1,0 +1,64 @@
+name: Deploy to Cloud Run on merge
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build_and_deploy:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for GCR
+        run: gcloud auth configure-docker --quiet
+
+      - name: Build container image
+        run: |
+          docker build -t gcr.io/alumni-golf-tournament/leaderboard-backend:${{ github.sha }} .
+          docker tag gcr.io/alumni-golf-tournament/leaderboard-backend:${{ github.sha }} gcr.io/alumni-golf-tournament/leaderboard-backend:latest
+
+      - name: Push container image
+        run: |
+          docker push gcr.io/alumni-golf-tournament/leaderboard-backend:${{ github.sha }}
+          docker push gcr.io/alumni-golf-tournament/leaderboard-backend:latest
+
+      - name: Deploy to Cloud Run
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: leaderboard-backend
+          image: gcr.io/alumni-golf-tournament/leaderboard-backend:${{ github.sha }}
+          region: us-east1
+          flags: |
+            --platform=managed
+            --allow-unauthenticated
+            --port=8080
+            --memory=512Mi
+            --cpu=1000m
+            --min-instances=0
+            --max-instances=40
+            --concurrency=80
+            --timeout=300
+            --execution-environment=gen2
+            --ingress=all
+            --service-account=628169335141-compute@developer.gserviceaccount.com
+            --set-secrets=RAPIDAPI_KEY=rapidapi-key-clean:latest,SPORTSDATA_IO_API_KEY=sportsdata-api-key:latest,FIREBASE_SERVICE_ACCOUNT_KEY_PATH=FireBase_Admin:latest
+
+      - name: Verify deployment
+        run: |
+          SERVICE_URL=$(gcloud run services describe leaderboard-backend --region=us-east1 --format='value(status.url)')
+          echo "Deployed to: $SERVICE_URL"
+          curl -sf "$SERVICE_URL/api/rate_limit_status" || echo "Health check returned non-zero (may need cold start)"

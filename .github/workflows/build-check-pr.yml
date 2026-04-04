@@ -1,0 +1,26 @@
+name: Build check on PR
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build_check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build container image
+        run: docker build -t leaderboard-backend:test .
+
+      - name: Verify container starts
+        run: |
+          docker run -d --name test-container -p 8080:8080 \
+            -e RAPIDAPI_KEY=test \
+            -e SPORTSDATA_IO_API_KEY=test \
+            leaderboard-backend:test
+          sleep 5
+          docker logs test-container
+          docker stop test-container

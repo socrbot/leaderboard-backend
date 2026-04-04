@@ -93,7 +93,15 @@ try:
         app.logger.info("FIREBASE_SERVICE_ACCOUNT_KEY_PATH not set. Assuming deployed environment and using default credentials.")
         firebase_admin.initialize_app()
         app.logger.info("Firebase Admin SDK initialized with default credentials.")
-    # Local environment: Use the service account key file
+    # Secret Manager or env var: JSON content provided directly
+    elif FIREBASE_SERVICE_ACCOUNT_KEY_PATH.strip().startswith('{'):
+        app.logger.info("FIREBASE_SERVICE_ACCOUNT_KEY_PATH contains JSON content. Parsing directly.")
+        import json
+        service_account_info = json.loads(FIREBASE_SERVICE_ACCOUNT_KEY_PATH)
+        cred = credentials.Certificate(service_account_info)
+        firebase_admin.initialize_app(cred)
+        app.logger.info("Firebase Admin SDK initialized with service account JSON from environment variable.")
+    # Local environment: Use the service account key file path
     else:
         app.logger.info(f"Found FIREBASE_SERVICE_ACCOUNT_KEY_PATH. Initializing with key file: {FIREBASE_SERVICE_ACCOUNT_KEY_PATH}")
         cred = credentials.Certificate(FIREBASE_SERVICE_ACCOUNT_KEY_PATH)
@@ -451,13 +459,19 @@ def sum_best_n_scores(scores_array, n):
 
 def calculate_team_scores(players, team_assignments, current_par):
     """Calculate team scores with correct cut player penalty"""
-    teams_map = {}
+    teams_list = []
     
     # Debug logging
-    app.logger.info(f"Team assignments structure: {team_assignments}")
     app.logger.info(f"Number of teams: {len(team_assignments) if team_assignments else 0}")
     if team_assignments:
-        app.logger.info(f"First team structure: {team_assignments[0]}")
+        for i, t in enumerate(team_assignments):
+            t_keys = list(t.keys()) if isinstance(t, dict) else dir(t)
+            app.logger.info(f"Team {i} keys={t_keys}, type={type(t).__name__}")
+            # Log all possible name fields
+            for key in ['teamName', 'name', 'team_name', 'team']:
+                val = t.get(key) if isinstance(t, dict) else getattr(t, key, None)
+                if val is not None:
+                    app.logger.info(f"  Team {i} {key}='{val}' (type={type(val).__name__})")
     
     # First, find the highest scoring non-cut player for penalty calculation
     highest_non_cut_score = None
@@ -556,13 +570,17 @@ def calculate_team_scores(players, team_assignments, current_par):
             }
         
         # Get team name from various possible field names
-        team_name = (team_def.get('teamName') or 
-                    team_def.get('name') or 
-                    team_def.get('team_name') or 
-                    team_def.get('team') or 
-                    'Unknown Team')
+        team_name = None
+        for name_key in ['teamName', 'name', 'team_name', 'team']:
+            val = team_def.get(name_key) if isinstance(team_def, dict) else getattr(team_def, name_key, None)
+            if val and str(val).strip():
+                team_name = str(val).strip()
+                break
+        if not team_name:
+            team_name = f'Team {len(teams_list) + 1}'
+            app.logger.warning(f"Could not find team name in keys {list(team_def.keys()) if isinstance(team_def, dict) else 'non-dict'}, using '{team_name}'")
         
-        teams_map[team_name] = {
+        teams_list.append({
             'teamName': team_name,
             'totalScore': team_total_score if valid_round_count > 0 else None,
             'players': team_players,
@@ -572,9 +590,9 @@ def calculate_team_scores(players, team_assignments, current_par):
             'highestNonCutScore': highest_non_cut_score,
             'validRounds': valid_round_count,
             'roundDetails': round_details
-        }
+        })
     
-    return list(teams_map.values())
+    return teams_list
 
 # --- Optimized RapidAPI Integration Functions ---
 def make_rapidapi_request(endpoint, params=None, bypass_rate_limit=False, request_source="api_call"):
@@ -2472,3 +2490,7 @@ def get_annual_championship():
     except Exception as e:
         app.logger.error(f"Error calculating annual championship: {e}")
         return jsonify({"error": str(e)}), 500
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)

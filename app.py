@@ -2427,6 +2427,26 @@ class TournamentMonitor:
                     if not tourn_id:
                         continue
                     
+                    # Skip if draft is not complete
+                    if not tournament_data.get('IsDraftComplete', False):
+                        continue
+                    
+                    # Skip tournaments from previous years
+                    tournament_year = str(tournament_data.get('year', ''))
+                    current_year_str = str(datetime.now().year)
+                    if tournament_year and tournament_year != current_year_str:
+                        continue
+                    
+                    # For tournaments not yet active (not started), only probe once per day
+                    # to check if they've started — saves 18 calls/day pre-tournament
+                    if not tournament_data.get('isActive', False):
+                        last_check = tournament_data.get('lastNotStartedCheck')
+                        if last_check:
+                            time_since = datetime.now() - last_check.replace(tzinfo=None)
+                            if time_since.total_seconds() < 86400:  # 24 hours
+                                self.app.logger.debug(f"Skipping not-yet-active tournament {doc.id} — already checked today")
+                                continue
+                    
                     active_count += 1
                     
                     # Check tournament status using RapidAPI
@@ -2469,6 +2489,12 @@ class TournamentMonitor:
                     if tournament_status['isInProgress'] and not tournament_status['isOfficialComplete']:
                         updates['isActive'] = True
                         updates['lastStatusCheck'] = firestore.SERVER_TIMESTAMP
+                    
+                    # If tournament is still not started, record the check time
+                    # so we only probe once per day until it goes live
+                    if not tournament_status['isInProgress'] and not tournament_status['isOfficialComplete']:
+                        if not tournament_data.get('isActive', False):
+                            updates['lastNotStartedCheck'] = firestore.SERVER_TIMESTAMP
                         
                     if updates:
                         doc.reference.update(updates)

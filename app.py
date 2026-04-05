@@ -1624,13 +1624,13 @@ def create_tournament():
             return jsonify({"error": "Missing 'name' for new tournament"}), 400
 
         tournament_name = data['name'].strip()
-        org_id = data.get('orgId', '').strip()
+        org_id = data.get('orgId', '1').strip()
         tourn_id = data.get('tournId', '').strip()
         year = data.get('year', '').strip()
         odds_id = data.get('oddsId', '').strip()
 
-        if not tournament_name or not org_id or not tourn_id or not year or not odds_id:
-            return jsonify({"error": "Missing tournament name, Org ID, Tourn ID, Year, or Odds ID in request data"}), 400
+        if not tournament_name or not tourn_id or not year or not odds_id:
+            return jsonify({"error": "Missing tournament name, Tourn ID, Year, or Odds ID in request data"}), 400
 
         new_tournament_data = {
             "name": tournament_name,

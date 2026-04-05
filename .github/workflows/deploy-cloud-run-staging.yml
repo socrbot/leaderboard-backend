@@ -1,0 +1,65 @@
+name: Deploy to Cloud Run (Staging)
+
+on:
+  push:
+    branches:
+      - staging
+  workflow_dispatch:
+
+jobs:
+  build_and_deploy:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY_STAGING }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker us-east1-docker.pkg.dev --quiet
+
+      - name: Build container image
+        run: |
+          docker build -t us-east1-docker.pkg.dev/alumni-golf-tournament-staging/docker-repo/leaderboard-backend-staging:${{ github.sha }} .
+          docker tag us-east1-docker.pkg.dev/alumni-golf-tournament-staging/docker-repo/leaderboard-backend-staging:${{ github.sha }} us-east1-docker.pkg.dev/alumni-golf-tournament-staging/docker-repo/leaderboard-backend-staging:latest
+
+      - name: Push container image
+        run: |
+          docker push us-east1-docker.pkg.dev/alumni-golf-tournament-staging/docker-repo/leaderboard-backend-staging:${{ github.sha }}
+          docker push us-east1-docker.pkg.dev/alumni-golf-tournament-staging/docker-repo/leaderboard-backend-staging:latest
+
+      - name: Deploy to Cloud Run
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: leaderboard-backend-staging
+          image: us-east1-docker.pkg.dev/alumni-golf-tournament-staging/docker-repo/leaderboard-backend-staging:${{ github.sha }}
+          region: us-east1
+          flags: |
+            --platform=managed
+            --allow-unauthenticated
+            --port=8080
+            --memory=512Mi
+            --cpu=1000m
+            --min-instances=0
+            --max-instances=40
+            --concurrency=80
+            --timeout=300
+            --execution-environment=gen2
+            --ingress=all
+            --service-account=1056126670188-compute@developer.gserviceaccount.com
+            --set-secrets=RAPIDAPI_KEY=Rapid-API-RG:latest,SPORTSDATA_IO_API_KEY=Sportsdata-api-RG:latest,FIREBASE_SERVICE_ACCOUNT_KEY_PATH=FireBase_Admin:latest
+
+      - name: Verify deployment
+        run: |
+          SERVICE_URL=$(gcloud run services describe leaderboard-backend-staging --region=us-east1 --format='value(status.url)')
+          echo "Deployed to: $SERVICE_URL"
+          curl -sf "$SERVICE_URL/api/rate_limit_status" || echo "Health check returned non-zero (may need cold start)"

@@ -334,8 +334,9 @@ def get_stored_scores(tournament_id, max_age_minutes=45):
             
             if last_calculation:
                 # Check if calculation is recent enough (45-min aligns with tournament schedule)
+                # max_age_minutes=None means no expiry (for completed tournaments)
                 time_diff = datetime.now() - last_calculation.replace(tzinfo=None)
-                if time_diff.total_seconds() < (max_age_minutes * 60):
+                if max_age_minutes is None or time_diff.total_seconds() < (max_age_minutes * 60):
                     stored_scores = tournament_data.get('lastCalculatedScores')
                     if stored_scores:
                         app.logger.info(f"Using stored scores for tournament {tournament_id} (age: {time_diff.total_seconds():.0f}s)")
@@ -357,7 +358,7 @@ def get_stored_scores(tournament_id, max_age_minutes=45):
             
             if calculated_at:
                 time_diff = datetime.now() - calculated_at.replace(tzinfo=None)
-                if time_diff.total_seconds() < (max_age_minutes * 60):
+                if max_age_minutes is None or time_diff.total_seconds() < (max_age_minutes * 60):
                     app.logger.info(f"Using detailed stored scores for tournament {tournament_id}")
                     return {
                         'teamScores': score_data.get('teamScores', []),
@@ -748,6 +749,42 @@ def get_optimized_leaderboard():
     else:
         app.logger.info("No cache data or force refresh requested, fetching fresh data")
     
+    # --- Skip RapidAPI if tournament is complete or not started ---
+    if tournament_id and db:
+        try:
+            t_doc = db.collection('tournaments').document(tournament_id).get()
+            if t_doc.exists:
+                t_data = t_doc.to_dict()
+                is_complete = t_data.get('isOfficiallyComplete', False) or t_data.get('isComplete', False)
+                if is_complete:
+                    app.logger.info(f"Tournament {tournament_id} is complete — returning stored scores without RapidAPI call")
+                    stored_results = get_stored_scores(tournament_id, max_age_minutes=None)
+                    if stored_results:
+                        result = {
+                            'teamScores': stored_results['teamScores'],
+                            'leaderboardData': stored_results.get('leaderboardData', {}),
+                            'isOfficiallyComplete': True,
+                            'tournamentStatus': {'status': 'Official', 'isOfficialComplete': True, 'isInProgress': False},
+                            'teamCalculationMetadata': {**stored_results.get('metadata', {}), 'fromStorage': True, 'lastCalculated': stored_results.get('calculatedAt')},
+                            'dataFreshness': 'stored'
+                        }
+                        CACHE[cache_key] = (result, time.time())
+                        return jsonify(result)
+
+                is_active = t_data.get('isActive', False)
+                has_stored_scores = t_data.get('lastCalculatedScores') is not None
+                if not is_complete and not is_active and not has_stored_scores:
+                    app.logger.info(f"Tournament {tournament_id} has not started — skipping RapidAPI call")
+                    return jsonify({
+                        'teamScores': [],
+                        'isOfficiallyComplete': False,
+                        'tournamentStatus': {'status': 'Not Started', 'isOfficialComplete': False, 'isInProgress': False},
+                        'dataFreshness': 'not_started',
+                        'message': 'Tournament has not started yet'
+                    })
+        except Exception as e:
+            app.logger.warning(f"Error checking tournament status for {tournament_id}, proceeding with RapidAPI: {e}")
+
     # Prepare RapidAPI request parameters
     params = {'orgId': org_id, 'tournId': tourn_id, 'year': year}
     if round_id:
@@ -855,6 +892,43 @@ def get_tournament_leaderboard(tournament_id):
         # Use the main leaderboard endpoint logic with tournament-specific parameters
         app.logger.info(f"Fetching leaderboard for tournament {tournament_id}: orgId={org_id}, tournId={tourn_id}, year={year}")
         
+        # --- Skip RapidAPI for completed tournaments ---
+        is_complete = tournament_data.get('isOfficiallyComplete', False) or tournament_data.get('isComplete', False)
+        if is_complete:
+            app.logger.info(f"Tournament {tournament_id} is complete — returning stored scores without RapidAPI call")
+            stored_results = get_stored_scores(tournament_id, max_age_minutes=None)
+            if stored_results:
+                return jsonify({
+                    'teamScores': stored_results['teamScores'],
+                    'leaderboardData': stored_results.get('leaderboardData', {}),
+                    'isOfficiallyComplete': True,
+                    'tournamentStatus': {'status': 'Official', 'isOfficialComplete': True, 'isInProgress': False},
+                    'teamCalculationMetadata': {**stored_results.get('metadata', {}), 'fromStorage': True, 'lastCalculated': stored_results.get('calculatedAt')},
+                    'dataFreshness': 'stored'
+                })
+            # Fallback: no stored scores for a complete tournament — still avoid RapidAPI
+            app.logger.warning(f"Tournament {tournament_id} marked complete but no stored scores found")
+            return jsonify({
+                'teamScores': [],
+                'isOfficiallyComplete': True,
+                'tournamentStatus': {'status': 'Official', 'isOfficialComplete': True, 'isInProgress': False},
+                'dataFreshness': 'stored',
+                'warning': 'Tournament complete but no stored scores available'
+            })
+
+        # --- Skip RapidAPI for tournaments that have not started ---
+        is_active = tournament_data.get('isActive', False)
+        has_stored_scores = tournament_data.get('lastCalculatedScores') is not None
+        if not is_active and not has_stored_scores:
+            app.logger.info(f"Tournament {tournament_id} has not started — skipping RapidAPI call")
+            return jsonify({
+                'teamScores': [],
+                'isOfficiallyComplete': False,
+                'tournamentStatus': {'status': 'Not Started', 'isOfficialComplete': False, 'isInProgress': False},
+                'dataFreshness': 'not_started',
+                'message': 'Tournament has not started yet'
+            })
+
         # Directly call leaderboard logic with tournament parameters
         params = {'orgId': org_id, 'tournId': tourn_id, 'year': year}
         
@@ -868,7 +942,7 @@ def get_tournament_leaderboard(tournament_id):
                 app.logger.info(f"Returning cached tournament leaderboard for {tournament_id}")
                 return jsonify(cached_data)
         
-        # Fetch leaderboard data from API
+        # Fetch leaderboard data from API (tournament is active/in-progress)
         data, error = make_rapidapi_request('/leaderboard', params, 
                                            request_source=f"tournament_leaderboard_{tournament_id}")
         if error:
@@ -2277,7 +2351,16 @@ class TournamentMonitor:
             return False
     
     def is_tournament_currently_active(self, tournament_data):
-        """Determine if a tournament is currently active (not completed)"""
+        """Determine if a tournament is currently active and worth polling RapidAPI for.
+        
+        A tournament is considered potentially active only if:
+        1. Not already marked as complete
+        2. Has a valid tournId
+        3. Draft is complete (tournament can't be live before draft is done)
+        4. Tournament year matches current year (don't poll old tournaments)
+        5. Has been seen as active before (isActive flag) OR draft was completed
+           recently enough that the tournament could be starting
+        """
         # Skip if already marked as complete
         if tournament_data.get('isOfficiallyComplete', False):
             return False
@@ -2286,7 +2369,20 @@ class TournamentMonitor:
             
         # Check if we have the required API parameters
         tourn_id = tournament_data.get('tournId')
-        return bool(tourn_id)  # If we have tournament ID, consider it potentially active
+        if not tourn_id:
+            return False
+        
+        # Skip if draft is not complete — tournament can't be live before draft finishes
+        if not tournament_data.get('IsDraftComplete', False):
+            return False
+        
+        # Skip tournaments from previous years
+        tournament_year = str(tournament_data.get('year', ''))
+        current_year = str(datetime.now().year)
+        if tournament_year and tournament_year != current_year:
+            return False
+        
+        return True
     
     def should_run_scheduled_check(self):
         """Check if current time matches tournament schedule and we have active tournaments"""

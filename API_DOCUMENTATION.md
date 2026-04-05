@@ -5,6 +5,7 @@ Optimized backend for golf tournament leaderboard management with RapidAPI integ
 
 ## Base URL
 - Production: `https://leaderboard-backend-628169335141.us-east1.run.app/api`
+- Staging: `https://leaderboard-backend-staging-1056126670188.us-east1.run.app/api`
 - Local Development: `http://localhost:8080/api`
 
 ## API Endpoints

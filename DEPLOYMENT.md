@@ -1,14 +1,27 @@
 # Google Cloud Run Deployment Guide
 
 ## Overview
-This document describes the deployment configuration for the leaderboard-backend service on Google Cloud Run.
+This document describes the deployment configuration for the leaderboard-backend service on Google Cloud Run. The service supports two environments: **production** and **staging**.
 
-## Service Configuration
-- **Project ID**: alumni-golf-tournament
-- **Service Name**: leaderboard-backend
-- **Region**: us-east1
-- **Platform**: Cloud Run (managed)
-- **Service URL**: https://leaderboard-backend-628169335141.us-east1.run.app
+## Environments
+
+| | Production | Staging |
+|---|---|---|
+| **Project ID** | `alumni-golf-tournament` | `alumni-golf-tournament-staging` |
+| **Project Number** | `628169335141` | `1056126670188` |
+| **Service Name** | `leaderboard-backend` | `leaderboard-backend-staging` |
+| **Service URL** | `https://leaderboard-backend-628169335141.us-east1.run.app` | `https://leaderboard-backend-staging-1056126670188.us-east1.run.app` |
+| **Service Account** | `628169335141-compute@developer.gserviceaccount.com` | `1056126670188-compute@developer.gserviceaccount.com` |
+| **Image Registry** | `gcr.io/alumni-golf-tournament` | `us-east1-docker.pkg.dev/alumni-golf-tournament-staging/docker-repo` |
+| **Region** | us-east1 | us-east1 |
+
+### Secrets (Google Secret Manager)
+
+| Secret | Production | Staging |
+|---|---|---|
+| RapidAPI Key | `rapidapi-key-clean` | `Rapid-API-RG` |
+| SportsData.io Key | `sportsdata-api-key` | `Sportsdata-api-RG` |
+| Firebase Admin | `FireBase_Admin` | `FireBase_Admin` |
 
 ## Resource Allocation
 - **Memory**: 512Mi
@@ -20,24 +33,23 @@ This document describes the deployment configuration for the leaderboard-backend
 - **Execution Environment**: gen2
 
 ## Security & Access
-- **Service Account**: 628169335141-compute@developer.gserviceaccount.com
 - **Authentication**: Unauthenticated (public access)
 - **Ingress**: All traffic allowed
-
-## Environment Variables
-The service uses the following environment variables:
-- `RAPIDAPI_KEY`: API key for RapidAPI services
-- `SPORTSDATA_IO_API_KEY`: API key for SportsData.io services
-
-## Secrets
-- `FIREBASE_SERVICE_ACCOUNT_KEY_PATH`: Mounted from Google Secret Manager (FireBase_Admin secret)
+- **Secrets**: Managed via Google Secret Manager (see Environments table above)
 
 ## Deployment
-To deploy the service, run:
+The deploy script supports both environments via a config file:
 ```bash
 chmod +x deploy.sh
-./deploy.sh
+
+# Deploy to production
+./deploy.sh prod
+
+# Deploy to staging
+./deploy.sh staging
 ```
+
+Environment-specific configuration is stored in `deploy-config/prod.env` and `deploy-config/staging.env`.
 
 The deployment script will:
 1. Enable required Google Cloud APIs
@@ -46,12 +58,18 @@ The deployment script will:
 4. Output the service URL and helpful commands
 
 ## Monitoring & Management
+
+### Production
 - **View logs**: `gcloud run logs tail leaderboard-backend --region=us-east1 --project=alumni-golf-tournament`
-- **Update service**: Use the deploy.sh script or gcloud run deploy command
 - **Delete service**: `gcloud run services delete leaderboard-backend --region=us-east1 --project=alumni-golf-tournament`
 
+### Staging
+- **View logs**: `gcloud run logs tail leaderboard-backend-staging --region=us-east1 --project=alumni-golf-tournament-staging`
+- **Delete service**: `gcloud run services delete leaderboard-backend-staging --region=us-east1 --project=alumni-golf-tournament-staging`
+
 ## API Endpoints
-- Base URL: https://leaderboard-backend-628169335141.us-east1.run.app
+- **Production**: `https://leaderboard-backend-628169335141.us-east1.run.app/api`
+- **Staging**: `https://leaderboard-backend-staging-1056126670188.us-east1.run.app/api`
 - Health check: `/api/health`
 - Tournaments: `/api/tournaments`
 - Other endpoints as defined in the Flask application
@@ -75,26 +93,28 @@ The deployment script will:
    gcloud auth application-default login
    ```
 
-3. **Set your project** (replace with your actual project ID):
+3. **Set your project**:
    ```bash
-   gcloud config set project YOUR_PROJECT_ID
+   # Production
+   gcloud config set project alumni-golf-tournament
+
+   # Staging
+   gcloud config set project alumni-golf-tournament-staging
    ```
 
 ## Deployment Options
 
 ### Option 1: Automated Deployment Script (Recommended)
 
-1. **Edit the deployment script**:
-   ```bash
-   # Open deploy.sh and update these variables:
-   PROJECT_ID="your-actual-project-id"
-   REGION="us-east1"  # or your preferred region
-   ```
+The deploy script reads configuration from `deploy-config/prod.env` or `deploy-config/staging.env`:
 
-2. **Run the deployment**:
-   ```bash
-   ./deploy.sh
-   ```
+```bash
+# Deploy to production
+./deploy.sh prod
+
+# Deploy to staging
+./deploy.sh staging
+```
 
 ### Option 2: Manual Deployment
 
@@ -112,22 +132,23 @@ The deployment script will:
    echo "your_sportsdata_key" | gcloud secrets create sportsdata-api-key --data-file=-
    ```
 
-3. **Build and deploy**:
+3. **Build and deploy** (example for staging using Artifact Registry):
    ```bash
-   # Build the image
-   gcloud builds submit --tag gcr.io/YOUR_PROJECT_ID/leaderboard-backend
-   
-   # Deploy to Cloud Run
-   gcloud run deploy leaderboard-backend \
-     --image gcr.io/YOUR_PROJECT_ID/leaderboard-backend \
+   gcloud builds submit --tag us-east1-docker.pkg.dev/alumni-golf-tournament-staging/docker-repo/leaderboard-backend-staging \
+     --project=alumni-golf-tournament-staging
+
+   gcloud run deploy leaderboard-backend-staging \
+     --image us-east1-docker.pkg.dev/alumni-golf-tournament-staging/docker-repo/leaderboard-backend-staging \
      --platform managed \
      --region us-east1 \
+     --project alumni-golf-tournament-staging \
      --allow-unauthenticated \
      --port 8080 \
-     --memory 1Gi \
+     --memory 512Mi \
      --set-env-vars "FLASK_ENV=production" \
-     --set-secrets "RAPIDAPI_KEY=rapidapi-key:latest,SPORTSDATA_IO_API_KEY=sportsdata-api-key:latest"
+     --set-secrets "RAPIDAPI_KEY=Rapid-API-RG:latest,SPORTSDATA_IO_API_KEY=Sportsdata-api-RG:latest,FIREBASE_ADMIN_SDK=FireBase_Admin:latest"
    ```
+   For production, use `gcr.io/alumni-golf-tournament/leaderboard-backend` and the production secret names (see Environments table).
 
 ### Option 3: Cloud Build CI/CD
 
@@ -147,22 +168,18 @@ The deployment script will:
    gcloud run services describe leaderboard-backend --region=us-east1 --format='value(status.url)'
    ```
 
-2. **Update your frontend** to use the new backend URL:
-   ```javascript
-   // In your frontend apiConfig.js
-   export const BACKEND_BASE_URL = "https://your-service-url.run.app/api";
-   ```
+2. **Frontend configuration**:
+   The frontend uses environment variables set in `.env.production` and `.env.staging` to determine the backend URL. See `src/apiConfig.js` in the frontend repo.
 
 3. **Test the deployment**:
    ```bash
    curl https://your-service-url.run.app/api/tournaments
    ```
 
-## Monitoring and Logs
+## Console Links
 
-- **View logs**: `gcloud run logs tail leaderboard-backend --region=us-east1`
-- **Monitor in Console**: https://console.cloud.google.com/run
-- **View metrics**: https://console.cloud.google.com/monitoring
+- **Cloud Run Console**: https://console.cloud.google.com/run
+- **Cloud Monitoring**: https://console.cloud.google.com/monitoring
 
 ## Troubleshooting
 

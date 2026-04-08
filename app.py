@@ -1096,115 +1096,7 @@ def get_player_odds():
         return jsonify({"error": "Invalid JSON response from external API"}), 500
 
 # --- Annual Championship Calculation API ---
-@app.route('/api/annual_championship', methods=['GET'])
-@cache.cached(timeout=TOURNAMENT_CACHE_TTL)
-def get_annual_championship_data():
-    """Calculate annual championship standings from completed tournaments"""
-    if not db:
-        return jsonify({"error": "Firestore not initialized"}), 500
-    
-    try:
-        # Fetch all tournaments
-        tournaments_ref = db.collection('tournaments').get()
-        annual_standings = {}
-        processed_tournaments = []
-        
-        for doc in tournaments_ref:
-            tournament_data = doc.to_dict()
-            tournament_id = doc.id
-            
-            # Skip if team assignments don't participate in annual championship
-            team_assignments = tournament_data.get('teams', [])
-            annual_teams = [team for team in team_assignments if team.get('participatesInAnnual', True)]
-            
-            if not annual_teams:
-                continue
-            
-            # Get tournament parameters
-            org_id = tournament_data.get('orgId', '1')
-            tourn_id = tournament_data.get('tournId')
-            year = tournament_data.get('year', '2025')
-            current_par = tournament_data.get('par', 71)
-            
-            if not tourn_id:
-                continue
-            
-            # Fetch leaderboard data
-            params = {'orgId': org_id, 'tournId': tourn_id, 'year': year}
-            leaderboard_data, error = make_rapidapi_request('/leaderboard', params)
-            
-            if error or not leaderboard_data:
-                app.logger.warning(f"Could not fetch leaderboard for tournament {tournament_id}: {error}")
-                continue
-            
-            # Check if tournament is officially complete
-            tournament_status = get_tournament_status_from_api(leaderboard_data)
-            if not tournament_status['isOfficialComplete']:
-                app.logger.info(f"Skipping incomplete tournament {tournament_id} (status: {tournament_status['status']})")
-                continue
-            
-            # Calculate team scores for this tournament
-            leaderboard_rows = leaderboard_data.get('leaderboardRows', [])
-            team_scores = calculate_team_scores(leaderboard_rows, annual_teams, current_par)
-            
-            # Sort teams by score and assign points
-            team_scores.sort(key=lambda x: x['totalScore'] if x['totalScore'] is not None else float('inf'))
-            
-            tournament_info = {
-                'tournamentId': tournament_id,
-                'name': tournament_data.get('name', 'Unknown Tournament'),
-                'completedAt': tournament_status['lastUpdated'],
-                'teamResults': []
-            }
-            
-            for position, team in enumerate(team_scores, 1):
-                if team['totalScore'] is not None:
-                    # Award points based on position (adjust as needed)
-                    points = max(0, len(team_scores) - position + 1)
-                    
-                    team_name = team['teamName']
-                    if team_name not in annual_standings:
-                        annual_standings[team_name] = {
-                            'teamName': team_name,
-                            'totalPoints': 0,
-                            'tournaments': []
-                        }
-                    
-                    annual_standings[team_name]['totalPoints'] += points
-                    annual_standings[team_name]['tournaments'].append({
-                        'tournamentId': tournament_id,
-                        'name': tournament_data.get('name'),
-                        'position': position,
-                        'points': points,
-                        'score': team['totalScore']
-                    })
-                    
-                    tournament_info['teamResults'].append({
-                        'teamName': team_name,
-                        'position': position,
-                        'score': team['totalScore'],
-                        'points': points
-                    })
-            
-            processed_tournaments.append(tournament_info)
-        
-        # Sort annual standings by total points
-        final_standings = sorted(annual_standings.values(), 
-                               key=lambda x: x['totalPoints'], reverse=True)
-        
-        return jsonify({
-            'standings': final_standings,
-            'tournaments': processed_tournaments,
-            'metadata': {
-                'calculatedAt': datetime.now().isoformat(),
-                'tournamentCount': len(processed_tournaments),
-                'teamCount': len(final_standings)
-            }
-        })
-        
-    except Exception as e:
-        app.logger.error(f"Error calculating annual championship: {e}")
-        return jsonify({"error": str(e)}), 500
+# OLD annual championship endpoint removed - see line 2555 for new year-filtered version
 
 # --- Debug API Routes ---
 @app.route('/api/tournaments/<tournament_id>/debug', methods=['GET'])
@@ -2553,7 +2445,6 @@ else:
 start_tournament_monitoring()
 
 @app.route('/api/annual_championship', methods=['GET'])
-@cache.cached(timeout=TOURNAMENT_CACHE_TTL)
 def get_annual_championship():
     """Calculate annual championship standings from completed tournaments for a specific year"""
     if not db:
@@ -2562,6 +2453,13 @@ def get_annual_championship():
     # Get year parameter from query string (default to current year)
     year = request.args.get('year', str(datetime.now().year))
     app.logger.info(f"Fetching annual championship data for year: {year}")
+    
+    # Create year-specific cache key
+    cache_key = f'annual_championship_{year}'
+    cached_result = cache.get(cache_key)
+    if cached_result:
+        app.logger.info(f"Returning cached annual championship data for year {year}")
+        return jsonify(cached_result)
     
     try:
         # Fetch tournaments for the specified year only
@@ -2652,7 +2550,7 @@ def get_annual_championship():
         final_standings = sorted(annual_standings.values(), 
                                key=lambda x: x['totalPoints'], reverse=True)
         
-        return jsonify({
+        result = {
             'standings': final_standings,
             'tournaments': processed_tournaments,
             'metadata': {
@@ -2660,7 +2558,13 @@ def get_annual_championship():
                 'tournamentCount': len(processed_tournaments),
                 'teamCount': len(final_standings)
             }
-        })
+        }
+        
+        # Cache the result with year-specific key
+        cache.set(cache_key, result, timeout=TOURNAMENT_CACHE_TTL)
+        app.logger.info(f"Cached annual championship data for year {year}")
+        
+        return jsonify(result)
         
     except Exception as e:
         app.logger.error(f"Error calculating annual championship: {e}")

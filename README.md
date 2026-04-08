@@ -6,7 +6,7 @@ Flask backend API for golf tournament leaderboard management with RapidAPI integ
 
 - **Live Tournament Data**: Integration with RapidAPI for real-time leaderboard updates
 - **Team Score Calculation**: Automatic calculation using best 3 of 4 golfers per round
-- **Annual Championship**: Aggregate tournament results with position-based points system
+- **Annual Championship**: Aggregate tournament results with cumulative stroke scoring
 - **Rate Limiting**: Intelligent API usage tracking and optimization
 - **Caching**: Multi-layer caching for performance optimization
 
@@ -28,19 +28,21 @@ The backend calculates annual championship standings by aggregating results from
 - Sum of all round scores
 - Only counts if team has at least 3 valid scores per round
 
-### Championship Points System
+### Annual Championship Scoring System
 
-**Points Award Formula:**
+The annual championship uses **cumulative stroke scoring** - the traditional golf scoring method:
+
+**Scoring Logic:**
 ```python
-points = max(0, team_count - position + 1)
+# For each completed tournament, add team's score to their total
+annual_total = sum(tournament_scores)
+# Lower total score wins (standard golf)
 ```
 
-**Example** (8 teams competing):
-- 1st place: 8 points
-- 2nd place: 7 points
-- 3rd place: 6 points
-- ...
-- 8th place: 1 point
+**Example** (3 tournaments):
+- Team A: +5, +8, +3 = **+16 total**
+- Team B: +10, +2, +6 = **+18 total**
+- **Winner: Team A** (lowest cumulative score)
 
 **Eligibility Requirements:**
 - Tournament must be **officially complete** (final round finished)
@@ -49,12 +51,12 @@ points = max(0, team_count - position + 1)
 
 ### API Endpoint
 
-**GET** `/api/annual_championship`
+**GET** `/api/annual_championship?year=2026`
 
 Returns standings with:
-- `totalPoints`: Sum of points from all completed tournaments
-- `tournaments`: Array of tournament results with position, score, and points
-- Sorted by total points (highest first)
+- `totalScore`: Cumulative sum of tournament scores
+- `tournaments`: Array of tournament results with position and score
+- Sorted by total score (lowest first - best in golf)
 
 ## Deployment
 

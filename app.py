@@ -2505,7 +2505,7 @@ def get_annual_championship():
             leaderboard_rows = leaderboard_data.get('leaderboardRows', [])
             team_scores = calculate_team_scores(leaderboard_rows, annual_teams, current_par)
             
-            # Sort teams by score and assign points
+            # Sort teams by score (lowest score is best)
             team_scores.sort(key=lambda x: x['totalScore'] if x['totalScore'] is not None else float('inf'))
             
             tournament_info = {
@@ -2517,38 +2517,35 @@ def get_annual_championship():
             
             for position, team in enumerate(team_scores, 1):
                 if team['totalScore'] is not None:
-                    # Award points based on position (adjust as needed)
-                    points = max(0, len(team_scores) - position + 1)
-                    
                     team_name = team['teamName']
+                    
                     if team_name not in annual_standings:
                         annual_standings[team_name] = {
                             'teamName': team_name,
-                            'totalPoints': 0,
+                            'totalScore': 0,
                             'tournaments': []
                         }
                     
-                    annual_standings[team_name]['totalPoints'] += points
+                    # Add tournament score to cumulative total
+                    annual_standings[team_name]['totalScore'] += team['totalScore']
                     annual_standings[team_name]['tournaments'].append({
                         'tournamentId': tournament_id,
                         'name': tournament_data.get('name'),
                         'position': position,
-                        'points': points,
                         'score': team['totalScore']
                     })
                     
                     tournament_info['teamResults'].append({
                         'teamName': team_name,
                         'position': position,
-                        'score': team['totalScore'],
-                        'points': points
+                        'score': team['totalScore']
                     })
             
             processed_tournaments.append(tournament_info)
         
-        # Sort annual standings by total points
+        # Sort annual standings by total score (lowest score wins)
         final_standings = sorted(annual_standings.values(), 
-                               key=lambda x: x['totalPoints'], reverse=True)
+                               key=lambda x: x['totalScore'] if x['totalScore'] is not None else float('inf'))
         
         result = {
             'standings': final_standings,

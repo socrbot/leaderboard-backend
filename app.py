@@ -2555,13 +2555,17 @@ start_tournament_monitoring()
 @app.route('/api/annual_championship', methods=['GET'])
 @cache.cached(timeout=TOURNAMENT_CACHE_TTL)
 def get_annual_championship():
-    """Calculate annual championship standings from completed tournaments"""
+    """Calculate annual championship standings from completed tournaments for a specific year"""
     if not db:
         return jsonify({"error": "Firestore not initialized"}), 500
     
+    # Get year parameter from query string (default to current year)
+    year = request.args.get('year', str(datetime.now().year))
+    app.logger.info(f"Fetching annual championship data for year: {year}")
+    
     try:
-        # Fetch all tournaments
-        tournaments_ref = db.collection('tournaments').get()
+        # Fetch tournaments for the specified year only
+        tournaments_ref = db.collection('tournaments').where('year', '==', year).get()
         annual_standings = {}
         processed_tournaments = []
         

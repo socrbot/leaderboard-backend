@@ -2578,12 +2578,34 @@ def get_annual_championship():
                         except Exception as team_error:
                             app.logger.warning(f"Error fetching global team {global_team_id}: {team_error}")
             else:
-                # LEGACY FALLBACK: Use embedded teams data from tournament
+                # LEGACY FALLBACK: Use embedded teams data but LOOK UP participatesInAnnual from global_teams
                 app.logger.info(f"Tournament {tournament_id} using legacy teams field")
                 legacy_teams = tournament_data.get('teams', [])
+                
+                # Build a map of team names to global team IDs for lookup
+                global_teams_by_name = {}
+                try:
+                    all_global_teams = db.collection('global_teams').where('year', '==', year).get()
+                    for gt_doc in all_global_teams:
+                        gt_data = gt_doc.to_dict()
+                        global_teams_by_name[gt_data.get('name', '').lower()] = {
+                            'id': gt_doc.id,
+                            'participatesInAnnual': gt_data.get('participatesInAnnual', True)
+                        }
+                except Exception as e:
+                    app.logger.warning(f"Could not fetch global teams for legacy lookup: {e}")
+                
+                # Check each legacy team against global_teams
                 for legacy_team in legacy_teams:
-                    if legacy_team.get('participatesInAnnual', True):
-                        annual_teams.append(legacy_team)
+                    team_name = legacy_team.get('name', '').lower()
+                    
+                    # Look up current participatesInAnnual value from global_teams
+                    if team_name in global_teams_by_name:
+                        if global_teams_by_name[team_name]['participatesInAnnual']:
+                            annual_teams.append(legacy_team)
+                    else:
+                        # Team not found in global_teams, skip it
+                        app.logger.warning(f"Legacy team '{legacy_team.get('name')}' not found in global_teams for year {year}")
             
             if not annual_teams:
                 continue

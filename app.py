@@ -1643,6 +1643,73 @@ def update_tournament_team_assignments(tournament_id):
         app.logger.error(f"Error updating team assignments for tournament {tournament_id}: {e}")
         return jsonify({"error": str(e)}), 500
 
+@app.route('/api/tournaments/<tournament_id>/sync_teams', methods=['POST'])
+def sync_tournament_teams(tournament_id):
+    """Sync tournament teams from global_teams (only allowed before draft starts)"""
+    if not db:
+        app.logger.error("Firestore DB not initialized.")
+        return jsonify({"error": "Firestore not initialized"}), 500
+    try:
+        doc_ref = db.collection('tournaments').document(tournament_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return jsonify({"error": "Tournament not found"}), 404
+        
+        tournament_data = doc.to_dict()
+        
+        # Check if draft has started - if so, don't allow sync
+        if tournament_data.get('IsDraftStarted', False):
+            return jsonify({"error": "Cannot sync teams after draft has started"}), 403
+        
+        # Get tournament year
+        year = tournament_data.get('year')
+        if not year:
+            return jsonify({"error": "Tournament has no year field"}), 400
+        
+        # Fetch all global teams for this year
+        global_teams_ref = db.collection('global_teams').where('year', '==', year).get()
+        team_assignments = []
+        legacy_teams = []
+        teams_data = []
+        
+        # Collect all teams
+        for team_doc in global_teams_ref:
+            team_data = team_doc.to_dict()
+            teams_data.append({
+                'id': team_doc.id,
+                'data': team_data
+            })
+        
+        # Sort by name in Python
+        teams_data.sort(key=lambda x: x['data'].get('name', '').lower())
+        
+        # Build assignments and legacy teams
+        for team_info in teams_data:
+            team_assignments.append({"globalTeamId": team_info['id']})
+            legacy_teams.append({
+                "name": team_info['data'].get("name", "Unknown"),
+                "golferNames": team_info['data'].get("golferNames", []),
+                "participatesInAnnual": team_info['data'].get("participatesInAnnual", True),
+                "draftOrder": team_info['data'].get("draftOrder", 0)
+            })
+        
+        # Update tournament with synced teams
+        doc_ref.update({
+            "teamAssignments": team_assignments,
+            "teams": legacy_teams,
+            "updatedAt": firestore.SERVER_TIMESTAMP
+        })
+        
+        app.logger.info(f"Synced {len(team_assignments)} teams for tournament {tournament_id} from year {year}")
+        return jsonify({
+            "message": f"Synced {len(team_assignments)} teams from global teams",
+            "teams": legacy_teams
+        }), 200
+        
+    except Exception as e:
+        app.logger.error(f"Error syncing teams for tournament {tournament_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
 # --- Tournament Management API Routes (MODIFIED) ---
 
 @app.route('/api/tournaments', methods=['POST'])

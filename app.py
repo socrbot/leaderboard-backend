@@ -427,7 +427,30 @@ def normalize_name(name):
     if not name:
         return ""
     
-    # Normalize Unicode characters (å→a, ø→o, etc.) using NFD decomposition
+    # First, handle special characters that don't decompose with NFD
+    # Common golf player name characters
+    char_map = {
+        'å': 'a', 'Å': 'A',
+        'ä': 'a', 'Ä': 'A',
+        'ö': 'o', 'Ö': 'O',
+        'ø': 'o', 'Ø': 'O',
+        'ü': 'u', 'Ü': 'U',
+        'é': 'e', 'É': 'E',
+        'è': 'e', 'È': 'E',
+        'ê': 'e', 'Ê': 'E',
+        'á': 'a', 'Á': 'A',
+        'à': 'a', 'À': 'A',
+        'ñ': 'n', 'Ñ': 'N',
+        'ó': 'o', 'Ó': 'O',
+        'ú': 'u', 'Ú': 'U',
+        'í': 'i', 'Í': 'I',
+    }
+    
+    # Replace special characters
+    for special_char, replacement in char_map.items():
+        name = name.replace(special_char, replacement)
+    
+    # Then normalize remaining Unicode characters using NFD decomposition
     normalized = unicodedata.normalize('NFD', name)
     # Remove combining characters (accents, diacritics)
     ascii_name = ''.join(char for char in normalized if unicodedata.category(char) != 'Mn')

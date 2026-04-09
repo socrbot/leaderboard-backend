@@ -1226,12 +1226,16 @@ def force_recalculate_scores(tournament_id):
 
 @app.route('/api/global_teams', methods=['GET'])
 def get_global_teams():
-    """Get all global teams"""
+    """Get all global teams for a specific year"""
     if not db:
         app.logger.error("Firestore DB not initialized.")
         return jsonify({"error": "Firestore not initialized"}), 500
     try:
-        teams_ref = db.collection('global_teams').order_by('name').get()
+        # Get year parameter from query string (default to current year)
+        year = request.args.get('year', str(datetime.now().year))
+        app.logger.info(f"Fetching global teams for year: {year}")
+        
+        teams_ref = db.collection('global_teams').where('year', '==', year).order_by('name').get()
         teams_list = []
         for doc in teams_ref:
             team_data = doc.to_dict()
@@ -1246,26 +1250,31 @@ def get_global_teams():
 
 @app.route('/api/global_teams', methods=['POST'])
 def create_global_team():
-    """Create a new global team"""
+    """Create a new global team for a specific year"""
     if not db:
         app.logger.error("Firestore DB not initialized.")
         return jsonify({"error": "Firestore not initialized"}), 500
     try:
         data = request.json
-        if not data or 'name' not in data:
-            return jsonify({"error": "Missing 'name' for new team"}), 400
+        if not data or 'name' not in data or 'year' not in data:
+            return jsonify({"error": "Missing 'name' or 'year' for new team"}), 400
 
         team_name = data['name'].strip()
+        year = data['year'].strip()
+        
         if not team_name:
             return jsonify({"error": "Team name cannot be empty"}), 400
+        if not year:
+            return jsonify({"error": "Year cannot be empty"}), 400
 
-        # Check if team name already exists
-        existing_teams = db.collection('global_teams').where('name', '==', team_name).limit(1).get()
+        # Check if team name already exists for this year
+        existing_teams = db.collection('global_teams').where('name', '==', team_name).where('year', '==', year).limit(1).get()
         if len(list(existing_teams)) > 0:
-            return jsonify({"error": "Team name already exists"}), 409
+            return jsonify({"error": "Team name already exists for this year"}), 409
 
         new_team_data = {
             "name": team_name,
+            "year": year,
             "golferNames": data.get('golferNames', []),
             "participatesInAnnual": data.get('participatesInAnnual', True),
             "draftOrder": data.get('draftOrder', 0),
@@ -1274,7 +1283,7 @@ def create_global_team():
         }
         
         doc_ref = db.collection('global_teams').add(new_team_data)
-        return jsonify({"message": "Global team created successfully", "id": doc_ref[1].id, "name": team_name}), 201
+        return jsonify({"message": "Global team created successfully", "id": doc_ref[1].id, "name": team_name, "year": year}), 201
     except Exception as e:
         app.logger.error(f"Error creating global team: {e}")
         return jsonify({"error": str(e)}), 500
@@ -1297,15 +1306,22 @@ def update_global_team(team_id):
 
         # Prepare update data
         update_data = {}
+        # Get the team's year to ensure name uniqueness within the same year
+        current_team_data = doc.to_dict()
+        team_year = current_team_data.get('year', '')
+        
         if 'name' in data:
             team_name = data['name'].strip()
             if not team_name:
                 return jsonify({"error": "Team name cannot be empty"}), 400
-            # Check if new name conflicts with existing teams (excluding current team)
-            existing_teams = db.collection('global_teams').where('name', '==', team_name).get()
+            # Check if new name conflicts with existing teams in same year (excluding current team)
+            if team_year:
+                existing_teams = db.collection('global_teams').where('name', '==', team_name).where('year', '==', team_year).get()
+            else:
+                existing_teams = db.collection('global_teams').where('name', '==', team_name).get()
             for existing_doc in existing_teams:
                 if existing_doc.id != team_id:
-                    return jsonify({"error": "Team name already exists"}), 409
+                    return jsonify({"error": "Team name already exists for this year"}), 409
             update_data['name'] = team_name
 
         if 'golferNames' in data:
@@ -1350,6 +1366,51 @@ def delete_global_team(team_id):
         return jsonify({"message": f"Global team {team_id} deleted successfully"}), 200
     except Exception as e:
         app.logger.error(f"Error deleting global team {team_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/global_teams/copy_year', methods=['POST'])
+def copy_global_teams_year():
+    """Copy all global teams from one year to another"""
+    if not db:
+        app.logger.error("Firestore DB not initialized.")
+        return jsonify({"error": "Firestore not initialized"}), 500
+    try:
+        data = request.json
+        if not data or 'fromYear' not in data or 'toYear' not in data:
+            return jsonify({"error": "Missing 'fromYear' or 'toYear'"}), 400
+        
+        from_year = data['fromYear'].strip()
+        to_year = data['toYear'].strip()
+        
+        if not from_year or not to_year:
+            return jsonify({"error": "fromYear and toYear cannot be empty"}), 400
+        
+        # Check if teams already exist for the target year
+        existing_teams = db.collection('global_teams').where('year', '==', to_year).limit(1).get()
+        if len(list(existing_teams)) > 0:
+            return jsonify({"error": f"Teams already exist for year {to_year}. Delete them first if you want to copy."}), 409
+        
+        # Fetch teams from source year
+        source_teams = db.collection('global_teams').where('year', '==', from_year).get()
+        teams_copied = 0
+        
+        for team_doc in source_teams:
+            team_data = team_doc.to_dict()
+            new_team = {
+                "name": team_data.get('name', 'Unknown'),
+                "year": to_year,
+                "golferNames": [],  # Reset golfers for new year
+                "participatesInAnnual": team_data.get('participatesInAnnual', True),
+                "draftOrder": team_data.get('draftOrder', 0),
+                "preferredTournaments": [],  # Reset preferred tournaments
+                "createdAt": firestore.SERVER_TIMESTAMP
+            }
+            db.collection('global_teams').add(new_team)
+            teams_copied += 1
+        
+        return jsonify({"message": f"Copied {teams_copied} teams from {from_year} to {to_year}"}), 200
+    except Exception as e:
+        app.logger.error(f"Error copying global teams: {e}")
         return jsonify({"error": str(e)}), 500
 
 # --- Team Preferred Tournaments Management ---
@@ -1614,9 +1675,9 @@ def create_tournament():
         doc_ref = db.collection('tournaments').add(new_tournament_data)
         tournament_id = doc_ref[1].id
 
-        # Auto-assign all global teams to the new tournament
+        # Auto-assign all global teams for this year to the new tournament
         try:
-            global_teams_ref = db.collection('global_teams').order_by('name').get()
+            global_teams_ref = db.collection('global_teams').where('year', '==', year).order_by('name').get()
             team_assignments = []
             legacy_teams = []
             for team_doc in global_teams_ref:
@@ -1633,7 +1694,7 @@ def create_tournament():
                     "teamAssignments": team_assignments,
                     "teams": legacy_teams
                 })
-                app.logger.info(f"Auto-assigned {len(team_assignments)} global teams to tournament {tournament_id}")
+                app.logger.info(f"Auto-assigned {len(team_assignments)} global teams for year {year} to tournament {tournament_id}")
         except Exception as team_error:
             app.logger.warning(f"Could not auto-assign global teams: {team_error}")
 
@@ -2471,9 +2532,33 @@ def get_annual_championship():
             tournament_data = doc.to_dict()
             tournament_id = doc.id
             
-            # Skip if team assignments don't participate in annual championship
-            team_assignments = tournament_data.get('teams', [])
-            annual_teams = [team for team in team_assignments if team.get('participatesInAnnual', True)]
+            # Get team assignments and filter by participatesInAnnual from global_teams
+            team_assignments = tournament_data.get('teamAssignments', [])
+            annual_teams = []
+            
+            # Look up each team in global_teams to check if they participate in annual championship
+            for assignment in team_assignments:
+                global_team_id = assignment.get('globalTeamId')
+                if global_team_id:
+                    try:
+                        global_team_doc = db.collection('global_teams').document(global_team_id).get()
+                        if global_team_doc.exists:
+                            global_team_data = global_team_doc.to_dict()
+                            # Only include teams that belong to this year and participate in annual
+                            if global_team_data.get('year') == year and global_team_data.get('participatesInAnnual', True):
+                                annual_teams.append({
+                                    "name": global_team_data.get("name", "Unknown"),
+                                    "golferNames": global_team_data.get("golferNames", []),
+                                    "participatesInAnnual": True,
+                                    "draftOrder": global_team_data.get("draftOrder", 0)
+                                })
+                    except Exception as team_error:
+                        app.logger.warning(f"Error fetching global team {global_team_id}: {team_error}")
+                        # Fallback to legacy teams data if global team lookup fails
+                        legacy_teams = tournament_data.get('teams', [])
+                        for legacy_team in legacy_teams:
+                            if legacy_team.get('participatesInAnnual', True):
+                                annual_teams.append(legacy_team)
             
             if not annual_teams:
                 continue

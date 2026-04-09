@@ -2556,29 +2556,34 @@ def get_annual_championship():
             team_assignments = tournament_data.get('teamAssignments', [])
             annual_teams = []
             
-            # Look up each team in global_teams to check if they participate in annual championship
-            for assignment in team_assignments:
-                global_team_id = assignment.get('globalTeamId')
-                if global_team_id:
-                    try:
-                        global_team_doc = db.collection('global_teams').document(global_team_id).get()
-                        if global_team_doc.exists:
-                            global_team_data = global_team_doc.to_dict()
-                            # Only include teams that belong to this year and participate in annual
-                            if global_team_data.get('year') == year and global_team_data.get('participatesInAnnual', True):
-                                annual_teams.append({
-                                    "name": global_team_data.get("name", "Unknown"),
-                                    "golferNames": global_team_data.get("golferNames", []),
-                                    "participatesInAnnual": True,
-                                    "draftOrder": global_team_data.get("draftOrder", 0)
-                                })
-                    except Exception as team_error:
-                        app.logger.warning(f"Error fetching global team {global_team_id}: {team_error}")
-                        # Fallback to legacy teams data if global team lookup fails
-                        legacy_teams = tournament_data.get('teams', [])
-                        for legacy_team in legacy_teams:
-                            if legacy_team.get('participatesInAnnual', True):
-                                annual_teams.append(legacy_team)
+            # NEW APPROACH: Try teamAssignments first, fall back to legacy teams
+            if team_assignments:
+                # Look up each team in global_teams to check if they participate in annual championship
+                for assignment in team_assignments:
+                    global_team_id = assignment.get('globalTeamId')
+                    if global_team_id:
+                        try:
+                            global_team_doc = db.collection('global_teams').document(global_team_id).get()
+                            if global_team_doc.exists:
+                                global_team_data = global_team_doc.to_dict()
+                                team_year = global_team_data.get('year', '2025')  # Default to 2025 for backwards compatibility
+                                # Only include teams that belong to this year and participate in annual
+                                if team_year == year and global_team_data.get('participatesInAnnual', True):
+                                    annual_teams.append({
+                                        "name": global_team_data.get("name", "Unknown"),
+                                        "golferNames": global_team_data.get("golferNames", []),
+                                        "participatesInAnnual": True,
+                                        "draftOrder": global_team_data.get("draftOrder", 0)
+                                    })
+                        except Exception as team_error:
+                            app.logger.warning(f"Error fetching global team {global_team_id}: {team_error}")
+            else:
+                # LEGACY FALLBACK: Use embedded teams data from tournament
+                app.logger.info(f"Tournament {tournament_id} using legacy teams field")
+                legacy_teams = tournament_data.get('teams', [])
+                for legacy_team in legacy_teams:
+                    if legacy_team.get('participatesInAnnual', True):
+                        annual_teams.append(legacy_team)
             
             if not annual_teams:
                 continue

@@ -15,16 +15,32 @@ load_dotenv()
 
 def main():
     # Initialize Firebase Admin SDK
+    db = None
     if not firebase_admin._apps:
-        # Check if GOOGLE_APPLICATION_CREDENTIALS is set
-        if os.getenv('GOOGLE_APPLICATION_CREDENTIALS'):
-            cred = credentials.ApplicationDefault()
-        else:
-            print("Error: GOOGLE_APPLICATION_CREDENTIALS environment variable not set")
-            print("Please set it to point to your service account key JSON file")
-            return
+        FIREBASE_SERVICE_ACCOUNT_KEY_PATH = os.getenv("FIREBASE_SERVICE_ACCOUNT_KEY_PATH")
         
-        firebase_admin.initialize_app(cred)
+        try:
+            # Deployed environment: Use default credentials from the environment
+            if not FIREBASE_SERVICE_ACCOUNT_KEY_PATH:
+                print("FIREBASE_SERVICE_ACCOUNT_KEY_PATH not set. Using default credentials.")
+                firebase_admin.initialize_app()
+            # Secret Manager or env var: JSON content provided directly
+            elif FIREBASE_SERVICE_ACCOUNT_KEY_PATH.strip().startswith('{'):
+                print("FIREBASE_SERVICE_ACCOUNT_KEY_PATH contains JSON content. Parsing directly.")
+                import json
+                service_account_info = json.loads(FIREBASE_SERVICE_ACCOUNT_KEY_PATH)
+                cred = credentials.Certificate(service_account_info)
+                firebase_admin.initialize_app(cred)
+            # Local environment: Use the service account key file path
+            else:
+                print(f"Using service account key file: {FIREBASE_SERVICE_ACCOUNT_KEY_PATH}")
+                cred = credentials.Certificate(FIREBASE_SERVICE_ACCOUNT_KEY_PATH)
+                firebase_admin.initialize_app(cred)
+            
+            print("✓ Firebase Admin SDK initialized successfully")
+        except Exception as e:
+            print(f"Error initializing Firebase Admin SDK: {e}")
+            return
     
     db = firestore.client()
     

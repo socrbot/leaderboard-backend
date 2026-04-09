@@ -14,6 +14,8 @@ import logging
 from threading import Lock
 import schedule
 import threading
+import unicodedata
+import re
 
 # --- Firebase Admin SDK Imports ---
 import firebase_admin
@@ -420,6 +422,21 @@ def parse_numeric_score(score_str):
     except (ValueError, TypeError):
         return 0
 
+def normalize_name(name):
+    """Normalize name for matching - handles Unicode characters, hyphens, and spacing"""
+    if not name:
+        return ""
+    
+    # Normalize Unicode characters (å→a, ø→o, etc.) using NFD decomposition
+    normalized = unicodedata.normalize('NFD', name)
+    # Remove combining characters (accents, diacritics)
+    ascii_name = ''.join(char for char in normalized if unicodedata.category(char) != 'Mn')
+    
+    # Remove hyphens and extra spaces, convert to lowercase
+    cleaned = re.sub(r'[-\s]+', ' ', ascii_name).strip().lower()
+    
+    return cleaned
+
 def get_golfer_round_score(player, round_num, current_par):
     """Get a golfer's score for a specific round"""
     if player.get('rounds') and isinstance(player['rounds'], list):
@@ -492,20 +509,21 @@ def calculate_team_scores(players, team_assignments, current_par):
         team_rounds_relative = {'r1': [], 'r2': [], 'r3': [], 'r4': []}
         
         for golfer_name in team_def.get('golferNames', []):
-            normalized_name = golfer_name.strip().lower()
+            # Normalize the stored golfer name (handles Unicode, hyphens, etc.)
+            normalized_stored_name = normalize_name(golfer_name)
             
-            # Try exact match first
+            # Try exact match first using normalized names
             found_player = next((p for p in players or [] 
-                               if f"{p.get('firstName', '')} {p.get('lastName', '')}".strip().lower() == normalized_name), None)
+                               if normalize_name(f"{p.get('firstName', '')} {p.get('lastName', '')}") == normalized_stored_name), None)
             
             # If no exact match, try matching on last name only (handles Chris vs Christopher, etc.)
             if not found_player:
-                name_parts = normalized_name.split()
+                name_parts = normalized_stored_name.split()
                 if len(name_parts) >= 2:
                     last_name = name_parts[-1]  # Take the last word as last name
                     found_player = next((p for p in players or [] 
-                                       if p.get('lastName', '').lower() == last_name and 
-                                       any(part in p.get('firstName', '').lower() for part in name_parts[:-1])), None)
+                                       if normalize_name(p.get('lastName', '')) == last_name and 
+                                       any(part in normalize_name(p.get('firstName', '')) for part in name_parts[:-1])), None)
             
             # Log if still not found
             if not found_player:

@@ -1235,7 +1235,8 @@ def get_global_teams():
         year = request.args.get('year', str(datetime.now().year))
         app.logger.info(f"Fetching global teams for year: {year}")
         
-        teams_ref = db.collection('global_teams').where('year', '==', year).order_by('name').get()
+        # Fetch teams for the year (removed order_by to avoid composite index requirement)
+        teams_ref = db.collection('global_teams').where('year', '==', year).get()
         teams_list = []
         for doc in teams_ref:
             team_data = doc.to_dict()
@@ -1243,6 +1244,10 @@ def get_global_teams():
                 "id": doc.id,
                 **team_data
             })
+        
+        # Sort by name in Python instead of Firestore
+        teams_list.sort(key=lambda x: x.get('name', '').lower())
+        
         return jsonify(teams_list), 200
     except Exception as e:
         app.logger.error(f"Error fetching global teams: {e}")
@@ -1677,18 +1682,33 @@ def create_tournament():
 
         # Auto-assign all global teams for this year to the new tournament
         try:
-            global_teams_ref = db.collection('global_teams').where('year', '==', year).order_by('name').get()
+            # Fetch teams for the year (removed order_by to avoid composite index requirement)
+            global_teams_ref = db.collection('global_teams').where('year', '==', year).get()
             team_assignments = []
             legacy_teams = []
+            teams_data = []
+            
+            # Collect all teams
             for team_doc in global_teams_ref:
                 team_data = team_doc.to_dict()
-                team_assignments.append({"globalTeamId": team_doc.id})
-                legacy_teams.append({
-                    "name": team_data.get("name", "Unknown"),
-                    "golferNames": team_data.get("golferNames", []),
-                    "participatesInAnnual": team_data.get("participatesInAnnual", True),
-                    "draftOrder": team_data.get("draftOrder", 0)
+                teams_data.append({
+                    'id': team_doc.id,
+                    'data': team_data
                 })
+            
+            # Sort by name in Python
+            teams_data.sort(key=lambda x: x['data'].get('name', '').lower())
+            
+            # Build assignments and legacy teams
+            for team_info in teams_data:
+                team_assignments.append({"globalTeamId": team_info['id']})
+                legacy_teams.append({
+                    "name": team_info['data'].get("name", "Unknown"),
+                    "golferNames": team_info['data'].get("golferNames", []),
+                    "participatesInAnnual": team_info['data'].get("participatesInAnnual", True),
+                    "draftOrder": team_info['data'].get("draftOrder", 0)
+                })
+            
             if team_assignments:
                 db.collection('tournaments').document(tournament_id).update({
                     "teamAssignments": team_assignments,

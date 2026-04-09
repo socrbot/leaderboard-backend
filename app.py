@@ -491,8 +491,27 @@ def calculate_team_scores(players, team_assignments, current_par):
         
         for golfer_name in team_def.get('golferNames', []):
             normalized_name = golfer_name.strip().lower()
+            
+            # Try exact match first
             found_player = next((p for p in players or [] 
                                if f"{p.get('firstName', '')} {p.get('lastName', '')}".strip().lower() == normalized_name), None)
+            
+            # If no exact match, try matching on last name only (handles Chris vs Christopher, etc.)
+            if not found_player:
+                name_parts = normalized_name.split()
+                if len(name_parts) >= 2:
+                    last_name = name_parts[-1]  # Take the last word as last name
+                    found_player = next((p for p in players or [] 
+                                       if p.get('lastName', '').lower() == last_name and 
+                                       any(part in p.get('firstName', '').lower() for part in name_parts[:-1])), None)
+            
+            # Log if still not found
+            if not found_player:
+                app.logger.warning(f"Could not find player '{golfer_name}' in leaderboard data")
+                # Log available players for debugging
+                if players and len(players) > 0:
+                    sample_names = [f"{p.get('firstName', '')} {p.get('lastName', '')}" for p in players[:5]]
+                    app.logger.info(f"Sample player names from API: {sample_names}")
             
             if found_player:
                 player_status = found_player.get('status', 'N/A')

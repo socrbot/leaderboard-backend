@@ -434,7 +434,9 @@ def get_golfer_round_score(player, round_num, current_par):
     # Check current round
     current_round = player.get('currentRound')
     if isinstance(current_round, dict) and '$numberInt' in current_round:
-        current_round = current_round['$numberInt']
+        current_round = int(current_round['$numberInt'])  # Convert string to int
+    elif current_round is not None:
+        current_round = int(current_round)  # Handle direct integer values
     
     if (current_round == round_num and 
         player.get('currentRoundScore') is not None and 

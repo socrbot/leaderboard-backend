@@ -533,20 +533,29 @@ def calculate_team_scores(players, team_assignments, current_par):
     
     # Calculate worst score per round for penalty calculation
     # Cut players get the worst score from that specific round + 1 stroke
+    # IMPORTANT: Can only calculate penalty AFTER the round is completed
     worst_round_scores = {1: None, 2: None, 3: None, 4: None}
     
     for round_num in [1, 2, 3, 4]:
         worst_score = None
+        round_has_completed_scores = False
+        
         for player in players or []:
             # Only consider non-cut players who completed the round
             if player.get('status') != 'cut':
                 round_score = get_golfer_round_score(player, round_num, current_par)
-                if round_score['score'] is not None:
+                # Check if this is a completed score (not live)
+                if round_score['score'] is not None and not round_score.get('isLive', False):
+                    round_has_completed_scores = True
                     if worst_score is None or round_score['score'] > worst_score:
                         worst_score = round_score['score']
         
-        # Set penalty as worst score + 1, or default to 10 if no scores found
-        worst_round_scores[round_num] = (worst_score + 1) if worst_score is not None else 10
+        # Only set penalty if the round has completed scores
+        # Otherwise, leave as None (penalty cannot be calculated yet)
+        if round_has_completed_scores and worst_score is not None:
+            worst_round_scores[round_num] = worst_score + 1
+        else:
+            worst_round_scores[round_num] = None
     
     for team_def in team_assignments or []:
         team_players = []
@@ -591,11 +600,17 @@ def calculate_team_scores(players, team_assignments, current_par):
                     round_score = get_golfer_round_score(found_player, round_num, current_par)
                     
                     # If player is cut and didn't play this round, assign penalty score for that round
+                    # BUT only if the round is complete and penalty can be calculated
                     if is_cut and round_score['score'] is None:
                         penalty_score = worst_round_scores[round_num]
-                        round_score = {'score': penalty_score, 'isLive': False, 'isPenalty': True}
-                        cut_player_total += penalty_score
-                        cut_penalty_rounds.append(round_num)
+                        if penalty_score is not None:
+                            # Round is complete, apply penalty
+                            round_score = {'score': penalty_score, 'isLive': False, 'isPenalty': True}
+                            cut_player_total += penalty_score
+                            cut_penalty_rounds.append(round_num)
+                        else:
+                            # Round not complete yet, leave as None
+                            round_score['isPenalty'] = False
                     else:
                         round_score['isPenalty'] = False
                         if round_score['score'] is not None:

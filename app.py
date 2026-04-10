@@ -531,16 +531,22 @@ def calculate_team_scores(players, team_assignments, current_par):
                 if val is not None:
                     app.logger.info(f"  Team {i} {key}='{val}' (type={type(val).__name__})")
     
-    # First, find the highest scoring non-cut player for penalty calculation
-    highest_non_cut_score = None
-    for player in players or []:
-        if player.get('status') != 'cut' and player.get('total') is not None:
-            player_total = parse_numeric_score(player.get('total'))
-            if highest_non_cut_score is None or player_total > highest_non_cut_score:
-                highest_non_cut_score = player_total
+    # Calculate worst score per round for penalty calculation
+    # Cut players get the worst score from that specific round + 1 stroke
+    worst_round_scores = {1: None, 2: None, 3: None, 4: None}
     
-    # If no non-cut players found, use a default penalty score
-    cut_penalty_score = (highest_non_cut_score + 1) if highest_non_cut_score is not None else 10
+    for round_num in [1, 2, 3, 4]:
+        worst_score = None
+        for player in players or []:
+            # Only consider non-cut players who completed the round
+            if player.get('status') != 'cut':
+                round_score = get_golfer_round_score(player, round_num, current_par)
+                if round_score['score'] is not None:
+                    if worst_score is None or round_score['score'] > worst_score:
+                        worst_score = round_score['score']
+        
+        # Set penalty as worst score + 1, or default to 10 if no scores found
+        worst_round_scores[round_num] = (worst_score + 1) if worst_score is not None else 10
     
     for team_def in team_assignments or []:
         team_players = []
@@ -577,25 +583,33 @@ def calculate_team_scores(players, team_assignments, current_par):
                 
                 # For cut players, use penalty score for rounds they didn't complete
                 golfer_round_scores = {}
+                cut_player_total = 0
+                cut_penalty_rounds = []
+                
                 for round_num in [1, 2, 3, 4]:
                     round_key = f'r{round_num}'
                     round_score = get_golfer_round_score(found_player, round_num, current_par)
                     
-                    # If player is cut and didn't play this round, assign penalty score
+                    # If player is cut and didn't play this round, assign penalty score for that round
                     if is_cut and round_score['score'] is None:
-                        round_score = {'score': cut_penalty_score, 'isLive': False, 'isPenalty': True}
+                        penalty_score = worst_round_scores[round_num]
+                        round_score = {'score': penalty_score, 'isLive': False, 'isPenalty': True}
+                        cut_player_total += penalty_score
+                        cut_penalty_rounds.append(round_num)
                     else:
                         round_score['isPenalty'] = False
+                        if round_score['score'] is not None:
+                            cut_player_total += round_score['score']
                     
                     golfer_round_scores[round_key] = round_score
                 
                 processed_player = {
                     'name': f"{found_player.get('firstName', '')} {found_player.get('lastName', '')}".strip(),
                     'status': player_status,
-                    'total': parse_numeric_score(found_player.get('total')) if not is_cut else cut_penalty_score,
+                    'total': parse_numeric_score(found_player.get('total')) if not is_cut else cut_player_total,
                     'thru': found_player.get('thru', ''),
                     'isCut': is_cut,
-                    'cutPenaltyScore': cut_penalty_score if is_cut else None,
+                    'cutPenaltyScore': {f'r{r}': worst_round_scores[r] for r in cut_penalty_rounds} if is_cut and cut_penalty_rounds else None,
                     **golfer_round_scores
                 }
                 team_players.append(processed_player)
@@ -664,8 +678,7 @@ def calculate_team_scores(players, team_assignments, current_par):
             'players': team_players,
             'cutPlayersCount': cut_players_count,
             'penaltyStrokesApplied': penalty_strokes_applied,
-            'cutPenaltyScore': cut_penalty_score,
-            'highestNonCutScore': highest_non_cut_score,
+            'worstRoundScores': worst_round_scores,
             'validRounds': valid_round_count,
             'roundDetails': round_details
         })

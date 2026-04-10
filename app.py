@@ -407,6 +407,16 @@ def should_recalculate_scores(tournament_id, current_leaderboard_data):
             app.logger.info(f"Tournament {tournament_id} became official, recalculating final scores")
             return True
         
+        # Recalculate if par has changed
+        stored_par = stored_data.get('metadata', {}).get('par', 71)
+        tournament_ref = db.collection('tournaments').document(tournament_id)
+        tournament_doc = tournament_ref.get()
+        if tournament_doc.exists:
+            current_par = tournament_doc.to_dict().get('par', 71)
+            if stored_par != current_par:
+                app.logger.info(f"Par changed for tournament {tournament_id} (was {stored_par}, now {current_par}), recalculating scores")
+                return True
+        
         return False
         
     except Exception as e:

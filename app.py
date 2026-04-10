@@ -471,17 +471,22 @@ def normalize_name(name):
     return cleaned
 
 def get_golfer_round_score(player, round_num, current_par):
-    """Get a golfer's score for a specific round"""
+    """Get a golfer's score for a specific round - uses RapidAPI scoreToPar when available"""
     if player.get('rounds') and isinstance(player['rounds'], list):
         round_data = next((r for r in player['rounds'] 
                           if int(r.get('roundId', {}).get('$numberInt', r.get('roundId', 0))) == round_num), None)
-        if round_data and round_data.get('strokes') is not None:
-            strokes = round_data['strokes']
-            if isinstance(strokes, dict) and '$numberInt' in strokes:
-                strokes = strokes['$numberInt']
-            return {'score': parse_numeric_score(strokes) - current_par, 'isLive': False}
+        if round_data:
+            # Prefer scoreToPar from RapidAPI (already relative to par)
+            if round_data.get('scoreToPar') is not None:
+                return {'score': parse_numeric_score(round_data['scoreToPar']), 'isLive': False}
+            # Fallback to calculating from strokes (for backwards compatibility)
+            elif round_data.get('strokes') is not None:
+                strokes = round_data['strokes']
+                if isinstance(strokes, dict) and '$numberInt' in strokes:
+                    strokes = strokes['$numberInt']
+                return {'score': parse_numeric_score(strokes) - current_par, 'isLive': False}
     
-    # Check current round
+    # Check current round (already provides score to par)
     current_round = player.get('currentRound')
     if isinstance(current_round, dict) and '$numberInt' in current_round:
         current_round = int(current_round['$numberInt'])  # Convert string to int

@@ -259,7 +259,9 @@ def get_tournament_status_from_api(api_response):
         last_updated = api_response.get('lastUpdated', '')
         
         # Determine if tournament is officially complete
-        is_official_complete = status == TOURNAMENT_STATUS['OFFICIAL']
+        # Accept both 'Complete' and 'Official' statuses - 'Complete' means all rounds done,
+        # 'Official' means final results are officially certified. Both are valid for annual championship.
+        is_official_complete = status in COMPLETED_STATUSES
         is_in_progress = status in ACTIVE_STATUSES
         
         return {
@@ -2705,22 +2707,26 @@ def get_annual_championship():
     
     # Get year parameter from query string (default to current year)
     year = request.args.get('year', str(datetime.now().year))
+    force_refresh = request.args.get('refresh', 'false').lower() == 'true'
     app.logger.info(f"Fetching annual championship data for year: {year}")
     
     # Create year-specific cache key
     cache_key = f'annual_championship_{year}'
     cached_result = cache.get(cache_key)
-    if cached_result:
+    if cached_result and not force_refresh:
         app.logger.info(f"Returning cached annual championship data for year {year}")
         return jsonify(cached_result)
     
     try:
         # Fetch tournaments for the specified year only
         tournaments_ref = db.collection('tournaments').where('year', '==', year).get()
+        all_tournament_docs = list(tournaments_ref)
+        app.logger.info(f"Found {len(all_tournament_docs)} tournament(s) in Firestore for year '{year}'")
         annual_standings = {}
         processed_tournaments = []
+        skipped_tournaments = []
         
-        for doc in tournaments_ref:
+        for doc in all_tournament_docs:
             tournament_data = doc.to_dict()
             tournament_id = doc.id
             
@@ -2780,29 +2786,36 @@ def get_annual_championship():
                         app.logger.warning(f"Legacy team '{legacy_team.get('name')}' not found in global_teams for year {year}")
             
             if not annual_teams:
+                app.logger.warning(f"Tournament {tournament_id} ('{tournament_data.get('name')}') skipped: no annual-eligible teams found for year '{year}'. "
+                                   f"Check that global_teams exist for year '{year}' and have participatesInAnnual=True.")
+                skipped_tournaments.append({'id': tournament_id, 'name': tournament_data.get('name'), 'reason': f'no_eligible_teams_for_year_{year}'})
                 continue
             
             # Get tournament parameters
             org_id = tournament_data.get('orgId', '1')
             tourn_id = tournament_data.get('tournId')
-            year = tournament_data.get('year', '2025')
+            tournament_year = tournament_data.get('year', year)
             current_par = tournament_data.get('par', 71)
             
             if not tourn_id:
+                app.logger.warning(f"Tournament {tournament_id} skipped: no tournId set")
+                skipped_tournaments.append({'id': tournament_id, 'name': tournament_data.get('name'), 'reason': 'no_tourn_id'})
                 continue
             
             # Fetch leaderboard data
-            params = {'orgId': org_id, 'tournId': tourn_id, 'year': year}
+            params = {'orgId': org_id, 'tournId': tourn_id, 'year': tournament_year}
             leaderboard_data, error = make_rapidapi_request('/leaderboard', params)
             
             if error or not leaderboard_data:
                 app.logger.warning(f"Could not fetch leaderboard for tournament {tournament_id}: {error}")
+                skipped_tournaments.append({'id': tournament_id, 'name': tournament_data.get('name'), 'reason': f'leaderboard_fetch_failed: {error}'})
                 continue
             
             # Check if tournament is officially complete
             tournament_status = get_tournament_status_from_api(leaderboard_data)
             if not tournament_status['isOfficialComplete']:
                 app.logger.info(f"Skipping incomplete tournament {tournament_id} (status: {tournament_status['status']})")
+                skipped_tournaments.append({'id': tournament_id, 'name': tournament_data.get('name'), 'reason': f'not_complete (status: {tournament_status["status"]})'})
                 continue
             
             # Calculate team scores for this tournament
@@ -2857,7 +2870,9 @@ def get_annual_championship():
             'metadata': {
                 'calculatedAt': datetime.now().isoformat(),
                 'tournamentCount': len(processed_tournaments),
-                'teamCount': len(final_standings)
+                'teamCount': len(final_standings),
+                'totalTournamentsFound': len(all_tournament_docs),
+                'skippedTournaments': skipped_tournaments
             }
         }
         

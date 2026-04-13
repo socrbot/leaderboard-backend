@@ -2736,27 +2736,12 @@ def get_annual_championship():
             
             # NEW APPROACH: Try teamAssignments first, fall back to legacy teams
             if team_assignments:
-                # Look up each team in global_teams to check if they participate in annual championship
-                for assignment in team_assignments:
-                    global_team_id = assignment.get('globalTeamId')
-                    if global_team_id:
-                        try:
-                            global_team_doc = db.collection('global_teams').document(global_team_id).get()
-                            if global_team_doc.exists:
-                                global_team_data = global_team_doc.to_dict()
-                                # Include team if it participates in annual championship.
-                                # We do NOT filter by year here — the tournament document is already
-                                # scoped to the correct year. Filtering by year would incorrectly
-                                # exclude teams whose global_team IDs pre-date a year copy operation.
-                                if global_team_data.get('participatesInAnnual', True):
-                                    annual_teams.append({
-                                        "name": global_team_data.get("name", "Unknown"),
-                                        "golferNames": global_team_data.get("golferNames", []),
-                                        "participatesInAnnual": True,
-                                        "draftOrder": global_team_data.get("draftOrder", 0)
-                                    })
-                        except Exception as team_error:
-                            app.logger.warning(f"Error fetching global team {global_team_id}: {team_error}")
+                # tournament.teams already has golferNames (filled during draft) and
+                # participatesInAnnual (copied from global_teams at creation time).
+                # Use it directly — no extra Firestore reads needed.
+                for team in tournament_data.get('teams', []):
+                    if team.get('participatesInAnnual', True):
+                        annual_teams.append(team)
             else:
                 # LEGACY FALLBACK: Use embedded teams data but LOOK UP participatesInAnnual from global_teams
                 app.logger.info(f"Tournament {tournament_id} using legacy teams field")

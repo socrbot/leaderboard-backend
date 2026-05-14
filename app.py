@@ -879,8 +879,9 @@ def get_optimized_leaderboard():
                         return jsonify(result)
 
                 is_active = t_data.get('isActive', False)
+                is_draft_complete = t_data.get('IsDraftComplete', False)
                 has_stored_scores = t_data.get('lastCalculatedScores') is not None
-                if not is_complete and not is_active and not has_stored_scores:
+                if not is_complete and not is_active and not has_stored_scores and not is_draft_complete:
                     app.logger.info(f"Tournament {tournament_id} has not started — skipping RapidAPI call")
                     return jsonify({
                         'teamScores': [],
@@ -1025,8 +1026,9 @@ def get_tournament_leaderboard(tournament_id):
 
         # --- Skip RapidAPI for tournaments that have not started ---
         is_active = tournament_data.get('isActive', False)
+        is_draft_complete = tournament_data.get('IsDraftComplete', False)
         has_stored_scores = tournament_data.get('lastCalculatedScores') is not None
-        if not is_active and not has_stored_scores:
+        if not is_active and not has_stored_scores and not is_draft_complete:
             app.logger.info(f"Tournament {tournament_id} has not started — skipping RapidAPI call")
             return jsonify({
                 'teamScores': [],

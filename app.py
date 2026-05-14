@@ -571,14 +571,16 @@ def calculate_team_scores(players, team_assignments, current_par):
             found_player = next((p for p in players or [] 
                                if normalize_name(f"{p.get('firstName', '')} {p.get('lastName', '')}") == normalized_stored_name), None)
             
-            # If no exact match, try matching on last name only (handles Chris vs Christopher, etc.)
+            # If no exact match, try matching on last name only (handles Chris vs Christopher, Alex vs Alexander, etc.)
             if not found_player:
                 name_parts = normalized_stored_name.split()
                 if len(name_parts) >= 2:
                     last_name = name_parts[-1]  # Take the last word as last name
                     found_player = next((p for p in players or [] 
                                        if normalize_name(p.get('lastName', '')) == last_name and 
-                                       any(part in normalize_name(p.get('firstName', '')) for part in name_parts[:-1])), None)
+                                       any(part in normalize_name(p.get('firstName', '')) or
+                                           normalize_name(p.get('firstName', '')) in part
+                                           for part in name_parts[:-1])), None)
             
             # Log if still not found
             if not found_player:

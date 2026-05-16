@@ -1966,6 +1966,7 @@ def create_tournament():
         tourn_id = data.get('tournId', '').strip()
         year = data.get('year', '').strip()
         odds_id = data.get('oddsId', '').strip()
+        league_id = data.get('leagueId', '').strip()
 
         if not tournament_name or not tourn_id or not year or not odds_id:
             return jsonify({"error": "Missing tournament name, Tourn ID, Year, or Odds ID in request data"}), 400
@@ -1976,11 +1977,12 @@ def create_tournament():
             "tournId": tourn_id,
             "year": year,
             "oddsId": odds_id,
+            "leagueId": league_id,
             "teams": [],  # Legacy field for backward compatibility
             "teamAssignments": [],  # New field for global team references
-            "IsDraftStarted": False, # NEW: Initialize IsDraftStarted to false
-            "IsDraftComplete": False, # NEW: Initialize IsDraftComplete to false
-            "DraftLockedOdds": [],   # NEW: Initialize empty array for locked odds
+            "IsDraftStarted": False,
+            "IsDraftComplete": False,
+            "DraftLockedOdds": [],
             "createdAt": firestore.SERVER_TIMESTAMP
         }
         doc_ref = db.collection('tournaments').add(new_tournament_data)
@@ -2056,12 +2058,15 @@ def get_tournaments():
         return jsonify({"error": "Firestore not initialized"}), 500
     try:
         year_filter = request.args.get('year')
+        league_id_filter = request.args.get('leagueId')
         tournaments_ref = db.collection('tournaments').order_by('createdAt').get()
         tournaments_list = []
         for doc in tournaments_ref:
             tournament_data = doc.to_dict()
             tournament_year = tournament_data.get('year', '')
             if year_filter and tournament_year != year_filter:
+                continue
+            if league_id_filter and tournament_data.get('leagueId', '') != league_id_filter:
                 continue
             tournaments_list.append({
                 "id": doc.id,
@@ -3019,6 +3024,229 @@ def _generate_invite_code(length=8):
 
 LEAGUE_DOC = ('config', 'league')
 
+# ---------------------------------------------------------------------------
+# Multi-league endpoints  (/api/leagues/*)
+# Old single-league /api/league* endpoints remain below for V1 backward compat.
+# ---------------------------------------------------------------------------
+
+@app.route('/api/leagues', methods=['POST'])
+@require_admin
+def create_league():
+    """Create a new league (admin only)"""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+    try:
+        data = request.json or {}
+        name = (data.get('name', '') or '').strip() or 'My League'
+        invite_code = _generate_invite_code()
+        league_data = {
+            'name': name,
+            'inviteCode': invite_code,
+            'adminUid': request.uid,
+            'memberCount': 0,
+            'createdAt': firestore.SERVER_TIMESTAMP,
+        }
+        _, doc_ref = db.collection('leagues').add(league_data)
+        app.logger.info(f'League created by {request.uid}: {doc_ref.id}')
+        return jsonify({'leagueId': doc_ref.id, 'name': name, 'inviteCode': invite_code, 'memberCount': 0}), 201
+    except Exception as e:
+        app.logger.error(f'Error creating league: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/leagues/mine', methods=['GET'])
+@require_admin
+def get_my_leagues():
+    """List all leagues owned by the current admin"""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+    try:
+        docs = db.collection('leagues').where('adminUid', '==', request.uid).get()
+        leagues = []
+        for doc in docs:
+            d = doc.to_dict()
+            leagues.append({
+                'leagueId': doc.id,
+                'name': d.get('name', ''),
+                'inviteCode': d.get('inviteCode', ''),
+                'memberCount': d.get('memberCount', 0),
+            })
+        return jsonify(leagues), 200
+    except Exception as e:
+        app.logger.error(f'Error fetching leagues: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/leagues/join', methods=['POST'])
+@require_auth
+def join_league_by_code():
+    """Join a league by invite code — resolves which league from the code"""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+    try:
+        data = request.json or {}
+        invite_code = (data.get('inviteCode', '') or '').strip().upper()
+        if not invite_code:
+            return jsonify({'error': 'inviteCode is required'}), 400
+
+        leagues_ref = db.collection('leagues').where('inviteCode', '==', invite_code).limit(1).get()
+        leagues_list = list(leagues_ref)
+        if not leagues_list:
+            return jsonify({'error': 'Invalid invite code'}), 403
+
+        league_doc = leagues_list[0]
+        league_id = league_doc.id
+        league_ref = db.collection('leagues').document(league_id)
+
+        member_ref = league_ref.collection('members').document(request.uid)
+        if member_ref.get().exists:
+            return jsonify({'message': 'Already a member', 'alreadyMember': True, 'leagueId': league_id}), 200
+
+        try:
+            firebase_user = firebase_auth.get_user(request.uid)
+            display_name = firebase_user.display_name or ''
+            email = firebase_user.email or request.user_email or ''
+        except Exception:
+            display_name = ''
+            email = request.user_email or ''
+
+        member_ref.set({
+            'uid': request.uid,
+            'email': email,
+            'displayName': display_name,
+            'joinedAt': firestore.SERVER_TIMESTAMP,
+        })
+        league_ref.update({'memberCount': firestore.Increment(1)})
+
+        db.collection('users').document(request.uid).set(
+            {
+                'leagueIds': firestore.ArrayUnion([league_id]),
+                'inLeague': True,  # backward compat
+                'leagueJoinedAt': firestore.SERVER_TIMESTAMP,
+            },
+            merge=True
+        )
+        app.logger.info(f'User {request.uid} joined league {league_id}')
+        return jsonify({'message': 'Successfully joined the league', 'leagueId': league_id}), 200
+    except Exception as e:
+        app.logger.error(f'Error joining league: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/leagues/<league_id>', methods=['GET'])
+def get_league_by_id(league_id):
+    """Get league info by ID (public)"""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+    try:
+        doc = db.collection('leagues').document(league_id).get()
+        if not doc.exists:
+            return jsonify({'error': 'League not found'}), 404
+        d = doc.to_dict()
+        return jsonify({
+            'leagueId': doc.id,
+            'name': d.get('name', ''),
+            'inviteCode': d.get('inviteCode', ''),
+            'memberCount': d.get('memberCount', 0),
+            'adminUid': d.get('adminUid', ''),
+        }), 200
+    except Exception as e:
+        app.logger.error(f'Error fetching league {league_id}: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/leagues/<league_id>', methods=['PUT'])
+@require_admin
+def update_league_by_id(league_id):
+    """Update league name (admin only)"""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+    try:
+        data = request.json or {}
+        name = (data.get('name', '') or '').strip()
+        if not name:
+            return jsonify({'error': 'name is required'}), 400
+        ref = db.collection('leagues').document(league_id)
+        if not ref.get().exists:
+            return jsonify({'error': 'League not found'}), 404
+        ref.update({'name': name, 'updatedAt': firestore.SERVER_TIMESTAMP})
+        return jsonify({'name': name}), 200
+    except Exception as e:
+        app.logger.error(f'Error updating league {league_id}: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/leagues/<league_id>/regenerate_code', methods=['POST'])
+@require_admin
+def regenerate_league_code_by_id(league_id):
+    """Generate a new invite code (admin only)"""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+    try:
+        ref = db.collection('leagues').document(league_id)
+        if not ref.get().exists:
+            return jsonify({'error': 'League not found'}), 404
+        new_code = _generate_invite_code()
+        ref.update({'inviteCode': new_code, 'updatedAt': firestore.SERVER_TIMESTAMP})
+        return jsonify({'inviteCode': new_code}), 200
+    except Exception as e:
+        app.logger.error(f'Error regenerating code for {league_id}: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/leagues/<league_id>/members', methods=['GET'])
+@require_admin
+def get_league_members_by_id(league_id):
+    """List all league members (admin only)"""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+    try:
+        members_ref = db.collection('leagues').document(league_id).collection('members').get()
+        members = []
+        for doc in members_ref:
+            d = doc.to_dict()
+            members.append({
+                'uid': doc.id,
+                'email': d.get('email', ''),
+                'displayName': d.get('displayName', ''),
+                'joinedAt': d.get('joinedAt').isoformat() if d.get('joinedAt') else None,
+            })
+        members.sort(key=lambda m: m.get('joinedAt') or '')
+        return jsonify(members), 200
+    except Exception as e:
+        app.logger.error(f'Error fetching members for {league_id}: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/leagues/<league_id>/members/<member_uid>', methods=['DELETE'])
+@require_admin
+def remove_league_member_by_id(league_id, member_uid):
+    """Remove a member from a league (admin only)"""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+    if member_uid == request.uid:
+        return jsonify({'error': 'Cannot remove yourself from the league'}), 400
+    try:
+        league_ref = db.collection('leagues').document(league_id)
+        member_ref = league_ref.collection('members').document(member_uid)
+        if not member_ref.get().exists:
+            return jsonify({'error': 'Member not found'}), 404
+        member_ref.delete()
+        league_ref.update({'memberCount': firestore.Increment(-1)})
+        db.collection('users').document(member_uid).set(
+            {'leagueIds': firestore.ArrayRemove([league_id])},
+            merge=True
+        )
+        app.logger.info(f'Member {member_uid} removed from league {league_id} by {request.uid}')
+        return jsonify({'message': 'Member removed'}), 200
+    except Exception as e:
+        app.logger.error(f'Error removing member {member_uid} from {league_id}: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Legacy single-league endpoints (/api/league*)  — V1 backward compat
+# ---------------------------------------------------------------------------
 
 @app.route('/api/league', methods=['GET'])
 def get_league():

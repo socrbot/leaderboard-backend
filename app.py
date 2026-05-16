@@ -571,14 +571,16 @@ def calculate_team_scores(players, team_assignments, current_par):
             found_player = next((p for p in players or [] 
                                if normalize_name(f"{p.get('firstName', '')} {p.get('lastName', '')}") == normalized_stored_name), None)
             
-            # If no exact match, try matching on last name only (handles Chris vs Christopher, etc.)
+            # If no exact match, try matching on last name only (handles Chris vs Christopher, Alex vs Alexander, etc.)
             if not found_player:
                 name_parts = normalized_stored_name.split()
                 if len(name_parts) >= 2:
                     last_name = name_parts[-1]  # Take the last word as last name
                     found_player = next((p for p in players or [] 
                                        if normalize_name(p.get('lastName', '')) == last_name and 
-                                       any(part in normalize_name(p.get('firstName', '')) for part in name_parts[:-1])), None)
+                                       any(part in normalize_name(p.get('firstName', '')) or
+                                           normalize_name(p.get('firstName', '')) in part
+                                           for part in name_parts[:-1])), None)
             
             # Log if still not found
             if not found_player:
@@ -879,8 +881,9 @@ def get_optimized_leaderboard():
                         return jsonify(result)
 
                 is_active = t_data.get('isActive', False)
+                is_draft_complete = t_data.get('IsDraftComplete', False)
                 has_stored_scores = t_data.get('lastCalculatedScores') is not None
-                if not is_complete and not is_active and not has_stored_scores:
+                if not is_complete and not is_active and not has_stored_scores and not is_draft_complete:
                     app.logger.info(f"Tournament {tournament_id} has not started — skipping RapidAPI call")
                     return jsonify({
                         'teamScores': [],
@@ -1025,8 +1028,9 @@ def get_tournament_leaderboard(tournament_id):
 
         # --- Skip RapidAPI for tournaments that have not started ---
         is_active = tournament_data.get('isActive', False)
+        is_draft_complete = tournament_data.get('IsDraftComplete', False)
         has_stored_scores = tournament_data.get('lastCalculatedScores') is not None
-        if not is_active and not has_stored_scores:
+        if not is_active and not has_stored_scores and not is_draft_complete:
             app.logger.info(f"Tournament {tournament_id} has not started — skipping RapidAPI call")
             return jsonify({
                 'teamScores': [],

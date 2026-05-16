@@ -19,7 +19,7 @@ import re
 
 # --- Firebase Admin SDK Imports ---
 import firebase_admin
-from firebase_admin import credentials, firestore
+from firebase_admin import credentials, firestore, auth as firebase_auth
 
 # Load environment variables from .env file (only for local development)
 load_dotenv()
@@ -117,6 +117,35 @@ except Exception as e:
     # Depending on the desired behavior, you might want to raise the exception
     # to prevent the app from running without a database connection.
     raise
+
+# --- Auth Decorators ---
+def require_auth(f):
+    """Verify Firebase ID token sent as Authorization: Bearer <token>"""
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        auth_header = request.headers.get('Authorization', '')
+        if not auth_header.startswith('Bearer '):
+            return jsonify({'error': 'Missing or invalid Authorization header'}), 401
+        id_token = auth_header.split('Bearer ')[1]
+        try:
+            decoded = firebase_auth.verify_id_token(id_token)
+            request.uid = decoded['uid']
+            request.user_email = decoded.get('email', '')
+        except Exception:
+            return jsonify({'error': 'Invalid or expired token'}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+def require_admin(f):
+    """Require authenticated user with role == 'admin' in Firestore"""
+    @functools.wraps(f)
+    @require_auth
+    def decorated(*args, **kwargs):
+        user_doc = db.collection('users').document(request.uid).get()
+        if not user_doc.exists or user_doc.to_dict().get('role') != 'admin':
+            return jsonify({'error': 'Admin access required'}), 403
+        return f(*args, **kwargs)
+    return decorated
 
 # SportsData.io credentials for odds
 SPORTSDATA_IO_API_KEY = os.getenv("SPORTSDATA_IO_API_KEY")

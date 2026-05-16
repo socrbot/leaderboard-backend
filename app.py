@@ -1114,6 +1114,103 @@ def get_tournament_leaderboard(tournament_id):
         app.logger.error(f"Error fetching tournament leaderboard for {tournament_id}: {e}")
         return jsonify({'error': str(e)}), 500
 
+
+@app.route('/api/tournaments/<tournament_id>/player_scores', methods=['GET'])
+def get_tournament_player_scores(tournament_id):
+    """Get individual player leaderboard scores for a tournament (for Tournament Scores view)"""
+    if not db:
+        return jsonify({"error": "Firestore not initialized"}), 500
+
+    try:
+        doc_ref = db.collection('tournaments').document(tournament_id)
+        doc = doc_ref.get()
+
+        if not doc.exists:
+            return jsonify({'error': 'Tournament not found'}), 404
+
+        tournament_data = doc.to_dict()
+        org_id = tournament_data.get('orgId', '1')
+        tourn_id = tournament_data.get('tournId')
+        year = tournament_data.get('year', '2025')
+
+        if not tourn_id:
+            return jsonify({'error': 'Tournament missing tournId parameter'}), 400
+
+        cache_key = ('player_scores', tournament_id)
+
+        # For completed tournaments, return stored leaderboard rows
+        is_complete = tournament_data.get('isOfficiallyComplete', False) or tournament_data.get('isComplete', False)
+        if is_complete:
+            if cache_key in CACHE:
+                cached_data, _ = CACHE[cache_key]
+                return jsonify(cached_data)
+            stored_results = get_stored_scores(tournament_id, max_age_minutes=None)
+            rows = []
+            if stored_results:
+                leaderboard_data = stored_results.get('leaderboardData', {})
+                rows = leaderboard_data.get('leaderboardRows', [])
+            result = {
+                'leaderboardRows': rows,
+                'isOfficiallyComplete': True,
+                'isInProgress': False,
+                'tournamentStatus': 'Official',
+                'dataFreshness': 'stored'
+            }
+            CACHE[cache_key] = (result, time.time())
+            return jsonify(result)
+
+        # For tournaments that have not started
+        is_draft_complete = tournament_data.get('IsDraftComplete', False)
+        is_active = tournament_data.get('isActive', False)
+        has_stored_scores = tournament_data.get('lastCalculatedScores') is not None
+        if not is_active and not has_stored_scores and not is_draft_complete:
+            return jsonify({
+                'leaderboardRows': [],
+                'isOfficiallyComplete': False,
+                'isInProgress': False,
+                'tournamentStatus': 'Not Started',
+                'dataFreshness': 'not_started',
+                'message': 'Tournament has not started yet'
+            })
+
+        # Check cache for live data
+        if cache_key in CACHE:
+            cached_data, timestamp = CACHE[cache_key]
+            if (time.time() - timestamp) < LEADERBOARD_CACHE_TTL:
+                app.logger.info(f"Returning cached player scores for {tournament_id}")
+                return jsonify(cached_data)
+
+        # Fetch live data from RapidAPI
+        params = {'orgId': org_id, 'tournId': tourn_id, 'year': year}
+        data, error = make_rapidapi_request('/leaderboard', params,
+                                            request_source=f"player_scores_{tournament_id}")
+        if error:
+            return jsonify({"error": error}), 429 if "Rate limit" in error else 500
+
+        tournament_status = get_tournament_status_from_api(data)
+        result = {
+            'leaderboardRows': data.get('leaderboardRows', []),
+            'isOfficiallyComplete': tournament_status['isOfficialComplete'],
+            'isInProgress': tournament_status['isInProgress'],
+            'tournamentStatus': tournament_status['status'],
+            'dataFreshness': 'live',
+            'fetchedAt': datetime.now().isoformat()
+        }
+
+        # If tournament is now officially complete, store the leaderboard data for future use
+        if tournament_status['isOfficialComplete']:
+            store_calculated_scores(tournament_id, data, [], {
+                'calculationReason': 'player_scores_fetch',
+                'calculatedAt': datetime.now().isoformat()
+            })
+
+        CACHE[cache_key] = (result, time.time())
+        return jsonify(result)
+
+    except Exception as e:
+        app.logger.error(f"Error fetching player scores for tournament {tournament_id}: {e}")
+        return jsonify({'error': str(e)}), 500
+
 # Helper function to calculate average odds
 def calculate_average_odds(player_odds_data):
     player_odds_map = {}

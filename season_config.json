@@ -4,33 +4,25 @@
       "name": "The Masters",
       "year": "2026",
       "tournId": "014",
-      "oddsId": "688",
-      "startDate": "2026-04-09",
-      "endDate": "2026-04-12"
+      "oddsId": "688"
     },
     {
       "name": "PGA Championship",
       "year": "2026",
       "tournId": "033",
-      "oddsId": "689",
-      "startDate": "2026-05-21",
-      "endDate": "2026-05-24"
+      "oddsId": "689"
     },
     {
       "name": "U.S. Open",
       "year": "2026",
       "tournId": "026",
-      "oddsId": "690",
-      "startDate": "2026-06-18",
-      "endDate": "2026-06-21"
+      "oddsId": "690"
     },
     {
       "name": "The Open Championship",
       "year": "2026",
       "tournId": "100",
-      "oddsId": "692",
-      "startDate": "2026-07-16",
-      "endDate": "2026-07-19"
+      "oddsId": "692"
     }
   ]
 }

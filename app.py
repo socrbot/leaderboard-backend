@@ -872,6 +872,20 @@ def _normalize_name(name):
     import re
     return re.sub(r'[^a-z0-9]', '', name.lower())
 
+def _parse_rapidapi_date(raw):
+    """Parse a RapidAPI date value (str or MongoDB extended JSON dict) to a YYYY-MM-DD string."""
+    if isinstance(raw, str):
+        return raw[:10] or None
+    elif isinstance(raw, dict):
+        ms_val = raw.get('$date') or raw.get('$numberLong')
+        if isinstance(ms_val, dict):
+            ms_val = ms_val.get('$numberLong')
+        try:
+            return datetime.utcfromtimestamp(int(ms_val) / 1000).strftime('%Y-%m-%d')
+        except (TypeError, ValueError):
+            return None
+    return None
+
 @app.route('/api/season_config', methods=['GET'])
 def get_season_config():
     """Return the pre-configured tournament list for a given year from season_config.json."""
@@ -929,24 +943,17 @@ def build_season_config():
             sched_name = item.get('name', '')
             norm = _normalize_name(sched_name)
 
-            # Parse start date — mirrors frontend parseDateField logic
-            start_date = None
+            # Parse start/end dates from schedule item
             date_field = item.get('date', {})
             if isinstance(date_field, str):
-                start_date = date_field[:10] or None
+                start_date = _parse_rapidapi_date(date_field)
+                end_date = None
             elif isinstance(date_field, dict):
-                raw = date_field.get('start')
-                if isinstance(raw, str):
-                    start_date = raw[:10] or None
-                elif isinstance(raw, dict):
-                    # MongoDB extended JSON: { "$date": { "$numberLong": "..." } } or { "$date": "..." }
-                    ms_val = raw.get('$date') or raw.get('$numberLong')
-                    if isinstance(ms_val, dict):
-                        ms_val = ms_val.get('$numberLong')
-                    try:
-                        start_date = datetime.utcfromtimestamp(int(ms_val) / 1000).strftime('%Y-%m-%d')
-                    except (TypeError, ValueError):
-                        start_date = None
+                start_date = _parse_rapidapi_date(date_field.get('start'))
+                end_date = _parse_rapidapi_date(date_field.get('end'))
+            else:
+                start_date = None
+                end_date = None
 
             match = (
                 next((t for t in odds_items if _normalize_name(t['name']) == norm), None) or
@@ -959,6 +966,7 @@ def build_season_config():
                 "year": year,
                 "tournId": item.get('tournId', ''),
                 "startDate": start_date,
+                "endDate": end_date,
                 "oddsId": match['oddsId'] if match else "",
                 "oddsName": match['name'] if match else "",
                 "matched": bool(match),
@@ -2081,6 +2089,31 @@ def create_tournament():
 
         if not tournament_name or not tourn_id or not year or not odds_id:
             return jsonify({"error": "Missing tournament name, Tourn ID, Year, or Odds ID in request data"}), 400
+
+        # If dates not supplied (e.g. Quick Create from config), look them up from the PGA schedule API
+        if (not start_date or not end_date) and tourn_id and year:
+            try:
+                schedule_data, _ = make_rapidapi_request(
+                    '/schedule', {'year': year, 'orgId': org_id},
+                    bypass_rate_limit=True,
+                    request_source="create_tournament_date_lookup"
+                )
+                if schedule_data:
+                    match_item = next(
+                        (s for s in schedule_data.get('schedule', [])
+                         if str(s.get('tournId', '')) == tourn_id),
+                        None
+                    )
+                    if match_item:
+                        date_field = match_item.get('date', {})
+                        if isinstance(date_field, str):
+                            start_date = start_date or _parse_rapidapi_date(date_field) or ''
+                        elif isinstance(date_field, dict):
+                            start_date = start_date or _parse_rapidapi_date(date_field.get('start')) or ''
+                            end_date = end_date or _parse_rapidapi_date(date_field.get('end')) or ''
+                        app.logger.info(f"Resolved dates for tournId {tourn_id}: {start_date} – {end_date}")
+            except Exception as date_err:
+                app.logger.warning(f"Could not resolve tournament dates from schedule: {date_err}")
 
         new_tournament_data = {
             "name": tournament_name,

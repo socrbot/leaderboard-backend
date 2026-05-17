@@ -2555,6 +2555,7 @@ def get_draft_status(tournament_id):
             "numTeams": num_teams,
             "draftPicks": draft_picks,
             "teams": teams,
+            "DraftLockedOdds": draft_locked_odds,
             "currentPickTeam": current_pick_team,
             "currentRound": current_round,
             "currentTier": current_tier,

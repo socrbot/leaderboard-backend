@@ -3358,8 +3358,27 @@ def create_league():
             'createdAt': firestore.SERVER_TIMESTAMP,
         }
         _, doc_ref = db.collection('leagues').add(league_data)
-        app.logger.info(f'League created by {request.uid}: {doc_ref.id}')
-        return jsonify({'leagueId': doc_ref.id, 'name': name, 'inviteCode': invite_code, 'memberCount': 0}), 201
+        # Auto-enrol the creator as a member so they appear in drafts
+        try:
+            firebase_user = firebase_auth.get_user(request.uid)
+            admin_display_name = firebase_user.display_name or ''
+            admin_email = firebase_user.email or ''
+        except Exception:
+            admin_display_name = ''
+            admin_email = ''
+        doc_ref.collection('members').document(request.uid).set({
+            'uid': request.uid,
+            'email': admin_email,
+            'displayName': admin_display_name,
+            'joinedAt': firestore.SERVER_TIMESTAMP,
+        })
+        doc_ref.update({'memberCount': firestore.Increment(1)})
+        db.collection('users').document(request.uid).set(
+            {'leagueIds': firestore.ArrayUnion([doc_ref.id]), 'inLeague': True},
+            merge=True
+        )
+        app.logger.info(f'League created by {request.uid}: {doc_ref.id} (admin auto-enrolled)')
+        return jsonify({'leagueId': doc_ref.id, 'name': name, 'inviteCode': invite_code, 'memberCount': 1}), 201
     except Exception as e:
         app.logger.error(f'Error creating league: {e}')
         return jsonify({'error': str(e)}), 500

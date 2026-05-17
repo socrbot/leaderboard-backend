@@ -928,12 +928,25 @@ def build_season_config():
         for item in schedule_items:
             sched_name = item.get('name', '')
             norm = _normalize_name(sched_name)
+
+            # Parse start date — mirrors frontend parseDateField logic
             start_date = None
             date_field = item.get('date', {})
-            if isinstance(date_field, dict):
-                start_date = (date_field.get('start') or '')[:10] or None
-            elif isinstance(date_field, str):
+            if isinstance(date_field, str):
                 start_date = date_field[:10] or None
+            elif isinstance(date_field, dict):
+                raw = date_field.get('start')
+                if isinstance(raw, str):
+                    start_date = raw[:10] or None
+                elif isinstance(raw, dict):
+                    # MongoDB extended JSON: { "$date": { "$numberLong": "..." } } or { "$date": "..." }
+                    ms_val = raw.get('$date') or raw.get('$numberLong')
+                    if isinstance(ms_val, dict):
+                        ms_val = ms_val.get('$numberLong')
+                    try:
+                        start_date = datetime.utcfromtimestamp(int(ms_val) / 1000).strftime('%Y-%m-%d')
+                    except (TypeError, ValueError):
+                        start_date = None
 
             match = (
                 next((t for t in odds_items if _normalize_name(t['name']) == norm), None) or

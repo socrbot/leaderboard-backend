@@ -2347,15 +2347,19 @@ def lock_draft_odds(tournament_id):
                 # Exclude members who have opted out of this tournament
                 opted_out = db.collection('users').document(uid).get()
                 opted_out_ids = []
+                user_participates_in_annual = True
                 if opted_out.exists:
-                    opted_out_ids = opted_out.to_dict().get('optedOutTournaments', [])
+                    user_data = opted_out.to_dict()
+                    opted_out_ids = user_data.get('optedOutTournaments', [])
+                    user_participates_in_annual = user_data.get('participatesInAnnual', True)
                 if tournament_id not in opted_out_ids:
                     teams.append({
-                        "name": m.get("displayName") or m.get("email", uid),
+                        "name": m.get("teamName") or m.get("displayName") or m.get("email", uid),
                         "ownerUid": uid,
                         "ownerEmail": m.get("email", ""),
                         "golferNames": [],
                         "draftOrder": None,
+                        "participatesInAnnual": user_participates_in_annual,
                     })
 
         if not teams:
@@ -3451,10 +3455,12 @@ def join_league_by_code():
             display_name = ''
             email = request.user_email or ''
 
+        team_name = (data.get('teamName', '') or '').strip() or display_name or email
         member_ref.set({
             'uid': request.uid,
             'email': email,
             'displayName': display_name,
+            'teamName': team_name,
             'joinedAt': firestore.SERVER_TIMESTAMP,
         })
         league_ref.update({'memberCount': firestore.Increment(1)})

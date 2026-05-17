@@ -2539,9 +2539,10 @@ def lock_draft_odds(tournament_id):
         raw_player_odds = data["PlayerTournamentOdds"]
         averaged_odds_list = calculate_average_odds(raw_player_odds)
 
-        # Trim to exactly 4 × num_teams players so tiers are equal-sized
+        # Store how many players form the "tiered" draft pool (4 × num_teams),
+        # but keep the full list in DraftLockedOdds so search works across all players.
         num_teams = len(teams)
-        averaged_odds_list = averaged_odds_list[:4 * num_teams]
+        draft_pool_size = 4 * num_teams
 
         # Store tournament metadata from this one-time API call so get_single_tournament never re-calls
         tourn_meta = data.get("Tournament", {})
@@ -2559,11 +2560,12 @@ def lock_draft_odds(tournament_id):
             "teams": teams,
             "draftPicks": [],
             "DraftLockedOdds": averaged_odds_list,
+            "draftPoolSize": draft_pool_size,
             "DraftOddsLockedAt": firestore.SERVER_TIMESTAMP,
             "numTeams": num_teams,
             **meta_update,
         })
-        app.logger.info(f"Draft odds locked for {tournament_id}: {num_teams} teams, {len(averaged_odds_list)} players")
+        app.logger.info(f"Draft odds locked for {tournament_id}: {num_teams} teams, {len(averaged_odds_list)} players ({draft_pool_size} in tier pool)")
         return jsonify({
             "message": f"Draft odds locked for tournament {tournament_id}.",
             "numTeams": num_teams,
@@ -2594,6 +2596,7 @@ def get_draft_status(tournament_id):
         teams = tournament_data.get('teams', [])
         num_teams = len(teams)
         draft_picks = tournament_data.get('draftPicks', [])
+        draft_pool_size = tournament_data.get('draftPoolSize', 4 * num_teams)
 
         # Determine whose turn it is using snake draft
         current_pick_team = None
@@ -2624,6 +2627,7 @@ def get_draft_status(tournament_id):
             "IsDraftLocked": is_draft_locked,
             "IsDraftComplete": is_draft_complete,
             "numTeams": num_teams,
+            "draftPoolSize": draft_pool_size,
             "draftPicks": draft_picks,
             "teams": teams,
             "DraftLockedOdds": draft_locked_odds,

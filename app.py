@@ -2172,6 +2172,10 @@ def create_tournament():
         tournament_id = doc_ref[1].id
 
         # Auto-assign all global teams for this year to the new tournament
+        # Skip for league-based tournaments — teams[] will be populated at lock_draft_odds time
+        if league_id:
+            return jsonify({"message": "Tournament created successfully", "id": tournament_id, "name": tournament_name, "teamsAssigned": 0}), 201
+
         try:
             # Fetch teams for the year (removed order_by to avoid composite index requirement)
             global_teams_ref = db.collection('global_teams').where('year', '==', year).get()

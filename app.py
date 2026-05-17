@@ -2515,20 +2515,20 @@ def make_draft_pick(tournament_id):
                 "error": f"It is not your turn. Current pick belongs to: {current_team.get('name')}"
             }), 403
 
-        # Validate player hasn't already been picked
+        # Validate player exists in the locked odds list
         all_picked = {p['playerName'] for p in draft_picks}
         if player_name in all_picked:
             return jsonify({"error": f"{player_name} has already been picked"}), 400
 
-        # Determine actual tier from player's position in locked_odds (free-tier picking)
         locked_names = [p['name'] for p in locked_odds]
-        if player_name in locked_names:
-            player_pos = locked_names.index(player_name)
-            actual_tier_idx = player_pos // num_teams if num_teams > 0 else round_idx
-        else:
-            actual_tier_idx = None  # Custom pick: assign to first available slot
+        if player_name not in locked_names:
+            return jsonify({"error": f"{player_name} is not in the draft board. You must pick a golfer from the locked odds list."}), 400
 
-        # Validate slot availability and resolve custom-pick slot
+        # Determine which tier slot this player belongs to (tier-indexed golferNames)
+        player_pos = locked_names.index(player_name)
+        actual_tier_idx = player_pos // num_teams if num_teams > 0 else 0
+
+        # Validate slot availability for the current team
         target_team = next((t for t in teams if t.get('ownerUid') == current_team.get('ownerUid')), None)
         if target_team is None:
             return jsonify({"error": "Team not found for current user"}), 400
@@ -2537,14 +2537,8 @@ def make_draft_pick(tournament_id):
         while len(golfer_names) < 4:
             golfer_names.append(None)
 
-        if actual_tier_idx is not None:
-            if golfer_names[actual_tier_idx]:
-                return jsonify({"error": f"Tier {actual_tier_idx + 1} is already filled for your team"}), 400
-        else:
-            # Custom pick: fill first available slot
-            actual_tier_idx = next((i for i in range(4) if not golfer_names[i]), None)
-            if actual_tier_idx is None:
-                return jsonify({"error": "All tier slots are already filled for your team"}), 400
+        if golfer_names[actual_tier_idx]:
+            return jsonify({"error": f"Tier {actual_tier_idx + 1} is already filled for your team"}), 400
 
         # Record pick
         new_pick = {
@@ -2559,7 +2553,7 @@ def make_draft_pick(tournament_id):
         }
         draft_picks.append(new_pick)
 
-        # Update team's golferNames (tier-indexed: golferNames[tier_idx] = player)
+        # Update team's golferNames (tier-indexed)
         golfer_names[actual_tier_idx] = player_name
         target_team['golferNames'] = golfer_names
 

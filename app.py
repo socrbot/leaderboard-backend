@@ -2321,10 +2321,12 @@ def start_draft_flag(tournament_id):
 
 @app.route('/api/tournaments/<tournament_id>/lock_draft_odds', methods=['POST'])
 def lock_draft_odds(tournament_id):
+    """Lock odds, build team list from enrolled league members (opt-out model), randomize draft order."""
     if not db:
         app.logger.error("Firestore DB not initialized.")
         return jsonify({"error": "Firestore not initialized"}), 500
     try:
+        import random as _random
         doc_ref = db.collection('tournaments').document(tournament_id)
         doc = doc_ref.get()
         if not doc.exists:
@@ -2333,6 +2335,40 @@ def lock_draft_odds(tournament_id):
         odds_id = tournament_data.get("oddsId")
         if not odds_id:
             return jsonify({"error": "Tournament does not have an Odds ID configured."}), 400
+
+        # --- 1. Build enrolled team list from league members (opt-out model) ---
+        league_id = tournament_data.get("leagueId", "")
+        teams = []
+        if league_id:
+            members_ref = db.collection('leagues').document(league_id).collection('members').stream()
+            for member_doc in members_ref:
+                m = member_doc.to_dict()
+                uid = member_doc.id
+                # Exclude members who have opted out of this tournament
+                opted_out = db.collection('users').document(uid).get()
+                opted_out_ids = []
+                if opted_out.exists:
+                    opted_out_ids = opted_out.to_dict().get('optedOutTournaments', [])
+                if tournament_id not in opted_out_ids:
+                    teams.append({
+                        "name": m.get("displayName") or m.get("email", uid),
+                        "ownerUid": uid,
+                        "ownerEmail": m.get("email", ""),
+                        "golferNames": [],
+                        "draftOrder": None,
+                    })
+
+        if not teams:
+            return jsonify({"error": "No enrolled participants found for this tournament."}), 400
+
+        # --- 2. Randomize draft order ---
+        order = list(range(1, len(teams) + 1))
+        _random.shuffle(order)
+        for i, team in enumerate(teams):
+            team["draftOrder"] = order[i]
+        teams.sort(key=lambda t: t["draftOrder"])
+
+        # --- 3. Fetch and lock odds ---
         dynamic_odds_api_endpoint = f"https://api.sportsdata.io/v3/golf/odds/json/TournamentOdds/{odds_id}"
         params = {"key": SPORTSDATA_IO_API_KEY}
         response = requests.get(dynamic_odds_api_endpoint, params=params)
@@ -2342,17 +2378,31 @@ def lock_draft_odds(tournament_id):
             return jsonify({"error": "Could not retrieve live odds to lock in. API response missing player data."}), 500
         raw_player_odds = data["PlayerTournamentOdds"]
         averaged_odds_list = calculate_average_odds(raw_player_odds)
+
+        # Trim to exactly 4 × num_teams players so tiers are equal-sized
+        num_teams = len(teams)
+        averaged_odds_list = averaged_odds_list[:4 * num_teams]
+
         doc_ref.update({
+            "teams": teams,
+            "draftPicks": [],
             "DraftLockedOdds": averaged_odds_list,
-            "DraftOddsLockedAt": firestore.SERVER_TIMESTAMP
+            "DraftOddsLockedAt": firestore.SERVER_TIMESTAMP,
+            "numTeams": num_teams,
         })
-        return jsonify({"message": f"Draft odds locked for tournament {tournament_id}."}), 200
+        app.logger.info(f"Draft odds locked for {tournament_id}: {num_teams} teams, {len(averaged_odds_list)} players")
+        return jsonify({
+            "message": f"Draft odds locked for tournament {tournament_id}.",
+            "numTeams": num_teams,
+            "teams": [{"name": t["name"], "draftOrder": t["draftOrder"]} for t in teams],
+        }), 200
     except Exception as e:
         app.logger.error(f"Error locking draft odds for tournament {tournament_id}: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/tournaments/<tournament_id>/draft_status', methods=['GET'])
 def get_draft_status(tournament_id):
+    """Return draft state including picks, whose turn it is, and tier info."""
     if not db:
         app.logger.error("Firestore DB not initialized.")
         return jsonify({"error": "Firestore not initialized"}), 500
@@ -2362,17 +2412,160 @@ def get_draft_status(tournament_id):
         if not doc.exists:
             return jsonify({"error": "Tournament not found"}), 404
         tournament_data = doc.to_dict()
+
         is_draft_started = tournament_data.get('IsDraftStarted', False)
         draft_locked_odds = tournament_data.get('DraftLockedOdds', [])
-        is_draft_locked = bool(draft_locked_odds and len(draft_locked_odds) > 0)
+        is_draft_locked = bool(draft_locked_odds)
         is_draft_complete = tournament_data.get('IsDraftComplete', False)
+
+        teams = tournament_data.get('teams', [])
+        num_teams = len(teams)
+        draft_picks = tournament_data.get('draftPicks', [])
+
+        # Determine whose turn it is using snake draft
+        current_pick_team = None
+        current_round = None
+        current_tier = None
+        if is_draft_started and not is_draft_complete and num_teams > 0:
+            next_pick_number = len(draft_picks) + 1  # 1-based
+            total_picks = 4 * num_teams
+            if next_pick_number <= total_picks:
+                round_idx = (next_pick_number - 1) // num_teams   # 0-based round (0-3)
+                pick_in_round = (next_pick_number - 1) % num_teams # 0-based within round
+                sorted_teams = sorted(teams, key=lambda t: t.get('draftOrder', 999))
+                if round_idx % 2 == 0:  # odd round (0,2): forward order
+                    team = sorted_teams[pick_in_round]
+                else:                    # even round (1,3): reverse order
+                    team = sorted_teams[num_teams - 1 - pick_in_round]
+                current_pick_team = {
+                    "name": team.get("name"),
+                    "ownerUid": team.get("ownerUid"),
+                    "draftOrder": team.get("draftOrder"),
+                }
+                current_round = round_idx + 1   # 1-based
+                current_tier = round_idx + 1    # tier == round in this scheme
+
         return jsonify({
             "IsDraftStarted": is_draft_started,
             "IsDraftLocked": is_draft_locked,
-            "IsDraftComplete": is_draft_complete
+            "IsDraftComplete": is_draft_complete,
+            "numTeams": num_teams,
+            "draftPicks": draft_picks,
+            "teams": teams,
+            "currentPickTeam": current_pick_team,
+            "currentRound": current_round,
+            "currentTier": current_tier,
         }), 200
     except Exception as e:
         app.logger.error(f"Error fetching draft status for tournament {tournament_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/tournaments/<tournament_id>/picks', methods=['POST'])
+@require_auth
+def make_draft_pick(tournament_id):
+    """Submit a draft pick. Caller must be the team whose turn it is (or admin)."""
+    if not db:
+        return jsonify({"error": "Firestore not initialized"}), 500
+    try:
+        data = request.json or {}
+        player_name = (data.get('playerName') or '').strip()
+        if not player_name:
+            return jsonify({"error": "playerName is required"}), 400
+
+        doc_ref = db.collection('tournaments').document(tournament_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return jsonify({"error": "Tournament not found"}), 404
+        tournament_data = doc.to_dict()
+
+        if not tournament_data.get('IsDraftStarted'):
+            return jsonify({"error": "Draft has not started yet"}), 400
+        if tournament_data.get('IsDraftComplete'):
+            return jsonify({"error": "Draft is already complete"}), 400
+
+        teams = tournament_data.get('teams', [])
+        num_teams = len(teams)
+        draft_picks = tournament_data.get('draftPicks', [])
+        locked_odds = tournament_data.get('DraftLockedOdds', [])
+        total_picks = 4 * num_teams
+
+        if len(draft_picks) >= total_picks:
+            return jsonify({"error": "All picks have been made"}), 400
+
+        # Determine whose turn
+        next_pick_number = len(draft_picks) + 1
+        round_idx = (next_pick_number - 1) // num_teams
+        pick_in_round = (next_pick_number - 1) % num_teams
+        sorted_teams = sorted(teams, key=lambda t: t.get('draftOrder', 999))
+        if round_idx % 2 == 0:
+            current_team = sorted_teams[pick_in_round]
+        else:
+            current_team = sorted_teams[num_teams - 1 - pick_in_round]
+
+        # Check caller is admin or the team owner
+        caller_uid = request.uid
+        is_admin_caller = False
+        user_doc = db.collection('users').document(caller_uid).get()
+        if user_doc.exists and user_doc.to_dict().get('role') == 'admin':
+            is_admin_caller = True
+
+        if not is_admin_caller and current_team.get('ownerUid') != caller_uid:
+            return jsonify({
+                "error": f"It is not your turn. Current pick belongs to: {current_team.get('name')}"
+            }), 403
+
+        # Validate player exists in the locked odds list
+        all_picked = {p['playerName'] for p in draft_picks}
+        if player_name in all_picked:
+            return jsonify({"error": f"{player_name} has already been picked"}), 400
+
+        # Validate player is in the correct tier
+        # Tier = round_idx (0-based). Tier slot: [round_idx*num_teams .. (round_idx+1)*num_teams - 1]
+        tier_start = round_idx * num_teams
+        tier_end = (round_idx + 1) * num_teams
+        tier_players = {p['name'] for p in locked_odds[tier_start:tier_end]}
+        if player_name not in tier_players:
+            return jsonify({
+                "error": f"{player_name} is not in Tier {round_idx + 1}. "
+                         f"You must pick from: {', '.join(sorted(tier_players - all_picked))}"
+            }), 400
+
+        # Record pick
+        new_pick = {
+            "pickNumber": next_pick_number,
+            "playerName": player_name,
+            "teamName": current_team.get('name'),
+            "ownerUid": current_team.get('ownerUid'),
+            "round": round_idx + 1,
+            "tier": round_idx + 1,
+            "isAutoPick": False,
+            "pickedAt": datetime.now().isoformat(),
+        }
+        draft_picks.append(new_pick)
+
+        # Update team's golferNames
+        for team in teams:
+            if team.get('ownerUid') == current_team.get('ownerUid'):
+                team.setdefault('golferNames', []).append(player_name)
+                break
+
+        update_data = {
+            "draftPicks": draft_picks,
+            "teams": teams,
+        }
+
+        # Auto-complete if all picks made
+        if len(draft_picks) >= total_picks:
+            update_data["IsDraftComplete"] = True
+            update_data["DraftCompletedAt"] = firestore.SERVER_TIMESTAMP
+
+        doc_ref.update(update_data)
+        app.logger.info(f"Pick #{next_pick_number}: {player_name} → {current_team.get('name')} (tournament {tournament_id})")
+        return jsonify({"message": "Pick recorded", "pick": new_pick, "draftComplete": len(draft_picks) >= total_picks}), 200
+
+    except Exception as e:
+        app.logger.error(f"Error recording pick for tournament {tournament_id}: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/tournaments/<tournament_id>/complete_draft', methods=['POST'])
@@ -2817,6 +3010,87 @@ class TournamentMonitor:
         except Exception as e:
             self.app.logger.error(f"Error in tournament monitoring: {e}")
 
+def auto_pick_expired_drafts():
+    """At 8 PM the evening before a tournament starts, auto-pick remaining slots
+    for any draft that is started but not yet complete.
+    Rule: pick the best available player (lowest averageOdds) in the current tier."""
+    if not db:
+        return
+    try:
+        tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
+        # Find tournaments whose draft is started but not complete
+        tournaments_ref = db.collection('tournaments') \
+            .where('IsDraftStarted', '==', True) \
+            .where('IsDraftComplete', '==', False).stream()
+
+        for t_doc in tournaments_ref:
+            t_data = t_doc.to_dict()
+            t_id = t_doc.id
+
+            # Only auto-pick if tournament starts tomorrow
+            start_date = t_data.get('startDate') or t_data.get('StartDate') or ''
+            if not start_date or str(start_date)[:10] != tomorrow:
+                continue
+
+            teams = t_data.get('teams', [])
+            num_teams = len(teams)
+            if num_teams == 0:
+                continue
+            locked_odds = t_data.get('DraftLockedOdds', [])
+            draft_picks = t_data.get('draftPicks', [])
+            total_picks = 4 * num_teams
+
+            app.logger.info(f"Auto-pick: filling {total_picks - len(draft_picks)} remaining picks for tournament {t_id}")
+
+            all_picked = {p['playerName'] for p in draft_picks}
+            sorted_teams = sorted(teams, key=lambda t: t.get('draftOrder', 999))
+
+            while len(draft_picks) < total_picks:
+                next_pick_number = len(draft_picks) + 1
+                round_idx = (next_pick_number - 1) // num_teams
+                pick_in_round = (next_pick_number - 1) % num_teams
+                if round_idx % 2 == 0:
+                    current_team = sorted_teams[pick_in_round]
+                else:
+                    current_team = sorted_teams[num_teams - 1 - pick_in_round]
+
+                tier_start = round_idx * num_teams
+                tier_end = (round_idx + 1) * num_teams
+                tier_players = locked_odds[tier_start:tier_end]
+
+                # Best available = first in tier not yet picked
+                chosen = next((p['name'] for p in tier_players if p['name'] not in all_picked), None)
+                if not chosen:
+                    app.logger.warning(f"Auto-pick: no available player in tier {round_idx+1} for tournament {t_id}")
+                    break
+
+                new_pick = {
+                    "pickNumber": next_pick_number,
+                    "playerName": chosen,
+                    "teamName": current_team.get('name'),
+                    "ownerUid": current_team.get('ownerUid'),
+                    "round": round_idx + 1,
+                    "tier": round_idx + 1,
+                    "isAutoPick": True,
+                    "pickedAt": datetime.now().isoformat(),
+                }
+                draft_picks.append(new_pick)
+                all_picked.add(chosen)
+
+                for team in teams:
+                    if team.get('ownerUid') == current_team.get('ownerUid'):
+                        team.setdefault('golferNames', []).append(chosen)
+                        break
+
+            update_data = {"draftPicks": draft_picks, "teams": teams, "IsDraftComplete": True,
+                           "DraftCompletedAt": firestore.SERVER_TIMESTAMP}
+            db.collection('tournaments').document(t_id).update(update_data)
+            app.logger.info(f"Auto-pick complete for tournament {t_id}")
+
+    except Exception as e:
+        app.logger.error(f"Error in auto_pick_expired_drafts: {e}")
+
+
 def start_tournament_monitoring():
     """Start the automated tournament monitoring system with tournament-day scheduling"""
     from apscheduler.schedulers.background import BackgroundScheduler
@@ -2851,7 +3125,16 @@ def start_tournament_monitoring():
     scheduler.start()
     app.logger.info(f"Tournament monitoring system started - {len(tournament_times)} daily checks during tournament hours")
     app.logger.info("Schedule: 07:30-21:00 (45-minute intervals) = 19 calls/day + 1 buffer")
-    
+
+    # Auto-pick job: 8 PM every evening — fills any incomplete drafts for tomorrow's tournaments
+    scheduler.add_job(
+        func=auto_pick_expired_drafts,
+        trigger=CronTrigger(hour=20, minute=0),
+        id='auto_pick_expired_drafts',
+        name='Auto-pick expired drafts at 20:00',
+        replace_existing=True
+    )
+
     # Shut down the scheduler when exiting the app
     atexit.register(lambda: scheduler.shutdown())
 
@@ -3199,6 +3482,29 @@ def update_user_settings():
             return jsonify({'error': 'No valid fields provided'}), 400
         db.collection('users').document(request.uid).set(update, merge=True)
         return jsonify({'message': 'Settings updated'}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/user/opt_out', methods=['POST'])
+@require_auth
+def opt_out_tournament():
+    """Opt the current user out of (or back into) a specific tournament."""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+    try:
+        data = request.json or {}
+        tournament_id = (data.get('tournamentId') or '').strip()
+        opt_out = data.get('optOut', True)  # True = opt out, False = opt back in
+        if not tournament_id:
+            return jsonify({'error': 'tournamentId is required'}), 400
+        if opt_out:
+            db.collection('users').document(request.uid).set(
+                {'optedOutTournaments': firestore.ArrayUnion([tournament_id])}, merge=True)
+        else:
+            db.collection('users').document(request.uid).set(
+                {'optedOutTournaments': firestore.ArrayRemove([tournament_id])}, merge=True)
+        return jsonify({'message': 'Preference saved', 'optOut': opt_out}), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

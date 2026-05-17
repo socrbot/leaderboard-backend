@@ -1431,48 +1431,17 @@ def get_player_odds():
 
         if tournament_doc and tournament_doc.exists:
             tournament_data = tournament_doc.to_dict()
-            if tournament_data.get('IsDraftStarted') and tournament_data.get('DraftLockedOdds'):
-                app.logger.info(f"Returning LOCKED draft odds for tournament with oddsId: {odds_id}")
-                return jsonify(tournament_data['DraftLockedOdds'])
+            locked_odds = tournament_data.get('DraftLockedOdds')
+            if locked_odds:
+                app.logger.info(f"Returning locked draft odds from Firestore for oddsId: {odds_id}")
+                return jsonify(locked_odds)
 
     except Exception as e:
         app.logger.error(f"Error checking Firestore for locked odds for oddsId {odds_id}: {e}")
 
-    # Fetch fresh player odds from SportsData.io if not locked
-    cache_key_params = request.args.to_dict()
-    cache_key = ('player_odds', tuple(sorted(cache_key_params.items())))
-
-    if cache_key in CACHE:
-        cached_data, timestamp = CACHE[cache_key]
-        if (time.time() - timestamp) < CACHE_TTL_SECONDS:
-            app.logger.info("Returning cached data for player odds (live).")
-            return jsonify(cached_data)
-
-    app.logger.info("Fetching fresh player odds from SportsData.io.")
-    dynamic_odds_api_endpoint = f"https://api.sportsdata.io/v3/golf/odds/json/TournamentOdds/{odds_id}"
-    params = {"key": SPORTSDATA_IO_API_KEY}
-    
-    try:
-        response = requests.get(dynamic_odds_api_endpoint, params=params)
-        response.raise_for_status()
-        data = response.json()
-        if not data or not data.get("PlayerTournamentOdds"):
-            app.logger.warning("SportsData.io response missing PlayerTournamentOdds for oddsId: %s", odds_id)
-            return jsonify({"error": "Unexpected API response structure for player odds."}), 500
-
-        raw_player_odds = data["PlayerTournamentOdds"]
-        averaged_odds_list = calculate_average_odds(raw_player_odds)
-        CACHE[cache_key] = (averaged_odds_list, time.time())
-        return jsonify(averaged_odds_list)
-    except requests.exceptions.RequestException as e:
-        app.logger.error(f"Error fetching player odds from SportsData.io for oddsId {odds_id}: {e}")
-        details = str(e)
-        if e.response is not None:
-            details += f" | Status: {e.response.status_code} | Content: {e.response.text}"
-        return jsonify({"error": "Failed to fetch player odds data", "details": details}), 500
-    except ValueError:
-        app.logger.error("Failed to parse JSON response from SportsData.io (player odds) for oddsId %s", odds_id)
-        return jsonify({"error": "Invalid JSON response from external API"}), 500
+    # Odds not yet locked — return empty list (draft board not yet available)
+    app.logger.info(f"Draft odds not yet locked for oddsId: {odds_id}, returning empty list")
+    return jsonify([]), 200
 
 # --- Annual Championship Calculation API ---
 # OLD annual championship endpoint removed - see line 2555 for new year-filtered version
@@ -2107,6 +2076,8 @@ def create_tournament():
         year = data.get('year', '').strip()
         odds_id = data.get('oddsId', '').strip()
         league_id = data.get('leagueId', '').strip()
+        start_date = (data.get('startDate') or '').strip()[:10]
+        end_date = (data.get('endDate') or '').strip()[:10]
 
         if not tournament_name or not tourn_id or not year or not odds_id:
             return jsonify({"error": "Missing tournament name, Tourn ID, Year, or Odds ID in request data"}), 400
@@ -2118,6 +2089,9 @@ def create_tournament():
             "year": year,
             "oddsId": odds_id,
             "leagueId": league_id,
+            "startDate": start_date,
+            "endDate": end_date,
+            "par": 72,
             "teams": [],  # Legacy field for backward compatibility
             "teamAssignments": [],  # New field for global team references
             "IsDraftStarted": False,
@@ -2234,63 +2208,45 @@ def get_single_tournament(tournament_id):
         tournament_data = doc.to_dict()
         odds_id = tournament_data.get("oddsId")
 
-        # Initialize default values for API-derived status
-        is_in_progress_from_api = False
-        is_over_from_api = False
-        tournament_par = tournament_data.get("par", 71)
-        odds_api_data = {}  # Initialize to prevent UnboundLocalError
-
-        # Fetch IsInProgress and IsOver from SportsData.io Tournament Odds API
-        if odds_id:
-            sportsdata_io_tournament_odds_endpoint = f"https://api.sportsdata.io/v3/golf/odds/json/TournamentOdds/{odds_id}"
-            params = {"key": SPORTSDATA_IO_API_KEY}
+        # Derive IsInProgress / IsOver from stored dates — no SportsData.io call at runtime
+        today = datetime.utcnow().date()
+        start_str = tournament_data.get('startDate', '')
+        end_str = tournament_data.get('endDate', '')
+        is_in_progress = False
+        is_over = False
+        if start_str:
             try:
-                cache_key = ('sportsdata_tournament_details', odds_id)
-                if cache_key in CACHE:
-                    cached_odds_data, timestamp = CACHE[cache_key]
-                    if (time.time() - timestamp) < CACHE_TTL_SECONDS:
-                        app.logger.info(f"Returning cached SportsData.io tournament details for oddsId {odds_id}.")
-                        odds_api_data = cached_odds_data
-                    else:
-                        del CACHE[cache_key]
-                        app.logger.warning(f"Cached SportsData.io data for {odds_id} expired, refetching.")
-                        response = requests.get(sportsdata_io_tournament_odds_endpoint, params=params)
-                        response.raise_for_status()
-                        odds_api_data = response.json()
-                        CACHE[cache_key] = (odds_api_data, time.time())
-                else:
-                    app.logger.info(f"Fetching live SportsData.io tournament details for oddsId {odds_id}.")
-                    response = requests.get(sportsdata_io_tournament_odds_endpoint, params=params)
-                    response.raise_for_status()
-                    odds_api_data = response.json()
-                    CACHE[cache_key] = (odds_api_data, time.time())
-
-
-                if odds_api_data and odds_api_data.get("Tournament"):
-                    is_in_progress_from_api = odds_api_data["Tournament"].get("IsInProgress", False)
-                    is_over_from_api = odds_api_data["Tournament"].get("IsOver", False)
-                    tournament_par = odds_api_data["Tournament"].get("Par", tournament_par)
-                else:
-                    app.logger.warning(f"SportsData.io response missing 'Tournament' info for oddsId: {odds_id}")
-
-            except requests.exceptions.RequestException as e:
-                app.logger.error(f"Error fetching live tournament status from SportsData.io for oddsId {odds_id}: {e}")
+                start_d = datetime.strptime(start_str[:10], '%Y-%m-%d').date()
+                end_d = datetime.strptime(end_str[:10], '%Y-%m-%d').date() if end_str else start_d + timedelta(days=3)
+                is_in_progress = start_d <= today <= end_d
+                is_over = today > end_d
             except ValueError:
-                app.logger.error(f"Failed to parse JSON response from SportsData.io (tournament status) for oddsId {odds_id}")
+                pass
 
-        # Combine logic: Frontend should show leaderboard if in progress OR over
-        show_leaderboard_on_frontend = is_in_progress_from_api or is_over_from_api
+        tournament_par = tournament_data.get('par', 72)
 
-        # Combine Firestore data with the live status and potential updated Par
+        # Build Tournament info from stored Firestore metadata (populated at lock time)
+        stored_meta = tournament_data.get('tournamentMeta', {})
+        tournament_info_obj = {
+            "Name": tournament_data.get('name', ''),
+            "StartDate": start_str,
+            "EndDate": end_str,
+            "Par": tournament_par,
+            "Venue": stored_meta.get('Venue', ''),
+            "Status": tournament_data.get('status', ''),
+            "CurrentRound": stored_meta.get('CurrentRound'),
+            "Courses": stored_meta.get('Courses', []),
+        }
+
         response_data = {
             "id": doc.id,
             **tournament_data,
-            "IsInProgress": show_leaderboard_on_frontend,
-            "IsOver": is_over_from_api,
+            "IsInProgress": is_in_progress or is_over,
+            "IsOver": is_over,
             "par": tournament_par,
             "IsDraftStarted": tournament_data.get('IsDraftStarted', False),
-            "Tournament": odds_api_data.get("Tournament", {}),
-            "status": odds_api_data.get("Tournament", {}).get("Status", "")
+            "Tournament": tournament_info_obj,
+            "status": tournament_data.get('status', ''),
         }
         return jsonify(response_data), 200
 
@@ -2386,11 +2342,23 @@ def start_draft(tournament_id):
             raw_player_odds = data["PlayerTournamentOdds"]
             averaged_odds_list = calculate_average_odds(raw_player_odds)
 
-            # Store the locked odds and set the flag
+            # Store tournament metadata from this one-time API call so we never need to call again
+            tourn_meta = data.get("Tournament", {})
+            meta_update = {}
+            if tourn_meta:
+                meta_update['tournamentMeta'] = {
+                    'Venue': tourn_meta.get('Venue') or tourn_meta.get('Location', ''),
+                    'Courses': tourn_meta.get('Courses', []),
+                    'CurrentRound': tourn_meta.get('CurrentRound'),
+                }
+                if tourn_meta.get('Par'):
+                    meta_update['par'] = tourn_meta['Par']
+
             doc_ref.update({
                 "IsDraftStarted": True,
                 "DraftLockedOdds": averaged_odds_list,
-                "DraftStartedAt": firestore.SERVER_TIMESTAMP # Optional: Timestamp when draft started
+                "DraftStartedAt": firestore.SERVER_TIMESTAMP,
+                **meta_update,
             })
 
             return jsonify({"message": f"Draft started and odds locked for tournament {tournament_id}."}), 200
@@ -2499,12 +2467,25 @@ def lock_draft_odds(tournament_id):
         num_teams = len(teams)
         averaged_odds_list = averaged_odds_list[:4 * num_teams]
 
+        # Store tournament metadata from this one-time API call so get_single_tournament never re-calls
+        tourn_meta = data.get("Tournament", {})
+        meta_update = {}
+        if tourn_meta:
+            meta_update['tournamentMeta'] = {
+                'Venue': tourn_meta.get('Venue') or tourn_meta.get('Location', ''),
+                'Courses': tourn_meta.get('Courses', []),
+                'CurrentRound': tourn_meta.get('CurrentRound'),
+            }
+            if tourn_meta.get('Par'):
+                meta_update['par'] = tourn_meta['Par']
+
         doc_ref.update({
             "teams": teams,
             "draftPicks": [],
             "DraftLockedOdds": averaged_odds_list,
             "DraftOddsLockedAt": firestore.SERVER_TIMESTAMP,
             "numTeams": num_teams,
+            **meta_update,
         })
         app.logger.info(f"Draft odds locked for {tournament_id}: {num_teams} teams, {len(averaged_odds_list)} players")
         return jsonify({

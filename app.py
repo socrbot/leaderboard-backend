@@ -862,6 +862,94 @@ def get_odds_tournaments():
         app.logger.error(f"Error parsing SportsData.io tournaments response: {e}")
         return jsonify({"error": "Failed to parse tournament data"}), 500
 
+# ---------------------------------------------------------------------------
+# Season Config endpoints
+# ---------------------------------------------------------------------------
+SEASON_CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'season_config.json')
+
+def _normalize_name(name):
+    """Lowercase, strip non-alphanumeric for fuzzy name matching."""
+    import re
+    return re.sub(r'[^a-z0-9]', '', name.lower())
+
+@app.route('/api/season_config', methods=['GET'])
+def get_season_config():
+    """Return the pre-configured tournament list for a given year from season_config.json."""
+    year = request.args.get('year', str(datetime.now().year))
+    try:
+        with open(SEASON_CONFIG_PATH, 'r') as f:
+            config = json.load(f)
+        return jsonify(config.get(year, []))
+    except FileNotFoundError:
+        return jsonify([])
+    except Exception as e:
+        app.logger.error(f"Error reading season_config.json: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/season_config/build', methods=['GET'])
+def build_season_config():
+    """Auto-build a season config suggestion by fetching both APIs and name-matching.
+    Returns a list of matched entries the admin can paste into season_config.json."""
+    year = request.args.get('year', str(datetime.now().year))
+    org_id = request.args.get('orgId', '1')
+
+    # Fetch PGA schedule (RapidAPI)
+    schedule_data, sched_error = make_rapidapi_request(
+        '/schedule', {'year': year, 'orgId': org_id},
+        request_source="season_config_build"
+    )
+    if sched_error:
+        return jsonify({"error": f"Schedule fetch failed: {sched_error}"}), 500
+    schedule_items = schedule_data.get('schedule', []) if schedule_data else []
+
+    # Fetch SportsData.io odds tournament list
+    try:
+        odds_resp = requests.get(
+            f"https://api.sportsdata.io/golf/v2/json/Tournaments/{year}",
+            params={"key": SPORTSDATA_IO_API_KEY},
+            timeout=10
+        )
+        odds_resp.raise_for_status()
+        odds_items = [
+            {"oddsId": str(t["TournamentID"]), "name": t.get("Name", ""), "startDate": t.get("StartDate", "")}
+            for t in odds_resp.json()
+            if isinstance(t, dict) and t.get("TournamentID")
+        ]
+    except Exception as e:
+        return jsonify({"error": f"Odds fetch failed: {str(e)}"}), 500
+
+    # Name-match schedule items to odds items
+    result = []
+    for item in schedule_items:
+        sched_name = item.get('name', '')
+        norm = _normalize_name(sched_name)
+        start_date = None
+        date_field = item.get('date', {})
+        if isinstance(date_field, dict):
+            start_date = (date_field.get('start') or '')[:10] or None
+        elif isinstance(date_field, str):
+            start_date = date_field[:10] or None
+
+        # Three-tier fuzzy match (same logic as frontend)
+        match = (
+            next((t for t in odds_items if _normalize_name(t['name']) == norm), None) or
+            next((t for t in odds_items if _normalize_name(t['name'])[:8] == norm[:8]), None) or
+            next((t for t in odds_items if norm[:8] in _normalize_name(t['name'])), None)
+        )
+
+        entry = {
+            "name": sched_name,
+            "year": year,
+            "tournId": item.get('tournId', ''),
+            "startDate": start_date,
+            "oddsId": match['oddsId'] if match else "",
+            "oddsName": match['name'] if match else "",
+            "matched": bool(match),
+        }
+        result.append(entry)
+
+    return jsonify(result)
+
 @app.route('/api/tournament_info', methods=['GET'])
 @cache.cached(timeout=TOURNAMENT_CACHE_TTL)
 def get_tournament_info():

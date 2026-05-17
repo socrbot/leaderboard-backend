@@ -2703,9 +2703,9 @@ def make_draft_pick(tournament_id):
         if player_name not in locked_names:
             return jsonify({"error": f"{player_name} is not in the draft board. You must pick a golfer from the locked odds list."}), 400
 
-        # Determine which tier slot this player belongs to (tier-indexed golferNames)
-        player_pos = locked_names.index(player_name)
-        actual_tier_idx = player_pos // num_teams if num_teams > 0 else 0
+        # Slot index is determined by the current round (0-3), not player position in odds list.
+        # This allows free-pick from any tier — the round determines which golferNames slot to fill.
+        actual_tier_idx = round_idx  # round_idx is already 0-based (0–3)
 
         # Validate slot availability for the current team
         target_team = next((t for t in teams if t.get('ownerUid') == current_team.get('ownerUid')), None)
@@ -2717,7 +2717,7 @@ def make_draft_pick(tournament_id):
             golfer_names.append(None)
 
         if golfer_names[actual_tier_idx]:
-            return jsonify({"error": f"Tier {actual_tier_idx + 1} is already filled for your team"}), 400
+            return jsonify({"error": f"Round {actual_tier_idx + 1} slot is already filled for your team"}), 400
 
         # Record pick
         new_pick = {

@@ -3607,6 +3607,66 @@ def join_league_by_code():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/user/profile', methods=['GET'])
+@require_auth
+def get_user_profile():
+    """Return the current user's profile: auth info + verified league memberships.
+    Cross-checks leagueIds against actual members subcollection records — stale entries are cleaned up."""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+    try:
+        try:
+            firebase_user = firebase_auth.get_user(request.uid)
+            email = firebase_user.email or request.user_email or ''
+            display_name = firebase_user.display_name or ''
+        except Exception:
+            email = request.user_email or ''
+            display_name = ''
+
+        user_doc = db.collection('users').document(request.uid).get()
+        league_ids = []
+        if user_doc.exists:
+            league_ids = user_doc.to_dict().get('leagueIds', [])
+
+        leagues = []
+        stale_ids = []
+        for lid in league_ids:
+            try:
+                league_doc = db.collection('leagues').document(lid).get()
+                if not league_doc.exists:
+                    stale_ids.append(lid)
+                    continue
+                member_doc = db.collection('leagues').document(lid).collection('members').document(request.uid).get()
+                if not member_doc.exists:
+                    stale_ids.append(lid)
+                    continue
+                m = member_doc.to_dict()
+                leagues.append({
+                    'leagueId': lid,
+                    'name': league_doc.to_dict().get('name', ''),
+                    'teamName': m.get('teamName', '') or m.get('displayName', ''),
+                    'joinedAt': m.get('joinedAt').isoformat() if m.get('joinedAt') else None,
+                })
+            except Exception as e:
+                app.logger.warning(f"Could not verify league {lid} for user {request.uid}: {e}")
+
+        # Clean up stale leagueIds silently so they don't resurface
+        if stale_ids:
+            db.collection('users').document(request.uid).update({
+                'leagueIds': firestore.ArrayRemove(stale_ids)
+            })
+            app.logger.info(f"Cleaned up stale leagueIds {stale_ids} for user {request.uid}")
+
+        return jsonify({
+            'email': email,
+            'displayName': display_name,
+            'leagues': leagues,
+        }), 200
+    except Exception as e:
+        app.logger.error(f'Error fetching user profile for {request.uid}: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/user/settings', methods=['GET'])
 @require_auth
 def get_user_settings():

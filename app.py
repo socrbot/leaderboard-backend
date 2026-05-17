@@ -893,62 +893,73 @@ def build_season_config():
     year = request.args.get('year', str(datetime.now().year))
     org_id = request.args.get('orgId', '1')
 
-    # Fetch PGA schedule (RapidAPI)
-    schedule_data, sched_error = make_rapidapi_request(
-        '/schedule', {'year': year, 'orgId': org_id},
-        request_source="season_config_build"
-    )
-    if sched_error:
-        return jsonify({"error": f"Schedule fetch failed: {sched_error}"}), 500
-    schedule_items = schedule_data.get('schedule', []) if schedule_data else []
-
-    # Fetch SportsData.io odds tournament list
     try:
-        odds_resp = requests.get(
-            f"https://api.sportsdata.io/golf/v2/json/Tournaments/{year}",
-            params={"key": SPORTSDATA_IO_API_KEY},
-            timeout=10
+        # Fetch PGA schedule (RapidAPI) — bypass rate limit since this is a one-time admin tool
+        schedule_data, sched_error = make_rapidapi_request(
+            '/schedule', {'year': year, 'orgId': org_id},
+            bypass_rate_limit=True,
+            request_source="season_config_build"
         )
-        odds_resp.raise_for_status()
-        odds_items = [
-            {"oddsId": str(t["TournamentID"]), "name": t.get("Name", ""), "startDate": t.get("StartDate", "")}
-            for t in odds_resp.json()
-            if isinstance(t, dict) and t.get("TournamentID")
-        ]
+        if sched_error:
+            return jsonify({"error": f"Schedule fetch failed: {sched_error}"}), 500
+        schedule_items = schedule_data.get('schedule', []) if schedule_data else []
+
+        # Fetch SportsData.io odds tournament list (non-fatal: proceed without if it fails)
+        odds_items = []
+        odds_error = None
+        try:
+            odds_resp = requests.get(
+                f"https://api.sportsdata.io/golf/v2/json/Tournaments/{year}",
+                params={"key": SPORTSDATA_IO_API_KEY},
+                timeout=10
+            )
+            odds_resp.raise_for_status()
+            odds_items = [
+                {"oddsId": str(t["TournamentID"]), "name": t.get("Name", ""), "startDate": t.get("StartDate", "")}
+                for t in odds_resp.json()
+                if isinstance(t, dict) and t.get("TournamentID")
+            ]
+        except Exception as e:
+            odds_error = str(e)
+            app.logger.warning(f"SportsData.io fetch failed (non-fatal): {e}")
+
+        # Name-match schedule items to odds items
+        result = []
+        for item in schedule_items:
+            sched_name = item.get('name', '')
+            norm = _normalize_name(sched_name)
+            start_date = None
+            date_field = item.get('date', {})
+            if isinstance(date_field, dict):
+                start_date = (date_field.get('start') or '')[:10] or None
+            elif isinstance(date_field, str):
+                start_date = date_field[:10] or None
+
+            match = (
+                next((t for t in odds_items if _normalize_name(t['name']) == norm), None) or
+                next((t for t in odds_items if _normalize_name(t['name'])[:8] == norm[:8]), None) or
+                next((t for t in odds_items if norm[:8] in _normalize_name(t['name'])), None)
+            )
+
+            entry = {
+                "name": sched_name,
+                "year": year,
+                "tournId": item.get('tournId', ''),
+                "startDate": start_date,
+                "oddsId": match['oddsId'] if match else "",
+                "oddsName": match['name'] if match else "",
+                "matched": bool(match),
+            }
+            result.append(entry)
+
+        response_data = {"tournaments": result, "count": len(result)}
+        if odds_error:
+            response_data["oddsWarning"] = f"SportsData.io unavailable ({odds_error}) — oddsId fields are empty"
+        return jsonify(response_data)
+
     except Exception as e:
-        return jsonify({"error": f"Odds fetch failed: {str(e)}"}), 500
-
-    # Name-match schedule items to odds items
-    result = []
-    for item in schedule_items:
-        sched_name = item.get('name', '')
-        norm = _normalize_name(sched_name)
-        start_date = None
-        date_field = item.get('date', {})
-        if isinstance(date_field, dict):
-            start_date = (date_field.get('start') or '')[:10] or None
-        elif isinstance(date_field, str):
-            start_date = date_field[:10] or None
-
-        # Three-tier fuzzy match (same logic as frontend)
-        match = (
-            next((t for t in odds_items if _normalize_name(t['name']) == norm), None) or
-            next((t for t in odds_items if _normalize_name(t['name'])[:8] == norm[:8]), None) or
-            next((t for t in odds_items if norm[:8] in _normalize_name(t['name'])), None)
-        )
-
-        entry = {
-            "name": sched_name,
-            "year": year,
-            "tournId": item.get('tournId', ''),
-            "startDate": start_date,
-            "oddsId": match['oddsId'] if match else "",
-            "oddsName": match['name'] if match else "",
-            "matched": bool(match),
-        }
-        result.append(entry)
-
-    return jsonify(result)
+        app.logger.error(f"build_season_config error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/tournament_info', methods=['GET'])
 @cache.cached(timeout=TOURNAMENT_CACHE_TTL)

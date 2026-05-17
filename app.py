@@ -3133,6 +3133,48 @@ def join_league_by_code():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/user/settings', methods=['GET'])
+@require_auth
+def get_user_settings():
+    """Get the current user's settings (tournament enrolments, annual opt-in)"""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+    try:
+        doc = db.collection('users').document(request.uid).get()
+        if not doc.exists:
+            return jsonify({'enrolledTournaments': [], 'participatesInAnnual': True}), 200
+        d = doc.to_dict()
+        return jsonify({
+            'enrolledTournaments': d.get('enrolledTournaments', []),
+            'participatesInAnnual': d.get('participatesInAnnual', True),
+        }), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/user/settings', methods=['PUT'])
+@require_auth
+def update_user_settings():
+    """Update the current user's settings (tournament enrolments, annual opt-in)"""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+    try:
+        data = request.json or {}
+        update = {}
+        if 'enrolledTournaments' in data:
+            if not isinstance(data['enrolledTournaments'], list):
+                return jsonify({'error': 'enrolledTournaments must be a list'}), 400
+            update['enrolledTournaments'] = data['enrolledTournaments']
+        if 'participatesInAnnual' in data:
+            update['participatesInAnnual'] = bool(data['participatesInAnnual'])
+        if not update:
+            return jsonify({'error': 'No valid fields provided'}), 400
+        db.collection('users').document(request.uid).set(update, merge=True)
+        return jsonify({'message': 'Settings updated'}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/leagues/<league_id>', methods=['GET'])
 def get_league_by_id(league_id):
     """Get league info by ID (public)"""

@@ -834,6 +834,34 @@ def get_tournament_schedule():
     
     return jsonify(data)
 
+@app.route('/api/odds_tournaments', methods=['GET'])
+def get_odds_tournaments():
+    """Get SportsData.io tournament list for a season to help admins pick oddsId"""
+    year = request.args.get('year', str(datetime.now().year))
+    url = f"https://api.sportsdata.io/golf/v2/json/Tournaments/{year}"
+    params = {"key": SPORTSDATA_IO_API_KEY}
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        tournaments = resp.json()
+        result = [
+            {
+                "oddsId": str(t["TournamentID"]),
+                "name": t.get("Name", ""),
+                "startDate": t.get("StartDate", ""),
+                "endDate": t.get("EndDate", ""),
+            }
+            for t in tournaments
+            if isinstance(t, dict) and t.get("TournamentID")
+        ]
+        return jsonify(result)
+    except requests.exceptions.RequestException as e:
+        app.logger.error(f"Error fetching SportsData.io tournaments for year {year}: {e}")
+        return jsonify({"error": str(e)}), 500
+    except (ValueError, KeyError) as e:
+        app.logger.error(f"Error parsing SportsData.io tournaments response: {e}")
+        return jsonify({"error": "Failed to parse tournament data"}), 500
+
 @app.route('/api/tournament_info', methods=['GET'])
 @cache.cached(timeout=TOURNAMENT_CACHE_TTL)
 def get_tournament_info():

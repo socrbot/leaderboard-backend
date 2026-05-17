@@ -872,6 +872,42 @@ def _normalize_name(name):
     import re
     return re.sub(r'[^a-z0-9]', '', name.lower())
 
+def _deduplicate_team_names(teams):
+    """If multiple teams have the same name, append the email prefix to make each unique."""
+    from collections import Counter
+    name_counts = Counter(t['name'] for t in teams)
+    seen = {}
+    for team in teams:
+        if name_counts[team['name']] > 1:
+            email = team.get('ownerEmail', '')
+            suffix = email.split('@')[0] if email else team.get('ownerUid', '')[:6]
+            base = team['name']
+            unique = f"{base} ({suffix})"
+            # Handle the rare case where even the suffix collides
+            if unique in seen:
+                unique = f"{base} ({team.get('ownerUid', '')[:8]})"
+            team['name'] = unique
+            seen[unique] = True
+    return teams
+
+def _deduplicate_team_names(teams):
+    """If multiple teams have the same name, append the email prefix to make each unique."""
+    from collections import Counter
+    name_counts = Counter(t['name'] for t in teams)
+    seen = {}
+    for team in teams:
+        if name_counts[team['name']] > 1:
+            email = team.get('ownerEmail', '')
+            suffix = email.split('@')[0] if email else team.get('ownerUid', '')[:6]
+            base = team['name']
+            unique = f"{base} ({suffix})"
+            # Handle the rare case where even the suffix collides
+            if unique in seen:
+                unique = f"{base} ({team.get('ownerUid', '')[:8]})"
+            team['name'] = unique
+            seen[unique] = True
+    return teams
+
 def _parse_rapidapi_date(raw):
     """Parse a RapidAPI date value (str or MongoDB extended JSON dict) to a YYYY-MM-DD string."""
     if isinstance(raw, str):
@@ -2478,6 +2514,9 @@ def lock_draft_odds(tournament_id):
         if not teams:
             return jsonify({"error": "No enrolled participants found for this tournament."}), 400
 
+        # Ensure every team has a unique name — append email prefix on collision
+        teams = _deduplicate_team_names(teams)
+
         # --- 2. Randomize draft order ---
         order = list(range(1, len(teams) + 1))
         _random.shuffle(order)
@@ -2570,6 +2609,7 @@ def get_draft_status(tournament_id):
                 current_pick_team = {
                     "name": team.get("name"),
                     "ownerUid": team.get("ownerUid"),
+                    "ownerEmail": team.get("ownerEmail", ""),
                     "draftOrder": team.get("draftOrder"),
                 }
                 current_round = round_idx + 1   # 1-based
@@ -3808,6 +3848,7 @@ def get_league_members_by_id(league_id):
                 'uid': doc.id,
                 'email': d.get('email', ''),
                 'displayName': d.get('displayName', ''),
+                'teamName': d.get('teamName', ''),
                 'joinedAt': d.get('joinedAt').isoformat() if d.get('joinedAt') else None,
             })
         members.sort(key=lambda m: m.get('joinedAt') or '')

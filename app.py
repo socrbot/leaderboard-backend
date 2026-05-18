@@ -3345,21 +3345,25 @@ def get_annual_championship():
     
     # Get year parameter from query string (default to current year)
     year = request.args.get('year', str(datetime.now().year))
+    league_id = request.args.get('leagueId', '').strip()
     force_refresh = request.args.get('refresh', 'false').lower() == 'true'
-    app.logger.info(f"Fetching annual championship data for year: {year}")
-    
-    # Create year-specific cache key
-    cache_key = f'annual_championship_{year}'
+    app.logger.info(f"Fetching annual championship data for year: {year}, leagueId: {league_id or 'all'}")
+
+    # Create year+league-specific cache key
+    cache_key = f'annual_championship_{year}_{league_id or "global"}'
     cached_result = cache.get(cache_key)
     if cached_result and not force_refresh:
         app.logger.info(f"Returning cached annual championship data for year {year}")
         return jsonify(cached_result)
     
     try:
-        # Fetch tournaments for the specified year only
-        tournaments_ref = db.collection('tournaments').where('year', '==', year).get()
+        # Fetch tournaments for the specified year (and optionally leagueId)
+        query = db.collection('tournaments').where('year', '==', year)
+        if league_id:
+            query = query.where('leagueId', '==', league_id)
+        tournaments_ref = query.get()
         all_tournament_docs = list(tournaments_ref)
-        app.logger.info(f"Found {len(all_tournament_docs)} tournament(s) in Firestore for year '{year}'")
+        app.logger.info(f"Found {len(all_tournament_docs)} tournament(s) in Firestore for year '{year}'" + (f", leagueId '{league_id}'" if league_id else ""))
         annual_standings = {}
         processed_tournaments = []
         skipped_tournaments = []

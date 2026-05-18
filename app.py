@@ -2773,6 +2773,107 @@ def complete_draft(tournament_id):
         app.logger.error(f"Error marking draft complete for tournament {tournament_id}: {e}")
         return jsonify({"error": str(e)}), 500
 
+
+@app.route('/api/tournaments/<tournament_id>/admin_edit_pick', methods=['POST'])
+@require_auth
+def admin_edit_pick(tournament_id):
+    """Admin-only: add or remove a golfer from any team's draft picks."""
+    if not db:
+        return jsonify({"error": "Firestore not initialized"}), 500
+    try:
+        caller_uid = request.uid
+        user_doc = db.collection('users').document(caller_uid).get()
+        if not user_doc.exists or user_doc.to_dict().get('role') != 'admin':
+            return jsonify({"error": "Admin access required"}), 403
+
+        data = request.json or {}
+        action = data.get('action')  # "add" or "remove"
+        owner_uid = (data.get('ownerUid') or '').strip()
+        player_name = (data.get('playerName') or '').strip()
+
+        if action not in ('add', 'remove'):
+            return jsonify({"error": "action must be 'add' or 'remove'"}), 400
+        if not owner_uid or not player_name:
+            return jsonify({"error": "ownerUid and playerName are required"}), 400
+
+        doc_ref = db.collection('tournaments').document(tournament_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return jsonify({"error": "Tournament not found"}), 404
+        tournament_data = doc.to_dict()
+
+        if not tournament_data.get('IsDraftLocked'):
+            return jsonify({"error": "Draft must be locked before editing picks"}), 400
+
+        teams = list(tournament_data.get('teams', []))
+        draft_picks = list(tournament_data.get('draftPicks', []))
+        locked_odds = tournament_data.get('DraftLockedOdds', [])
+        num_teams = len(teams)
+        total_picks = 4 * num_teams
+
+        target_team = next((t for t in teams if t.get('ownerUid') == owner_uid), None)
+        if target_team is None:
+            return jsonify({"error": "Team not found for given ownerUid"}), 404
+
+        golfer_names = list(target_team.get('golferNames') or [])
+        while len(golfer_names) < 4:
+            golfer_names.append(None)
+
+        if action == 'remove':
+            if player_name not in golfer_names:
+                return jsonify({"error": f"{player_name} is not on this team"}), 400
+            slot_idx = golfer_names.index(player_name)
+            golfer_names[slot_idx] = None
+            target_team['golferNames'] = golfer_names
+            draft_picks = [p for p in draft_picks if not (
+                p.get('playerName') == player_name and p.get('ownerUid') == owner_uid
+            )]
+            update_data = {"teams": teams, "draftPicks": draft_picks, "IsDraftComplete": False}
+            doc_ref.update(update_data)
+            app.logger.info(f"Admin removed {player_name} from {target_team.get('name')} (tournament {tournament_id})")
+            return jsonify({"message": f"Removed {player_name} from {target_team.get('name')}"}), 200
+
+        else:  # add
+            locked_names = {p['name'] for p in locked_odds}
+            if player_name not in locked_names:
+                return jsonify({"error": f"{player_name} is not in the locked draft board"}), 400
+            all_picked = {p['playerName'] for p in draft_picks}
+            if player_name in all_picked:
+                return jsonify({"error": f"{player_name} has already been picked by another team"}), 400
+            # Find first empty slot
+            try:
+                slot_idx = golfer_names.index(None)
+            except ValueError:
+                return jsonify({"error": "This team already has 4 picks"}), 400
+
+            golfer_names[slot_idx] = player_name
+            target_team['golferNames'] = golfer_names
+            new_pick = {
+                "pickNumber": len(draft_picks) + 1,
+                "playerName": player_name,
+                "teamName": target_team.get('name'),
+                "ownerUid": owner_uid,
+                "round": slot_idx + 1,
+                "tier": slot_idx + 1,
+                "isAutoPick": False,
+                "isAdminPick": True,
+                "pickedAt": datetime.now().isoformat(),
+            }
+            draft_picks.append(new_pick)
+            is_complete = len(draft_picks) >= total_picks
+            update_data = {"teams": teams, "draftPicks": draft_picks}
+            if is_complete:
+                update_data["IsDraftComplete"] = True
+                update_data["DraftCompletedAt"] = firestore.SERVER_TIMESTAMP
+            doc_ref.update(update_data)
+            app.logger.info(f"Admin added {player_name} to {target_team.get('name')} slot {slot_idx} (tournament {tournament_id})")
+            return jsonify({"message": f"Added {player_name} to {target_team.get('name')}", "draftComplete": is_complete}), 200
+
+    except Exception as e:
+        app.logger.error(f"Error in admin_edit_pick for tournament {tournament_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 # NEW: API endpoint to get draft order information
 @app.route('/api/tournaments/<tournament_id>/draft_order', methods=['GET'])
 def get_draft_order(tournament_id):

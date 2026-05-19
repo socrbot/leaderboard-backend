@@ -3957,12 +3957,19 @@ def get_league_members_by_id(league_id):
         members = []
         for doc in members_ref:
             d = doc.to_dict()
+            uid = doc.id
+            # Fetch participatesInAnnual from the user's own record
+            participates = True
+            user_doc = db.collection('users').document(uid).get()
+            if user_doc.exists:
+                participates = user_doc.to_dict().get('participatesInAnnual', True)
             members.append({
-                'uid': doc.id,
+                'uid': uid,
                 'email': d.get('email', ''),
                 'displayName': d.get('displayName', ''),
                 'teamName': d.get('teamName', ''),
                 'joinedAt': d.get('joinedAt').isoformat() if d.get('joinedAt') else None,
+                'participatesInAnnual': participates,
             })
         members.sort(key=lambda m: m.get('joinedAt') or '')
         return jsonify(members), 200

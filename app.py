@@ -735,6 +735,78 @@ def calculate_team_scores(players, team_assignments, current_par):
     
     return teams_list
 
+def parse_tournament_start_date(start_date_value):
+    """Parse tournament start date from Firestore fields into a date object."""
+    if not start_date_value:
+        return None
+
+    try:
+        if isinstance(start_date_value, datetime):
+            return start_date_value.date()
+
+        start_date_str = str(start_date_value).strip()
+        if not start_date_str:
+            return None
+
+        # Most tournament docs store dates as YYYY-MM-DD
+        if len(start_date_str) >= 10:
+            return datetime.strptime(start_date_str[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+    return None
+
+def build_not_started_team_scores(team_assignments):
+    """Return placeholder team score rows so leaderboard tables stay visible pre-tournament."""
+    placeholder_rows = []
+
+    for idx, team_def in enumerate(team_assignments or []):
+        team_name = None
+        for name_key in ['teamName', 'name', 'team_name', 'team']:
+            if isinstance(team_def, dict):
+                val = team_def.get(name_key)
+            else:
+                val = getattr(team_def, name_key, None)
+            if val and str(val).strip():
+                team_name = str(val).strip()
+                break
+
+        if not team_name:
+            team_name = f"Team {idx + 1}"
+
+        golfers = []
+        for golfer_name in (team_def.get('golferNames', []) if isinstance(team_def, dict) else []):
+            golfers.append({
+                'name': golfer_name,
+                'status': '',
+                'thru': '',
+                'r1': {'score': None, 'isLive': False, 'isPenalty': False},
+                'r2': {'score': None, 'isLive': False, 'isPenalty': False},
+                'r3': {'score': None, 'isLive': False, 'isPenalty': False},
+                'r4': {'score': None, 'isLive': False, 'isPenalty': False},
+                'total': None,
+                'isCut': False,
+                'cutPenaltyScore': None,
+            })
+
+        placeholder_rows.append({
+            'teamName': team_name,
+            'totalScore': None,
+            'players': golfers,
+            'cutPlayersCount': 0,
+            'penaltyStrokesApplied': 0,
+            'worstRoundScores': {'r1': None, 'r2': None, 'r3': None, 'r4': None},
+            'validRounds': 0,
+            'roundDetails': {
+                'r1': {'score': None, 'penaltyScores': 0, 'validScores': 0},
+                'r2': {'score': None, 'penaltyScores': 0, 'validScores': 0},
+                'r3': {'score': None, 'penaltyScores': 0, 'validScores': 0},
+                'r4': {'score': None, 'penaltyScores': 0, 'validScores': 0},
+            }
+        })
+
+    return placeholder_rows
+
 # --- Optimized RapidAPI Integration Functions ---
 def make_rapidapi_request(endpoint, params=None, bypass_rate_limit=False, request_source="api_call"):
     """Make a rate-limited request to RapidAPI using response headers for rate limiting"""
@@ -1098,10 +1170,13 @@ def get_optimized_leaderboard():
                 is_active = t_data.get('isActive', False)
                 is_draft_complete = t_data.get('IsDraftComplete', False)
                 has_stored_scores = t_data.get('lastCalculatedScores') is not None
-                if not is_complete and not is_active and not has_stored_scores and not is_draft_complete:
+                tournament_start_date = parse_tournament_start_date(t_data.get('startDate'))
+                tournament_not_started_by_date = bool(tournament_start_date and tournament_start_date > datetime.now().date())
+                if not is_complete and not has_stored_scores and (tournament_not_started_by_date or (not is_active and not is_draft_complete)):
                     app.logger.info(f"Tournament {tournament_id} has not started — skipping RapidAPI call")
+                    placeholder_scores = build_not_started_team_scores(t_data.get('teams', []))
                     return jsonify({
-                        'teamScores': [],
+                        'teamScores': placeholder_scores,
                         'isOfficiallyComplete': False,
                         'tournamentStatus': {'status': 'Not Started', 'isOfficialComplete': False, 'isInProgress': False},
                         'dataFreshness': 'not_started',
@@ -1245,10 +1320,13 @@ def get_tournament_leaderboard(tournament_id):
         is_active = tournament_data.get('isActive', False)
         is_draft_complete = tournament_data.get('IsDraftComplete', False)
         has_stored_scores = tournament_data.get('lastCalculatedScores') is not None
-        if not is_active and not has_stored_scores and not is_draft_complete:
+        tournament_start_date = parse_tournament_start_date(tournament_data.get('startDate'))
+        tournament_not_started_by_date = bool(tournament_start_date and tournament_start_date > datetime.now().date())
+        if not has_stored_scores and (tournament_not_started_by_date or (not is_active and not is_draft_complete)):
             app.logger.info(f"Tournament {tournament_id} has not started — skipping RapidAPI call")
+            placeholder_scores = build_not_started_team_scores(tournament_data.get('teams', []))
             return jsonify({
-                'teamScores': [],
+                'teamScores': placeholder_scores,
                 'isOfficiallyComplete': False,
                 'tournamentStatus': {'status': 'Not Started', 'isOfficialComplete': False, 'isInProgress': False},
                 'dataFreshness': 'not_started',

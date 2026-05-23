@@ -890,24 +890,6 @@ def _deduplicate_team_names(teams):
             seen[unique] = True
     return teams
 
-def _deduplicate_team_names(teams):
-    """If multiple teams have the same name, append the email prefix to make each unique."""
-    from collections import Counter
-    name_counts = Counter(t['name'] for t in teams)
-    seen = {}
-    for team in teams:
-        if name_counts[team['name']] > 1:
-            email = team.get('ownerEmail', '')
-            suffix = email.split('@')[0] if email else team.get('ownerUid', '')[:6]
-            base = team['name']
-            unique = f"{base} ({suffix})"
-            # Handle the rare case where even the suffix collides
-            if unique in seen:
-                unique = f"{base} ({team.get('ownerUid', '')[:8]})"
-            team['name'] = unique
-            seen[unique] = True
-    return teams
-
 def _parse_rapidapi_date(raw):
     """Parse a RapidAPI date value (str or MongoDB extended JSON dict) to a YYYY-MM-DD string."""
     if isinstance(raw, str):
@@ -2986,51 +2968,61 @@ def optimize_response(data, request_args=None):
 @app.route('/api/batch', methods=['POST'])
 @performance_monitor
 def batch_requests():
-    """Handle multiple API requests in a single call"""
+    """Handle multiple API requests in a single call.
+    
+    Request body:
+      { "requests": [ { "endpoint": "/tournaments/{id}/leaderboard", "params": {} }, ... ] }
+    
+    Supported GET endpoints (prefix /api is added automatically):
+      /tournaments/{id}
+      /tournaments/{id}/leaderboard
+      /tournaments/{id}/draft_status
+      /player_odds?oddsId={oddsId}
+    
+    Returns an array of { data, error } objects in the same order.
+    """
     try:
         requests_data = request.get_json()
         if not requests_data or 'requests' not in requests_data:
             return jsonify({'error': 'Invalid batch request format'}), 400
-        
+
         requests_list = requests_data['requests']
         if len(requests_list) > 10:  # Limit batch size
             return jsonify({'error': 'Too many requests in batch (max 10)'}), 400
-        
+
+        # Forward the caller's Authorization header to each sub-request
+        forward_headers = {}
+        auth_header = request.headers.get('Authorization')
+        if auth_header:
+            forward_headers['Authorization'] = auth_header
+
         results = []
-        
-        for req_data in requests_list:
-            try:
-                endpoint = req_data.get('endpoint', '')
-                params = req_data.get('params', {})
-                
-                # Route to appropriate handler based on endpoint
-                if endpoint.startswith('/tournaments'):
-                    if '/leaderboard' in endpoint:
-                        tournament_id = endpoint.split('/')[-2]
-                        # Call leaderboard logic (would need to extract from existing endpoint)
-                        result = {'message': 'Leaderboard data would be fetched here'}
-                    elif '/draft_status' in endpoint:
-                        tournament_id = endpoint.split('/')[-2]
-                        # Call draft status logic
-                        result = {'message': 'Draft status would be fetched here'}
+
+        with app.test_client() as sub_client:
+            for req_data in requests_list:
+                try:
+                    endpoint = req_data.get('endpoint', '')
+                    params = req_data.get('params', {})
+
+                    # Build the full internal path, appending query params
+                    path = f'/api{endpoint}'
+                    if params:
+                        qs = '&'.join(f'{k}={v}' for k, v in params.items())
+                        path = f'{path}?{qs}'
+
+                    sub_resp = sub_client.get(path, headers=forward_headers)
+                    result_data = sub_resp.get_json()
+
+                    if sub_resp.status_code >= 400:
+                        results.append({'data': None, 'error': result_data})
                     else:
-                        tournament_id = endpoint.split('/')[-1]
-                        # Call tournament data logic
-                        result = {'message': 'Tournament data would be fetched here'}
-                elif endpoint.startswith('/player_odds'):
-                    odds_id = params.get('oddsId')
-                    # Call player odds logic
-                    result = {'message': 'Player odds would be fetched here'}
-                else:
-                    result = {'error': f'Unknown endpoint: {endpoint}'}
-                
-                results.append({'data': result, 'error': None})
-                
-            except Exception as e:
-                results.append({'data': None, 'error': str(e)})
-        
+                        results.append({'data': result_data, 'error': None})
+
+                except Exception as e:
+                    results.append({'data': None, 'error': str(e)})
+
         return jsonify(results)
-        
+
     except Exception as e:
         app.logger.error(f"Batch request error: {str(e)}")
         return jsonify({'error': 'Internal server error'}), 500
@@ -3257,7 +3249,10 @@ class TournamentMonitor:
                         self.app.logger.info(f"Recalculating scores for tournament {doc.id} during scheduled check")
                         
                         # Calculate team scores
-                        team_scores = calculate_team_scores(leaderboard_data, tournament_data)
+                        leaderboard_rows = leaderboard_data.get('leaderboardRows', [])
+                        team_assignments = tournament_data.get('teams', [])
+                        current_par = tournament_data.get('par', 72)
+                        team_scores = calculate_team_scores(leaderboard_rows, team_assignments, current_par)
                         
                         # Store calculated scores
                         metadata = {

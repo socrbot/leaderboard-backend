@@ -1726,6 +1726,38 @@ def get_player_odds():
     app.logger.info(f"Draft odds not yet locked for oddsId: {odds_id}, returning empty list")
     return jsonify([]), 200
 
+
+@app.route('/api/player_headshots', methods=['GET'])
+def get_player_headshots():
+    """Return cached player headshots, optionally filtered by a comma-separated names query."""
+    names_param = (request.args.get('names') or '').strip()
+    force_refresh = request.args.get('forceRefresh', 'false').lower() == 'true'
+
+    headshot_maps = fetch_sportsdata_headshot_maps(force_refresh=force_refresh)
+    by_name = headshot_maps.get('by_name', {})
+
+    # If no names are provided, return full normalized map.
+    if not names_param:
+        return jsonify({
+            'headshotsByName': by_name,
+            'count': len(by_name),
+            'cacheTtlSeconds': HEADSHOT_CACHE_TTL_SECONDS
+        })
+
+    requested_names = [name.strip() for name in names_param.split(',') if name and name.strip()]
+    filtered = {}
+    for raw_name in requested_names:
+        normalized_name = normalize_player_name(raw_name)
+        if normalized_name and normalized_name in by_name:
+            filtered[normalized_name] = by_name[normalized_name]
+
+    return jsonify({
+        'headshotsByName': filtered,
+        'requestedCount': len(requested_names),
+        'matchedCount': len(filtered),
+        'cacheTtlSeconds': HEADSHOT_CACHE_TTL_SECONDS
+    })
+
 # --- Annual Championship Calculation API ---
 # OLD annual championship endpoint removed - see line 2555 for new year-filtered version
 

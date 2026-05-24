@@ -165,8 +165,23 @@ if not SPORTSDATA_IO_API_KEY:
     app.logger.warning("SPORTSDATA_IO_API_KEY environment variable not set. Using dummy key.")
     SPORTSDATA_IO_API_KEY = "dummy_sportsdataio_key"
 
+SPORTSDATA_HEADSHOTS_ENDPOINT = "https://api.sportsdata.io/v3/golf/headshots/json/Headshots"
+HEADSHOT_CACHE_TTL_SECONDS = 24 * 60 * 60
+
 # --- Cache variables (for both APIs) ---
 CACHE = {}
+
+
+def normalize_player_name(name):
+    """Normalize player names to improve matching across APIs."""
+    if not name:
+        return ""
+
+    normalized = unicodedata.normalize('NFKD', str(name))
+    ascii_name = ''.join(c for c in normalized if not unicodedata.combining(c))
+    ascii_name = re.sub(r"[^a-zA-Z0-9 ]", "", ascii_name)
+    ascii_name = re.sub(r"\s+", " ", ascii_name).strip().lower()
+    return ascii_name
 
 # --- API Rate Limiting Functions ---
 def update_rate_limit_info(response_headers):
@@ -1542,6 +1557,91 @@ def extract_player_photo_url(player_entry):
     return None
 
 
+def fetch_sportsdata_headshot_maps(force_refresh=False):
+    """Fetch and cache SportsData headshots, returning maps by normalized name and player id."""
+    cache_key = ('sportsdata_headshots', 'v1')
+
+    if not force_refresh and cache_key in CACHE:
+        cached_data, timestamp = CACHE[cache_key]
+        if (time.time() - timestamp) < HEADSHOT_CACHE_TTL_SECONDS:
+            return cached_data
+
+    try:
+        response = requests.get(
+            SPORTSDATA_HEADSHOTS_ENDPOINT,
+            params={"key": SPORTSDATA_IO_API_KEY},
+            timeout=20
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as e:
+        app.logger.warning(f"Failed to fetch SportsData headshots: {e}")
+        return {'by_name': {}, 'by_id': {}}
+
+    if not isinstance(payload, list):
+        app.logger.warning("SportsData headshots response was not a list")
+        return {'by_name': {}, 'by_id': {}}
+
+    by_name = {}
+    by_id = {}
+    for entry in payload:
+        if not isinstance(entry, dict):
+            continue
+
+        photo_url = extract_player_photo_url(entry)
+        if not photo_url:
+            continue
+
+        player_id = entry.get('PlayerID') or entry.get('PlayerId') or entry.get('PgaPlayerID')
+        player_name = entry.get('Name') or entry.get('PlayerName') or entry.get('DisplayName')
+
+        normalized_name = normalize_player_name(player_name)
+        if normalized_name and normalized_name not in by_name:
+            by_name[normalized_name] = photo_url
+
+        if player_id is not None:
+            by_id[str(player_id)] = photo_url
+
+    maps = {'by_name': by_name, 'by_id': by_id}
+    CACHE[cache_key] = (maps, time.time())
+    return maps
+
+
+def enrich_player_odds_with_headshots(player_rows):
+    """Ensure player odds rows include photoUrl when possible via SportsData headshots API."""
+    if not isinstance(player_rows, list) or not player_rows:
+        return player_rows
+
+    headshot_maps = fetch_sportsdata_headshot_maps()
+    by_name = headshot_maps.get('by_name', {})
+    by_id = headshot_maps.get('by_id', {})
+
+    enriched = []
+    for row in player_rows:
+        if not isinstance(row, dict):
+            enriched.append(row)
+            continue
+
+        updated = dict(row)
+        current_photo = updated.get('photoUrl') or updated.get('PhotoUrl')
+        player_id = updated.get('playerId') or updated.get('PlayerID') or updated.get('PlayerId')
+        player_name = updated.get('name') or updated.get('Name') or updated.get('playerName')
+
+        if not current_photo:
+            lookup_photo = None
+            if player_id is not None:
+                lookup_photo = by_id.get(str(player_id))
+            if not lookup_photo:
+                lookup_photo = by_name.get(normalize_player_name(player_name))
+
+            if lookup_photo:
+                updated['photoUrl'] = lookup_photo
+
+        enriched.append(updated)
+
+    return enriched
+
+
 def calculate_average_odds(player_odds_data):
     player_odds_map = {}
     player_metadata_map = {}
@@ -1616,6 +1716,7 @@ def get_player_odds():
             locked_odds = tournament_data.get('DraftLockedOdds')
             if locked_odds:
                 app.logger.info(f"Returning locked draft odds from Firestore for oddsId: {odds_id}")
+                locked_odds = enrich_player_odds_with_headshots(tournament_data['DraftLockedOdds'])
                 return jsonify(locked_odds)
 
     except Exception as e:
@@ -2552,6 +2653,7 @@ def start_draft(tournament_id):
 
             raw_player_odds = data["PlayerTournamentOdds"]
             averaged_odds_list = calculate_average_odds(raw_player_odds)
+            averaged_odds_list = enrich_player_odds_with_headshots(averaged_odds_list)
 
             # Store tournament metadata from this one-time API call so we never need to call again
             tourn_meta = data.get("Tournament", {})
@@ -2676,6 +2778,7 @@ def lock_draft_odds(tournament_id):
             return jsonify({"error": "Could not retrieve live odds to lock in. API response missing player data."}), 500
         raw_player_odds = data["PlayerTournamentOdds"]
         averaged_odds_list = calculate_average_odds(raw_player_odds)
+        averaged_odds_list = enrich_player_odds_with_headshots(averaged_odds_list)
 
         # Store how many players form the "tiered" draft pool (4 × num_teams),
         # but keep the full list in DraftLockedOdds so search works across all players.

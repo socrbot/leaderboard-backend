@@ -3833,11 +3833,10 @@ def lock_draft_odds(tournament_id):
                 # Exclude members who have opted out of this tournament
                 opted_out = db.collection('users').document(uid).get()
                 opted_out_ids = []
-                user_participates_in_annual = True
+                member_participates_in_annual = bool(m.get('participatesInAnnual', True))
                 if opted_out.exists:
                     user_data = opted_out.to_dict()
                     opted_out_ids = user_data.get('optedOutTournaments', [])
-                    user_participates_in_annual = user_data.get('participatesInAnnual', True)
                 if tournament_id not in opted_out_ids:
                     teams.append({
                         "name": m.get("teamName") or m.get("displayName") or m.get("email", uid),
@@ -3845,7 +3844,7 @@ def lock_draft_odds(tournament_id):
                         "ownerEmail": m.get("email", ""),
                         "golferNames": [],
                         "draftOrder": None,
-                        "participatesInAnnual": user_participates_in_annual,
+                        "participatesInAnnual": member_participates_in_annual,
                     })
 
         if not teams:
@@ -5069,24 +5068,50 @@ def join_league_by_code():
             display_name = ''
             email = request.user_email or ''
 
-        team_name = (data.get('teamName', '') or '').strip() or display_name or email
+        user_ref = db.collection('users').document(request.uid)
+        user_snapshot = user_ref.get()
+        user_data = user_snapshot.to_dict() if user_snapshot.exists else {}
+
+        incoming_team_name = (data.get('teamName', '') or '').strip()
+        team_name = incoming_team_name or (user_data.get('teamName') or '').strip() or display_name or email
+
+        # Keep annual preference scoped per league membership.
+        default_annual = user_data.get('participatesInAnnual', True)
+        if 'participatesInAnnual' in data:
+            default_annual = bool(data.get('participatesInAnnual'))
+
         member_ref.set({
             'uid': request.uid,
             'email': email,
             'displayName': display_name,
             'teamName': team_name,
+            'participatesInAnnual': bool(default_annual),
             'joinedAt': firestore.SERVER_TIMESTAMP,
         })
         league_ref.update({'memberCount': firestore.Increment(1)})
 
-        db.collection('users').document(request.uid).set(
-            {
-                'leagueIds': firestore.ArrayUnion([league_id]),
-                'inLeague': True,  # backward compat
-                'leagueJoinedAt': firestore.SERVER_TIMESTAMP,
-            },
-            merge=True
-        )
+        user_update = {
+            'leagueIds': firestore.ArrayUnion([league_id]),
+            'inLeague': True,  # backward compat
+            'leagueJoinedAt': firestore.SERVER_TIMESTAMP,
+            'teamName': team_name,
+        }
+        if 'participatesInAnnual' in data:
+            user_update['participatesInAnnual'] = bool(data.get('participatesInAnnual'))
+        user_ref.set(user_update, merge=True)
+
+        # If the user provided a new team name, align all league memberships to the global team identity.
+        if incoming_team_name:
+            league_ids = list(set((user_data.get('leagueIds', []) or []) + [league_id]))
+            for lid in league_ids:
+                try:
+                    db.collection('leagues').document(lid).collection('members').document(request.uid).set(
+                        {'teamName': team_name},
+                        merge=True
+                    )
+                except Exception as sync_err:
+                    app.logger.warning(f"Could not sync global teamName for user {request.uid} in league {lid}: {sync_err}")
+
         app.logger.info(f'User {request.uid} joined league {league_id}')
         return jsonify({'message': 'Successfully joined the league', 'leagueId': league_id}), 200
     except Exception as e:
@@ -5112,8 +5137,11 @@ def get_user_profile():
 
         user_doc = db.collection('users').document(request.uid).get()
         league_ids = []
+        global_team_name = ''
         if user_doc.exists:
-            league_ids = user_doc.to_dict().get('leagueIds', [])
+            user_data = user_doc.to_dict()
+            league_ids = user_data.get('leagueIds', [])
+            global_team_name = (user_data.get('teamName') or '').strip()
 
         leagues = []
         stale_ids = []
@@ -5131,11 +5159,18 @@ def get_user_profile():
                 leagues.append({
                     'leagueId': lid,
                     'name': league_doc.to_dict().get('name', ''),
-                    'teamName': m.get('teamName', '') or m.get('displayName', ''),
+                    'teamName': global_team_name or m.get('teamName', '') or m.get('displayName', ''),
+                    'participatesInAnnual': m.get('participatesInAnnual', True),
                     'joinedAt': m.get('joinedAt').isoformat() if m.get('joinedAt') else None,
                 })
             except Exception as e:
                 app.logger.warning(f"Could not verify league {lid} for user {request.uid}: {e}")
+
+        # Backfill a global team name from membership data if user profile does not have one yet.
+        if not global_team_name and leagues:
+            global_team_name = leagues[0].get('teamName', '') or ''
+            if global_team_name:
+                db.collection('users').document(request.uid).set({'teamName': global_team_name}, merge=True)
 
         # Clean up stale leagueIds silently so they don't resurface
         if stale_ids:
@@ -5147,6 +5182,7 @@ def get_user_profile():
         return jsonify({
             'email': email,
             'displayName': display_name,
+            'teamName': global_team_name,
             'leagues': leagues,
         }), 200
     except Exception as e:
@@ -5163,11 +5199,24 @@ def get_user_settings():
     try:
         doc = db.collection('users').document(request.uid).get()
         if not doc.exists:
-            return jsonify({'enrolledTournaments': [], 'participatesInAnnual': True}), 200
+            return jsonify({'enrolledTournaments': [], 'participatesInAnnual': True, 'leagueAnnualPreferences': {}}), 200
         d = doc.to_dict()
+
+        league_annual_preferences = {}
+        league_ids = d.get('leagueIds', []) or []
+        for lid in league_ids:
+            try:
+                member_doc = db.collection('leagues').document(lid).collection('members').document(request.uid).get()
+                if member_doc.exists:
+                    league_annual_preferences[lid] = bool(member_doc.to_dict().get('participatesInAnnual', True))
+            except Exception as member_err:
+                app.logger.warning(f"Could not read annual preference for user {request.uid} in league {lid}: {member_err}")
+
         return jsonify({
             'enrolledTournaments': d.get('enrolledTournaments', []),
             'participatesInAnnual': d.get('participatesInAnnual', True),
+            'leagueAnnualPreferences': league_annual_preferences,
+            'teamName': d.get('teamName', ''),
         }), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -5188,9 +5237,46 @@ def update_user_settings():
             update['enrolledTournaments'] = data['enrolledTournaments']
         if 'participatesInAnnual' in data:
             update['participatesInAnnual'] = bool(data['participatesInAnnual'])
-        if not update:
+
+        team_name = None
+        if 'teamName' in data:
+            team_name = (data.get('teamName', '') or '').strip()
+            if not team_name:
+                return jsonify({'error': 'teamName cannot be empty'}), 400
+            update['teamName'] = team_name
+        league_annual_preferences = data.get('leagueAnnualPreferences')
+        if league_annual_preferences is not None and not isinstance(league_annual_preferences, dict):
+            return jsonify({'error': 'leagueAnnualPreferences must be an object keyed by leagueId'}), 400
+
+        if not update and league_annual_preferences is None:
             return jsonify({'error': 'No valid fields provided'}), 400
-        db.collection('users').document(request.uid).set(update, merge=True)
+        user_ref = db.collection('users').document(request.uid)
+        user_ref.set(update, merge=True)
+
+        if isinstance(league_annual_preferences, dict):
+            for lid, participates in league_annual_preferences.items():
+                lid_text = (lid or '').strip()
+                if not lid_text:
+                    continue
+                member_ref = db.collection('leagues').document(lid_text).collection('members').document(request.uid)
+                member_doc = member_ref.get()
+                if member_doc.exists:
+                    member_ref.set({'participatesInAnnual': bool(participates)}, merge=True)
+
+        # Keep one team identity across all leagues for this user.
+        if team_name:
+            user_snapshot = user_ref.get()
+            league_ids = []
+            if user_snapshot.exists:
+                league_ids = user_snapshot.to_dict().get('leagueIds', []) or []
+            for lid in league_ids:
+                try:
+                    member_ref = db.collection('leagues').document(lid).collection('members').document(request.uid)
+                    if member_ref.get().exists:
+                        member_ref.set({'teamName': team_name}, merge=True)
+                except Exception as sync_err:
+                    app.logger.warning(f"Could not sync teamName for user {request.uid} in league {lid}: {sync_err}")
+
         return jsonify({'message': 'Settings updated'}), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -5292,18 +5378,13 @@ def get_league_members_by_id(league_id):
         for doc in members_ref:
             d = doc.to_dict()
             uid = doc.id
-            # Fetch participatesInAnnual from the user's own record
-            participates = True
-            user_doc = db.collection('users').document(uid).get()
-            if user_doc.exists:
-                participates = user_doc.to_dict().get('participatesInAnnual', True)
             members.append({
                 'uid': uid,
                 'email': d.get('email', ''),
                 'displayName': d.get('displayName', ''),
                 'teamName': d.get('teamName', ''),
                 'joinedAt': d.get('joinedAt').isoformat() if d.get('joinedAt') else None,
-                'participatesInAnnual': participates,
+                'participatesInAnnual': d.get('participatesInAnnual', True),
             })
         members.sort(key=lambda m: m.get('joinedAt') or '')
         return jsonify(members), 200

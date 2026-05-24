@@ -940,6 +940,202 @@ def map_four_majors_to_sport_keys(discovered_sports, saved_mapping=None):
         'unresolvedMajors': [r['majorCode'] for r in unresolved],
     }
 
+
+def get_major_definition(major_code):
+    """Return a major definition object by code."""
+    for definition in ODDS_MAJOR_DEFINITIONS:
+        if definition.get('majorCode') == major_code:
+            return definition
+    return None
+
+
+def resolve_major_sport_key(major_code, force_refresh=False, include_all=False):
+    """Resolve sport key for a major using discovery + fallback mapping logic."""
+    major_definition = get_major_definition(major_code)
+    if not major_definition:
+        return None, f"Unknown majorCode: {major_code}"
+
+    saved_mapping = get_saved_odds_major_mapping()
+    discovery, error = get_discovered_odds_golf_sports(include_all=include_all, force_refresh=force_refresh)
+    if error:
+        cache_key = ('odds_api_sports_discovery', bool(include_all))
+        if cache_key in CACHE:
+            discovery = CACHE[cache_key][0]
+        else:
+            return None, error
+
+    discovered_sports = discovery.get('sports', []) if isinstance(discovery, dict) else []
+    mapping = map_four_majors_to_sport_keys(discovered_sports, saved_mapping=saved_mapping)
+    by_major = {row.get('majorCode'): row for row in mapping.get('majors', []) if isinstance(row, dict)}
+    row = by_major.get(major_code)
+
+    # Fallback to all=true discovery if needed.
+    if (not row or not row.get('sportKey')) and not include_all:
+        all_discovery, all_error = get_discovered_odds_golf_sports(include_all=True, force_refresh=force_refresh)
+        if not all_error and isinstance(all_discovery, dict):
+            all_mapping = map_four_majors_to_sport_keys(all_discovery.get('sports', []), saved_mapping=saved_mapping)
+            all_by_major = {item.get('majorCode'): item for item in all_mapping.get('majors', []) if isinstance(item, dict)}
+            all_row = all_by_major.get(major_code)
+            if all_row and all_row.get('sportKey'):
+                row = all_row
+
+    if not row or not row.get('sportKey'):
+        return None, f"Could not resolve sport key for major {major_code}"
+
+    return row, None
+
+
+def compute_odds_api_expected_cost(regions, markets):
+    """Approximate Odds API call cost: number_of_regions * number_of_markets."""
+    region_count = len([r.strip() for r in str(regions or '').split(',') if r.strip()])
+    market_count = len([m.strip() for m in str(markets or '').split(',') if m.strip()])
+    if region_count <= 0:
+        region_count = 1
+    if market_count <= 0:
+        market_count = 1
+    return region_count * market_count
+
+
+def normalize_odds_api_outrights(odds_events, sport_key, major_code=None):
+    """Normalize Odds API outrights payload into DraftLockedOdds-compatible player rows."""
+    if not isinstance(odds_events, list):
+        return []
+
+    aggregate = {}
+    for event in odds_events:
+        if not isinstance(event, dict):
+            continue
+
+        event_id = event.get('id')
+        bookmakers = event.get('bookmakers', [])
+        if not isinstance(bookmakers, list):
+            continue
+
+        for bookmaker in bookmakers:
+            if not isinstance(bookmaker, dict):
+                continue
+
+            book_key = bookmaker.get('key') or bookmaker.get('title')
+            markets = bookmaker.get('markets', [])
+            if not isinstance(markets, list):
+                continue
+
+            for market in markets:
+                if not isinstance(market, dict):
+                    continue
+                if market.get('key') != 'outrights':
+                    continue
+
+                outcomes = market.get('outcomes', [])
+                if not isinstance(outcomes, list):
+                    continue
+
+                for outcome in outcomes:
+                    if not isinstance(outcome, dict):
+                        continue
+
+                    player_name = (outcome.get('name') or '').strip()
+                    if not player_name:
+                        continue
+
+                    raw_price = outcome.get('price')
+                    try:
+                        numeric_price = float(raw_price)
+                    except (TypeError, ValueError):
+                        continue
+
+                    norm_name = normalize_player_name(player_name)
+                    if not norm_name:
+                        continue
+
+                    if norm_name not in aggregate:
+                        aggregate[norm_name] = {
+                            'name': player_name,
+                            'prices': [],
+                            'eventIds': set(),
+                            'bookmakers': set(),
+                        }
+
+                    aggregate[norm_name]['prices'].append(numeric_price)
+                    if event_id:
+                        aggregate[norm_name]['eventIds'].add(str(event_id))
+                    if book_key:
+                        aggregate[norm_name]['bookmakers'].add(str(book_key))
+
+    normalized_rows = []
+    for player_data in aggregate.values():
+        prices = player_data.get('prices', [])
+        if not prices:
+            continue
+
+        average_odds = sum(prices) / len(prices)
+        normalized_rows.append({
+            'name': player_data.get('name'),
+            'averageOdds': round(average_odds, 2),
+            'playerId': None,
+            'photoUrl': None,
+            'bestOdds': min(prices),
+            'worstOdds': max(prices),
+            'source': 'odds_api',
+            'sourceMajor': major_code,
+            'sourceSportKey': sport_key,
+            'sourceEventIds': sorted(player_data.get('eventIds', set())),
+            'sourceBookCount': len(player_data.get('bookmakers', set())),
+            'lastSyncedAt': datetime.utcnow().isoformat()
+        })
+
+    normalized_rows.sort(key=lambda row: row['averageOdds'] if row['averageOdds'] is not None else float('inf'))
+    return normalized_rows
+
+
+def fetch_major_odds_snapshot(major_code, sport_key=None, regions='us', markets='outrights', odds_format='american', date_format='iso', force_refresh=False):
+    """Fetch and normalize major outright odds snapshot from Odds API."""
+    resolved = None
+    if sport_key:
+        resolved = {
+            'majorCode': major_code,
+            'sportKey': sport_key,
+            'confidence': 'explicit',
+            'matchedFrom': 'request_param',
+        }
+    else:
+        resolved, resolve_error = resolve_major_sport_key(major_code, force_refresh=force_refresh, include_all=False)
+        if resolve_error:
+            return None, resolve_error
+
+    target_sport_key = resolved.get('sportKey')
+    expected_cost = compute_odds_api_expected_cost(regions, markets)
+    params = {
+        'regions': regions,
+        'markets': markets,
+        'oddsFormat': odds_format,
+        'dateFormat': date_format,
+    }
+
+    odds_events, error = make_odds_api_request(
+        f"/sports/{target_sport_key}/odds/",
+        params=params,
+        expected_cost=expected_cost,
+        request_source=f"odds_api_major_odds_{major_code}"
+    )
+    if error:
+        return None, error
+
+    if not isinstance(odds_events, list):
+        return None, f"Unexpected odds response shape for sportKey {target_sport_key}"
+
+    normalized = normalize_odds_api_outrights(odds_events, target_sport_key, major_code=major_code)
+    normalized = enrich_player_odds_with_headshots(normalized)
+
+    return {
+        'majorCode': major_code,
+        'sportKey': target_sport_key,
+        'resolution': resolved,
+        'eventCount': len(odds_events),
+        'playerCount': len(normalized),
+        'players': normalized,
+    }, None
+
 # --- Tournament Status Detection Functions ---
 def get_tournament_status_from_api(api_response):
     """Extract tournament status from RapidAPI response"""
@@ -1625,6 +1821,106 @@ def get_odds_api_major_sport_keys():
         'forceRefresh': force_refresh,
         'usedAllSportsFallback': all_sports_fallback_used,
         'savedMappingCount': len(saved_mapping),
+        'oddsApiUsage': get_odds_api_rate_limit_status(refresh_from_firestore=False)
+    })
+
+
+@app.route('/api/odds_api/major_odds', methods=['GET'])
+def get_odds_api_major_odds():
+    """Phase 2 endpoint: fetch normalized outright odds for a major."""
+    major_code = (request.args.get('majorCode') or '').strip()
+    sport_key = (request.args.get('sportKey') or '').strip() or None
+    regions = (request.args.get('regions') or 'us').strip()
+    markets = (request.args.get('markets') or 'outrights').strip()
+    odds_format = (request.args.get('oddsFormat') or 'american').strip()
+    date_format = (request.args.get('dateFormat') or 'iso').strip()
+    force_refresh = request.args.get('forceRefresh', 'false').lower() == 'true'
+
+    if not major_code:
+        return jsonify({'error': 'Missing required parameter: majorCode'}), 400
+
+    snapshot, error = fetch_major_odds_snapshot(
+        major_code=major_code,
+        sport_key=sport_key,
+        regions=regions,
+        markets=markets,
+        odds_format=odds_format,
+        date_format=date_format,
+        force_refresh=force_refresh,
+    )
+    if error:
+        return jsonify({'error': error}), 500
+
+    return jsonify({
+        'majorCode': snapshot['majorCode'],
+        'sportKey': snapshot['sportKey'],
+        'resolution': snapshot['resolution'],
+        'eventCount': snapshot['eventCount'],
+        'playerCount': snapshot['playerCount'],
+        'players': snapshot['players'],
+        'oddsApiUsage': get_odds_api_rate_limit_status(refresh_from_firestore=False)
+    })
+
+
+@app.route('/api/tournaments/<tournament_id>/sync_odds_api', methods=['POST'])
+def sync_tournament_odds_from_odds_api(tournament_id):
+    """Phase 2 sync endpoint: write normalized Odds API odds into tournament DraftLockedOdds."""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+
+    body = request.get_json(silent=True) or {}
+    major_code = (body.get('majorCode') or '').strip()
+    sport_key = (body.get('sportKey') or '').strip() or None
+    regions = (body.get('regions') or 'us').strip()
+    markets = (body.get('markets') or 'outrights').strip()
+    odds_format = (body.get('oddsFormat') or 'american').strip()
+    date_format = (body.get('dateFormat') or 'iso').strip()
+    force_refresh = bool(body.get('forceRefresh', False))
+    persist_draft_locked_odds = bool(body.get('persistDraftLockedOdds', True))
+
+    if not major_code:
+        return jsonify({'error': 'Missing required field in body: majorCode'}), 400
+
+    doc_ref = db.collection('tournaments').document(tournament_id)
+    doc = doc_ref.get()
+    if not doc.exists:
+        return jsonify({'error': 'Tournament not found'}), 404
+
+    snapshot, error = fetch_major_odds_snapshot(
+        major_code=major_code,
+        sport_key=sport_key,
+        regions=regions,
+        markets=markets,
+        odds_format=odds_format,
+        date_format=date_format,
+        force_refresh=force_refresh,
+    )
+    if error:
+        return jsonify({'error': error}), 500
+
+    update_data = {
+        'oddsSource': 'odds_api',
+        'oddsMajorCode': major_code,
+        'oddsSportKey': snapshot['sportKey'],
+        'oddsSyncStatus': 'success',
+        'oddsSourceVersion': 'v2_phase2',
+        'oddsLastSyncAt': firestore.SERVER_TIMESTAMP,
+        'oddsEventCount': snapshot['eventCount'],
+        'oddsPlayerCount': snapshot['playerCount'],
+    }
+    if persist_draft_locked_odds:
+        update_data['DraftLockedOdds'] = snapshot['players']
+
+    doc_ref.update(update_data)
+
+    return jsonify({
+        'message': f"Synced Odds API odds for tournament {tournament_id}",
+        'tournamentId': tournament_id,
+        'majorCode': major_code,
+        'sportKey': snapshot['sportKey'],
+        'eventCount': snapshot['eventCount'],
+        'playerCount': snapshot['playerCount'],
+        'persistDraftLockedOdds': persist_draft_locked_odds,
         'oddsApiUsage': get_odds_api_rate_limit_status(refresh_from_firestore=False)
     })
 

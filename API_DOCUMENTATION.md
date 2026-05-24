@@ -61,6 +61,37 @@ Phase 1 mapping endpoint: discover golf sports and map them to the 4 majors.
 
 **Example:** `/odds_api/major_sport_keys?forceRefresh=true`
 
+#### GET /odds_api/major_odds
+Phase 2 endpoint: fetch normalized outright odds for a major.
+
+**Parameters:**
+- `majorCode` (string, required): `masters`, `pga_championship`, `us_open`, or `open_championship`
+- `sportKey` (string, optional): explicit sport key override
+- `regions` (string, optional): default `us`
+- `markets` (string, optional): default `outrights`
+- `oddsFormat` (string, optional): default `american`
+- `dateFormat` (string, optional): default `iso`
+- `forceRefresh` (boolean, optional): bypass cached discovery
+
+**Example:** `/odds_api/major_odds?majorCode=us_open&regions=us&markets=outrights`
+
+#### POST /tournaments/{tournament_id}/sync_odds_api
+Phase 2 sync endpoint: fetch Odds API major odds and write to tournament metadata and `DraftLockedOdds`.
+
+**Request body:**
+```json
+{
+  "majorCode": "us_open",
+  "sportKey": "golf_us_open_winner",
+  "regions": "us",
+  "markets": "outrights",
+  "oddsFormat": "american",
+  "dateFormat": "iso",
+  "forceRefresh": false,
+  "persistDraftLockedOdds": true
+}
+```
+
 ### Tournament Schedule
 
 #### GET /schedule

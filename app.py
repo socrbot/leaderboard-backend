@@ -1509,8 +1509,43 @@ def get_tournament_player_scores(tournament_id):
         return jsonify({'error': str(e)}), 500
 
 # Helper function to calculate average odds
+def extract_player_photo_url(player_entry):
+    """Best-effort extraction of a player headshot URL from SportsData odds payload."""
+    if not isinstance(player_entry, dict):
+        return None
+
+    direct_keys = [
+        'PhotoUrl',
+        'PhotoURL',
+        'PlayerImageUrl',
+        'PlayerImageURL',
+        'HeadshotUrl',
+        'HeadshotURL',
+        'ImageUrl',
+        'ImageURL',
+        'Photo',
+    ]
+
+    for key in direct_keys:
+        value = player_entry.get(key)
+        if isinstance(value, str) and value.strip().lower().startswith('http'):
+            return value.strip()
+
+    # Fallback: scan any field that looks like image/photo/headshot URL.
+    for key, value in player_entry.items():
+        if not isinstance(value, str):
+            continue
+        key_l = str(key).lower()
+        if ('photo' in key_l or 'image' in key_l or 'headshot' in key_l) and value.strip().lower().startswith('http'):
+            return value.strip()
+
+    return None
+
+
 def calculate_average_odds(player_odds_data):
     player_odds_map = {}
+    player_metadata_map = {}
+
     for player_entry in player_odds_data:
         player_name = player_entry.get("Name")
         odds_to_win = player_entry.get("OddsToWin")
@@ -1521,17 +1556,42 @@ def calculate_average_odds(player_odds_data):
                     player_odds_map[player_name].append(numeric_odds)
                 else:
                     player_odds_map[player_name] = [numeric_odds]
+
+                if player_name not in player_metadata_map:
+                    player_metadata_map[player_name] = {
+                        'playerId': player_entry.get('PlayerID') or player_entry.get('PlayerId'),
+                        'photoUrl': extract_player_photo_url(player_entry)
+                    }
+                else:
+                    # Preserve first non-empty metadata, fill gaps from later entries.
+                    if not player_metadata_map[player_name].get('playerId'):
+                        player_metadata_map[player_name]['playerId'] = player_entry.get('PlayerID') or player_entry.get('PlayerId')
+                    if not player_metadata_map[player_name].get('photoUrl'):
+                        player_metadata_map[player_name]['photoUrl'] = extract_player_photo_url(player_entry)
             except ValueError:
                 app.logger.warning(f"Could not parse odds for {player_name}: {odds_to_win}")
                 continue
+
     averaged_odds = []
     for player_name, odds_array in player_odds_map.items():
         valid_odds = [odds for odds in odds_array if odds > 0]
+        metadata = player_metadata_map.get(player_name, {})
         if valid_odds:
             average = sum(valid_odds) / len(valid_odds)
-            averaged_odds.append({"name": player_name, "averageOdds": average})
+            averaged_odds.append({
+                "name": player_name,
+                "averageOdds": average,
+                "playerId": metadata.get('playerId'),
+                "photoUrl": metadata.get('photoUrl')
+            })
         else:
-            averaged_odds.append({"name": player_name, "averageOdds": None})
+            averaged_odds.append({
+                "name": player_name,
+                "averageOdds": None,
+                "playerId": metadata.get('playerId'),
+                "photoUrl": metadata.get('photoUrl')
+            })
+
     averaged_odds.sort(key=lambda x: x['averageOdds'] if x['averageOdds'] is not None else float('inf'))
     return averaged_odds
 

@@ -67,7 +67,7 @@ gcloud run deploy $SERVICE_NAME \
     --ingress all \
     --service-account "$SERVICE_ACCOUNT" \
     --clear-env-vars \
-    --set-secrets "RAPIDAPI_KEY=$RAPIDAPI_SECRET:latest,SPORTSDATA_IO_API_KEY=$SPORTSDATA_SECRET:latest,FIREBASE_SERVICE_ACCOUNT_KEY_PATH=$FIREBASE_ADMIN_SECRET:latest" \
+    --set-secrets "RAPIDAPI_KEY=$RAPIDAPI_SECRET:latest,SPORTSDATA_IO_API_KEY=$SPORTSDATA_SECRET:latest,ODDS_API_KEY=$ODDSAPI_SECRET:latest,FIREBASE_SERVICE_ACCOUNT_KEY_PATH=$FIREBASE_ADMIN_SECRET:latest" \
     --project=$PROJECT_ID
 
 # Get the service URL

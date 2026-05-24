@@ -26,6 +26,41 @@ Get current API rate limit status and usage statistics.
 }
 ```
 
+#### GET /odds_api_status
+Get Odds API monthly usage status for free-tier guardrails.
+
+**Response includes:**
+- `requests_used`
+- `requests_remaining`
+- `monthly_limit`
+- `is_warning`
+- `is_blocked`
+
+#### GET /odds_api/sports
+Phase 1 helper endpoint to fetch in-season sports from Odds API.
+
+**Parameters:**
+- `all` (boolean, optional): Include out-of-season sports (`true`|`false`, default `false`)
+
+**Example:** `/odds_api/sports?all=false`
+
+#### GET /odds_api/major_sport_keys
+Phase 1 mapping endpoint: discover golf sports and map them to the 4 majors.
+
+**Parameters:**
+- `all` (boolean, optional): Include out-of-season sports (`true`|`false`, default `false`)
+- `forceRefresh` (boolean, optional): Bypass discovery cache (`true`|`false`, default `false`)
+- `persist` (boolean, optional): Persist healthy mapping as last-known fallback (`true`|`false`, default `true`)
+
+**Response includes:**
+- `majors[]` with `majorCode`, `majorName`, `sportKey`, `confidence`, `matchedFrom`, `matchScore`
+- `isHealthy` (true when all 4 majors are mapped)
+- `unresolvedMajors[]`
+- `sportsCandidateCount`
+- `oddsApiUsage`
+
+**Example:** `/odds_api/major_sport_keys?forceRefresh=true`
+
 ### Tournament Schedule
 
 #### GET /schedule

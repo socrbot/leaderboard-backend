@@ -45,6 +45,18 @@ cache = Cache(app, config=cache_config)
 # --- CORS Configuration ---
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
+
+def get_env_int(name, default):
+    """Read an integer env var with fallback."""
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        return int(raw_value)
+    except (TypeError, ValueError):
+        app.logger.warning(f"Invalid integer for {name}: {raw_value}. Using default {default}.")
+        return default
+
 # --- RapidAPI Configuration ---
 RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
 if RAPIDAPI_KEY:
@@ -56,6 +68,76 @@ else:
     
 RAPIDAPI_HOST = "live-golf-data.p.rapidapi.com"
 RAPIDAPI_BASE_URL = "https://live-golf-data.p.rapidapi.com"
+
+# --- Odds API Configuration ---
+ODDS_API_KEY = os.getenv("ODDS_API_KEY")
+if ODDS_API_KEY:
+    ODDS_API_KEY = ODDS_API_KEY.strip().replace('\r', '').replace('\n', '')
+    app.logger.info(f"Odds API key loaded and cleaned (length: {len(ODDS_API_KEY)})")
+else:
+    app.logger.warning("ODDS_API_KEY environment variable not found")
+
+ODDS_API_BASE_URL = "https://api.the-odds-api.com/v4"
+ODDS_API_MONTHLY_LIMIT = get_env_int("ODDS_API_MONTHLY_LIMIT", 500)
+ODDS_API_SOFT_LIMIT = get_env_int("ODDS_API_SOFT_LIMIT", 450)
+ODDS_API_WARNING_THRESHOLD = get_env_int("ODDS_API_WARNING_THRESHOLD", 400)
+ODDS_SPORTS_DISCOVERY_CACHE_TTL_SECONDS = 6 * 60 * 60
+
+ODDS_MAJOR_DEFINITIONS = [
+    {
+        'majorCode': 'masters',
+        'majorName': 'The Masters',
+        'fallbackKeys': [
+            'golf_masters_winner',
+            'golf_masters_tournament_winner',
+        ],
+    },
+    {
+        'majorCode': 'pga_championship',
+        'majorName': 'PGA Championship',
+        'fallbackKeys': [
+            'golf_pga_championship_winner',
+            'golf_pga_winner',
+        ],
+    },
+    {
+        'majorCode': 'us_open',
+        'majorName': 'U.S. Open',
+        'fallbackKeys': [
+            'golf_us_open_winner',
+            'golf_u_s_open_winner',
+        ],
+    },
+    {
+        'majorCode': 'open_championship',
+        'majorName': 'The Open Championship',
+        'fallbackKeys': [
+            'golf_the_open_championship_winner',
+            'golf_open_championship_winner',
+            'golf_british_open_winner',
+        ],
+    },
+]
+
+ODDS_MAJOR_MAPPING_DOC_ID = 'odds_major_sport_key_mapping'
+
+ODDS_API_USAGE_LOCK = Lock()
+ODDS_API_USAGE_STATE = {
+    'month_key': None,
+    'requests_used': 0,
+    'requests_remaining': None,
+    'last_request_cost': None,
+    'last_updated': None,
+    'source': 'startup_default'
+}
+
+
+def normalize_lookup_text(value):
+    if value is None:
+        return ""
+    normalized = unicodedata.normalize('NFKD', str(value))
+    ascii_text = ''.join(c for c in normalized if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]+", " ", ascii_text.lower()).strip()
 
 # --- API Rate Limiting Configuration ---
 API_CALL_LOCK = Lock()
@@ -293,6 +375,570 @@ def get_rate_limit_status():
             'rapidapi_reset': RATE_LIMIT_INFO['reset'],
             'last_updated': RATE_LIMIT_INFO['last_updated'].isoformat() if RATE_LIMIT_INFO['last_updated'] else None
         }
+
+
+def get_month_key(now=None):
+    """Return UTC month key in YYYY-MM format."""
+    timestamp = now or datetime.utcnow()
+    return timestamp.strftime('%Y-%m')
+
+
+def get_odds_usage_doc_ref(month_key):
+    """Return Firestore document ref for monthly Odds API usage."""
+    if not db:
+        return None
+    return db.collection('api_usage').document(f"odds_api_{month_key}")
+
+
+def _reset_local_odds_usage_if_new_month(month_key):
+    if ODDS_API_USAGE_STATE['month_key'] != month_key:
+        ODDS_API_USAGE_STATE.update({
+            'month_key': month_key,
+            'requests_used': 0,
+            'requests_remaining': max(0, ODDS_API_MONTHLY_LIMIT),
+            'last_request_cost': None,
+            'last_updated': datetime.utcnow(),
+            'source': 'month_reset'
+        })
+
+
+def refresh_odds_api_usage_from_firestore(month_key=None):
+    """Load monthly usage snapshot from Firestore when available."""
+    current_month_key = month_key or get_month_key()
+
+    with ODDS_API_USAGE_LOCK:
+        _reset_local_odds_usage_if_new_month(current_month_key)
+
+        doc_ref = get_odds_usage_doc_ref(current_month_key)
+        if not doc_ref:
+            return dict(ODDS_API_USAGE_STATE)
+
+        try:
+            snapshot = doc_ref.get()
+            if snapshot.exists:
+                payload = snapshot.to_dict() or {}
+                used = int(payload.get('requestsUsed', 0) or 0)
+                remaining_from_provider = payload.get('providerRemaining')
+
+                ODDS_API_USAGE_STATE.update({
+                    'month_key': current_month_key,
+                    'requests_used': max(0, used),
+                    'requests_remaining': remaining_from_provider if remaining_from_provider is not None else max(0, ODDS_API_MONTHLY_LIMIT - used),
+                    'last_request_cost': payload.get('lastRequestCost'),
+                    'last_updated': datetime.utcnow(),
+                    'source': 'firestore_snapshot'
+                })
+        except Exception as e:
+            app.logger.warning(f"Could not refresh Odds API usage from Firestore: {e}")
+
+        return dict(ODDS_API_USAGE_STATE)
+
+
+def reserve_odds_api_quota(expected_cost=1, request_source='odds_api_call'):
+    """Reserve quota before a billable Odds API call to prevent overage."""
+    expected_cost = max(0, int(expected_cost or 0))
+    current_month_key = get_month_key()
+
+    with ODDS_API_USAGE_LOCK:
+        _reset_local_odds_usage_if_new_month(current_month_key)
+
+        # Free requests (for example /sports, /events) don't need reservation.
+        if expected_cost == 0:
+            return True, dict(ODDS_API_USAGE_STATE)
+
+        if db:
+            try:
+                doc_ref = get_odds_usage_doc_ref(current_month_key)
+                snapshot = doc_ref.get()
+                current_used = int((snapshot.to_dict() or {}).get('requestsUsed', 0)) if snapshot.exists else 0
+
+                if current_used + expected_cost > ODDS_API_MONTHLY_LIMIT:
+                    status = {
+                        'month_key': current_month_key,
+                        'requests_used': current_used,
+                        'requests_remaining': max(0, ODDS_API_MONTHLY_LIMIT - current_used),
+                        'monthly_limit': ODDS_API_MONTHLY_LIMIT,
+                        'blocked': True,
+                        'reason': f"Monthly Odds API limit would be exceeded by {request_source}"
+                    }
+                    return False, status
+
+                doc_ref.set({
+                    'provider': 'odds_api',
+                    'monthKey': current_month_key,
+                    'requestsUsed': firestore.Increment(expected_cost),
+                    'lastRequestSource': request_source,
+                    'updatedAt': firestore.SERVER_TIMESTAMP,
+                }, merge=True)
+
+                current_used += expected_cost
+                ODDS_API_USAGE_STATE.update({
+                    'month_key': current_month_key,
+                    'requests_used': current_used,
+                    'requests_remaining': max(0, ODDS_API_MONTHLY_LIMIT - current_used),
+                    'last_request_cost': expected_cost,
+                    'last_updated': datetime.utcnow(),
+                    'source': 'firestore_reservation'
+                })
+                return True, dict(ODDS_API_USAGE_STATE)
+            except Exception as e:
+                app.logger.warning(f"Firestore quota reservation failed for Odds API: {e}. Falling back to local limiter.")
+
+        # Local fallback limiter (covers local dev without Firestore, or Firestore failures)
+        current_used = int(ODDS_API_USAGE_STATE.get('requests_used', 0) or 0)
+        if current_used + expected_cost > ODDS_API_MONTHLY_LIMIT:
+            status = {
+                'month_key': current_month_key,
+                'requests_used': current_used,
+                'requests_remaining': max(0, ODDS_API_MONTHLY_LIMIT - current_used),
+                'monthly_limit': ODDS_API_MONTHLY_LIMIT,
+                'blocked': True,
+                'reason': f"Monthly Odds API limit would be exceeded by {request_source} (local limiter)"
+            }
+            return False, status
+
+        current_used += expected_cost
+        ODDS_API_USAGE_STATE.update({
+            'month_key': current_month_key,
+            'requests_used': current_used,
+            'requests_remaining': max(0, ODDS_API_MONTHLY_LIMIT - current_used),
+            'last_request_cost': expected_cost,
+            'last_updated': datetime.utcnow(),
+            'source': 'local_reservation'
+        })
+        return True, dict(ODDS_API_USAGE_STATE)
+
+
+def reconcile_odds_api_quota(actual_cost, expected_cost=1, request_source='odds_api_call'):
+    """Adjust reserved quota to match actual billed cost from x-requests-last."""
+    expected = max(0, int(expected_cost or 0))
+    actual = max(0, int(actual_cost or 0))
+    delta = actual - expected
+
+    if delta == 0:
+        return
+
+    month_key = get_month_key()
+    with ODDS_API_USAGE_LOCK:
+        _reset_local_odds_usage_if_new_month(month_key)
+
+        if db:
+            try:
+                doc_ref = get_odds_usage_doc_ref(month_key)
+                doc_ref.set({
+                    'provider': 'odds_api',
+                    'monthKey': month_key,
+                    'requestsUsed': firestore.Increment(delta),
+                    'lastRequestSource': request_source,
+                    'updatedAt': firestore.SERVER_TIMESTAMP,
+                }, merge=True)
+            except Exception as e:
+                app.logger.warning(f"Could not reconcile Odds API quota in Firestore: {e}")
+
+        new_used = max(0, int(ODDS_API_USAGE_STATE.get('requests_used', 0) or 0) + delta)
+        ODDS_API_USAGE_STATE.update({
+            'month_key': month_key,
+            'requests_used': new_used,
+            'requests_remaining': max(0, ODDS_API_MONTHLY_LIMIT - new_used),
+            'last_request_cost': actual,
+            'last_updated': datetime.utcnow(),
+            'source': 'reconciled_from_headers'
+        })
+
+
+def update_odds_api_usage_from_headers(response_headers):
+    """Update usage state from Odds API x-requests-* headers."""
+    remaining_raw = response_headers.get('x-requests-remaining')
+    used_raw = response_headers.get('x-requests-used')
+    last_raw = response_headers.get('x-requests-last')
+
+    remaining = None
+    used = None
+    last = None
+    try:
+        if remaining_raw is not None:
+            remaining = int(remaining_raw)
+    except (TypeError, ValueError):
+        pass
+    try:
+        if used_raw is not None:
+            used = int(used_raw)
+    except (TypeError, ValueError):
+        pass
+    try:
+        if last_raw is not None:
+            last = int(last_raw)
+    except (TypeError, ValueError):
+        pass
+
+    month_key = get_month_key()
+    with ODDS_API_USAGE_LOCK:
+        _reset_local_odds_usage_if_new_month(month_key)
+
+        if used is not None:
+            ODDS_API_USAGE_STATE['requests_used'] = max(ODDS_API_USAGE_STATE['requests_used'], used)
+        if remaining is not None:
+            ODDS_API_USAGE_STATE['requests_remaining'] = remaining
+        else:
+            ODDS_API_USAGE_STATE['requests_remaining'] = max(0, ODDS_API_MONTHLY_LIMIT - ODDS_API_USAGE_STATE['requests_used'])
+
+        ODDS_API_USAGE_STATE['last_request_cost'] = last
+        ODDS_API_USAGE_STATE['last_updated'] = datetime.utcnow()
+        ODDS_API_USAGE_STATE['source'] = 'provider_headers'
+
+        if db:
+            try:
+                doc_ref = get_odds_usage_doc_ref(month_key)
+                doc_ref.set({
+                    'provider': 'odds_api',
+                    'monthKey': month_key,
+                    'providerUsed': used,
+                    'providerRemaining': remaining,
+                    'lastRequestCost': last,
+                    'updatedAt': firestore.SERVER_TIMESTAMP,
+                }, merge=True)
+            except Exception as e:
+                app.logger.warning(f"Could not persist Odds API header usage snapshot: {e}")
+
+
+def get_odds_api_rate_limit_status(refresh_from_firestore=True):
+    """Return normalized status payload for Odds API monthly usage."""
+    month_key = get_month_key()
+    if refresh_from_firestore:
+        refresh_odds_api_usage_from_firestore(month_key=month_key)
+
+    with ODDS_API_USAGE_LOCK:
+        _reset_local_odds_usage_if_new_month(month_key)
+        used = int(ODDS_API_USAGE_STATE.get('requests_used', 0) or 0)
+        remaining = ODDS_API_USAGE_STATE.get('requests_remaining')
+        if remaining is None:
+            remaining = max(0, ODDS_API_MONTHLY_LIMIT - used)
+
+        blocked = used >= ODDS_API_MONTHLY_LIMIT or remaining <= 0
+        warning = used >= ODDS_API_WARNING_THRESHOLD or remaining <= (ODDS_API_MONTHLY_LIMIT - ODDS_API_SOFT_LIMIT)
+
+        return {
+            'provider': 'odds_api',
+            'month_key': month_key,
+            'requests_used': used,
+            'requests_remaining': remaining,
+            'monthly_limit': ODDS_API_MONTHLY_LIMIT,
+            'soft_limit': ODDS_API_SOFT_LIMIT,
+            'warning_threshold': ODDS_API_WARNING_THRESHOLD,
+            'is_blocked': blocked,
+            'is_warning': warning,
+            'last_request_cost': ODDS_API_USAGE_STATE.get('last_request_cost'),
+            'last_updated': ODDS_API_USAGE_STATE['last_updated'].isoformat() if ODDS_API_USAGE_STATE['last_updated'] else None,
+            'state_source': ODDS_API_USAGE_STATE.get('source')
+        }
+
+
+def make_odds_api_request(endpoint_path, params=None, expected_cost=1, request_source='odds_api_call'):
+    """Make an Odds API request with strict monthly usage controls."""
+    if not ODDS_API_KEY:
+        return None, "ODDS_API_KEY not configured"
+
+    clean_path = endpoint_path if endpoint_path.startswith('/') else f"/{endpoint_path}"
+    query_params = dict(params or {})
+    query_params['apiKey'] = ODDS_API_KEY
+
+    reserve_ok, reserve_status = reserve_odds_api_quota(expected_cost=expected_cost, request_source=request_source)
+    if not reserve_ok:
+        app.logger.warning(f"Blocked Odds API request for {request_source}: {reserve_status}")
+        return None, f"Odds API monthly limit reached ({reserve_status.get('requests_used')}/{reserve_status.get('monthly_limit')})"
+
+    url = f"{ODDS_API_BASE_URL}{clean_path}"
+    try:
+        response = requests.get(url, params=query_params, timeout=20)
+        update_odds_api_usage_from_headers(response.headers)
+        response.raise_for_status()
+
+        billed_cost = response.headers.get('x-requests-last')
+        if billed_cost is not None:
+            try:
+                reconcile_odds_api_quota(int(billed_cost), expected_cost=expected_cost, request_source=request_source)
+            except (TypeError, ValueError):
+                pass
+
+        status = get_odds_api_rate_limit_status(refresh_from_firestore=False)
+        if status['is_warning']:
+            app.logger.warning(f"Odds API usage warning: {status['requests_used']}/{status['monthly_limit']}")
+
+        return response.json(), None
+    except requests.exceptions.RequestException as e:
+        # If no response headers are available, release reserved cost back to 0 billed.
+        if not hasattr(e, 'response') or e.response is None:
+            reconcile_odds_api_quota(0, expected_cost=expected_cost, request_source=request_source)
+        else:
+            update_odds_api_usage_from_headers(e.response.headers)
+
+        error_msg = f"Odds API request failed for {request_source}: {e}"
+        if hasattr(e, 'response') and e.response is not None:
+            error_msg += f" | Status: {e.response.status_code} | Content: {e.response.text}"
+        app.logger.error(error_msg)
+        return None, error_msg
+
+
+def get_odds_major_mapping_doc_ref():
+    if not db:
+        return None
+    return db.collection('api_usage').document(ODDS_MAJOR_MAPPING_DOC_ID)
+
+
+def get_saved_odds_major_mapping():
+    """Return last-known 4-major mapping from Firestore when available."""
+    doc_ref = get_odds_major_mapping_doc_ref()
+    if not doc_ref:
+        return {}
+
+    try:
+        snapshot = doc_ref.get()
+        if not snapshot.exists:
+            return {}
+        payload = snapshot.to_dict() or {}
+        mapping = payload.get('mapping') or {}
+        return mapping if isinstance(mapping, dict) else {}
+    except Exception as e:
+        app.logger.warning(f"Could not load saved Odds major mapping: {e}")
+        return {}
+
+
+def save_odds_major_mapping(mapping):
+    """Persist last-known healthy mapping to Firestore for fallback use."""
+    doc_ref = get_odds_major_mapping_doc_ref()
+    if not doc_ref or not isinstance(mapping, dict):
+        return
+
+    try:
+        doc_ref.set({
+            'provider': 'odds_api',
+            'mapping': mapping,
+            'updatedAt': firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+    except Exception as e:
+        app.logger.warning(f"Could not save Odds major mapping: {e}")
+
+
+def get_discovered_odds_golf_sports(include_all=False, force_refresh=False):
+    """Fetch and cache discovered golf outright sports from Odds API."""
+    cache_key = ('odds_api_sports_discovery', bool(include_all))
+    if not force_refresh and cache_key in CACHE:
+        cached_value, cached_at = CACHE[cache_key]
+        if (time.time() - cached_at) < ODDS_SPORTS_DISCOVERY_CACHE_TTL_SECONDS:
+            return cached_value, None
+
+    params = {'all': 'true'} if include_all else {}
+    data, error = make_odds_api_request(
+        '/sports/',
+        params=params,
+        expected_cost=0,
+        request_source='odds_api_sports_discovery'
+    )
+    if error:
+        return None, error
+
+    if not isinstance(data, list):
+        return None, 'Unexpected Odds API sports response shape'
+
+    discovered = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+
+        key = str(row.get('key', '')).strip()
+        if not key.startswith('golf_'):
+            continue
+
+        if not row.get('has_outrights', False):
+            continue
+
+        if not include_all and not row.get('active', False):
+            continue
+
+        discovered.append({
+            'key': key,
+            'title': str(row.get('title', '')).strip(),
+            'description': str(row.get('description', '')).strip(),
+            'group': str(row.get('group', '')).strip(),
+            'active': bool(row.get('active', False)),
+            'has_outrights': bool(row.get('has_outrights', False)),
+        })
+
+    payload = {
+        'sports': discovered,
+        'count': len(discovered),
+        'include_all': bool(include_all),
+        'discoveredAt': datetime.utcnow().isoformat()
+    }
+    CACHE[cache_key] = (payload, time.time())
+    return payload, None
+
+
+def score_major_sport_candidate(major_code, candidate):
+    key = normalize_lookup_text(candidate.get('key', ''))
+    title = normalize_lookup_text(candidate.get('title', ''))
+    description = normalize_lookup_text(candidate.get('description', ''))
+    blob = f"{key} {title} {description}".strip()
+
+    score = 0
+    reason = []
+
+    if major_code == 'masters':
+        if 'masters' in blob:
+            score += 6
+            reason.append('contains masters')
+        if 'augusta' in blob:
+            score += 1
+            reason.append('contains augusta')
+
+    elif major_code == 'pga_championship':
+        if 'pga championship' in blob:
+            score += 7
+            reason.append('contains pga championship phrase')
+        if 'pga' in blob:
+            score += 3
+            reason.append('contains pga')
+        if 'championship' in blob:
+            score += 2
+            reason.append('contains championship')
+
+    elif major_code == 'us_open':
+        if 'us open' in blob or 'u s open' in blob:
+            score += 7
+            reason.append('contains us open phrase')
+        if 'us_open' in candidate.get('key', ''):
+            score += 3
+            reason.append('contains us_open key token')
+        if 'open championship' in blob or 'british open' in blob:
+            score -= 4
+            reason.append('penalty for open championship overlap')
+
+    elif major_code == 'open_championship':
+        if 'open championship' in blob:
+            score += 8
+            reason.append('contains open championship phrase')
+        if 'british open' in blob:
+            score += 6
+            reason.append('contains british open phrase')
+        if 'the open' in blob:
+            score += 2
+            reason.append('contains the open phrase')
+        if 'us open' in blob or 'u s open' in blob:
+            score -= 5
+            reason.append('penalty for us open overlap')
+
+    return score, '; '.join(reason)
+
+
+def map_four_majors_to_sport_keys(discovered_sports, saved_mapping=None):
+    """Return deterministic mapping for 4 majors with confidence metadata."""
+    saved_mapping = saved_mapping or {}
+    key_to_sport = {sport.get('key'): sport for sport in discovered_sports}
+    used_keys = set()
+    result = []
+
+    for definition in ODDS_MAJOR_DEFINITIONS:
+        major_code = definition['majorCode']
+        major_name = definition['majorName']
+
+        resolved = {
+            'majorCode': major_code,
+            'majorName': major_name,
+            'sportKey': None,
+            'confidence': 'unresolved',
+            'matchedFrom': 'none',
+            'matchScore': 0,
+            'active': None,
+            'hasOutrights': None,
+            'notes': ''
+        }
+
+        # 1) Previous exact key mapping.
+        # If key is not currently listed (common after a major completes),
+        # still treat it as usable historical mapping for this season flow.
+        previous_key = saved_mapping.get(major_code)
+        if previous_key and previous_key not in used_keys:
+            if previous_key in key_to_sport:
+                sport = key_to_sport[previous_key]
+                resolved.update({
+                    'sportKey': previous_key,
+                    'confidence': 'exact_key',
+                    'matchedFrom': 'saved_mapping',
+                    'matchScore': 100,
+                    'active': sport.get('active'),
+                    'hasOutrights': sport.get('has_outrights'),
+                    'notes': 'Matched previous saved mapping'
+                })
+            else:
+                resolved.update({
+                    'sportKey': previous_key,
+                    'confidence': 'archived_saved_key',
+                    'matchedFrom': 'saved_mapping_not_currently_listed',
+                    'matchScore': 70,
+                    'active': False,
+                    'hasOutrights': None,
+                    'notes': 'Using last-known key; currently not listed in Odds API sports discovery'
+                })
+
+            used_keys.add(previous_key)
+            result.append(resolved)
+            continue
+
+        # 2) Known fallback keys if available in discovery response.
+        fallback_match = None
+        for fallback_key in definition.get('fallbackKeys', []):
+            if fallback_key in key_to_sport and fallback_key not in used_keys:
+                fallback_match = key_to_sport[fallback_key]
+                break
+
+        if fallback_match:
+            fallback_key = fallback_match.get('key')
+            resolved.update({
+                'sportKey': fallback_key,
+                'confidence': 'fallback',
+                'matchedFrom': 'known_fallback_keys',
+                'matchScore': 90,
+                'active': fallback_match.get('active'),
+                'hasOutrights': fallback_match.get('has_outrights'),
+                'notes': 'Matched predefined fallback key'
+            })
+            used_keys.add(fallback_key)
+            result.append(resolved)
+            continue
+
+        # 3) Score all remaining candidates and pick best above threshold.
+        scored = []
+        for candidate in discovered_sports:
+            key = candidate.get('key')
+            if key in used_keys:
+                continue
+            score, reason = score_major_sport_candidate(major_code, candidate)
+            if score > 0:
+                scored.append((score, reason, candidate))
+
+        scored.sort(key=lambda row: row[0], reverse=True)
+        if scored and scored[0][0] >= 5:
+            top_score, top_reason, top_sport = scored[0]
+            top_key = top_sport.get('key')
+            resolved.update({
+                'sportKey': top_key,
+                'confidence': 'fuzzy',
+                'matchedFrom': 'keyword_scoring',
+                'matchScore': top_score,
+                'active': top_sport.get('active'),
+                'hasOutrights': top_sport.get('has_outrights'),
+                'notes': top_reason
+            })
+            used_keys.add(top_key)
+
+        result.append(resolved)
+
+    unresolved = [row for row in result if not row.get('sportKey')]
+    return {
+        'majors': result,
+        'isHealthy': len(unresolved) == 0,
+        'unresolvedMajors': [r['majorCode'] for r in unresolved],
+    }
 
 # --- Tournament Status Detection Functions ---
 def get_tournament_status_from_api(api_response):
@@ -862,6 +1508,125 @@ def make_rapidapi_request(endpoint, params=None, bypass_rate_limit=False, reques
 def get_api_rate_limit_status():
     """Get current API rate limit status"""
     return jsonify(get_rate_limit_status())
+
+
+@app.route('/api/odds_api_status', methods=['GET'])
+def get_odds_api_status():
+    """Get Odds API monthly usage state and local guardrail status."""
+    return jsonify(get_odds_api_rate_limit_status(refresh_from_firestore=True))
+
+
+@app.route('/api/odds_api/sports', methods=['GET'])
+def get_odds_api_sports():
+    """Step 1 helper: list in-season sports from Odds API with quota-safe controls."""
+    include_all = request.args.get('all', 'false').lower() == 'true'
+    params = {'all': 'true'} if include_all else {}
+
+    # /sports is a zero-cost endpoint according to Odds API docs.
+    data, error = make_odds_api_request(
+        '/sports/',
+        params=params,
+        expected_cost=0,
+        request_source='odds_api_sports_discovery'
+    )
+    if error:
+        return jsonify({'error': error}), 500
+
+    if not isinstance(data, list):
+        return jsonify({'error': 'Unexpected Odds API sports response shape'}), 500
+
+    return jsonify({
+        'sports': data,
+        'count': len(data),
+        'oddsApiUsage': get_odds_api_rate_limit_status(refresh_from_firestore=False)
+    })
+
+
+@app.route('/api/odds_api/major_sport_keys', methods=['GET'])
+def get_odds_api_major_sport_keys():
+    """Phase 1 endpoint: discover golf sports and map them to the 4 majors."""
+    include_all = request.args.get('all', 'false').lower() == 'true'
+    force_refresh = request.args.get('forceRefresh', 'false').lower() == 'true'
+    persist_healthy = request.args.get('persist', 'true').lower() == 'true'
+
+    discovery, error = get_discovered_odds_golf_sports(include_all=include_all, force_refresh=force_refresh)
+    if error:
+        # On discovery failure, try a stale cache payload first.
+        cache_key = ('odds_api_sports_discovery', bool(include_all))
+        stale_payload = None
+        if cache_key in CACHE:
+            stale_payload = CACHE[cache_key][0]
+
+        if not stale_payload:
+            return jsonify({'error': error}), 500
+
+        discovery = stale_payload
+
+    discovered_sports = discovery.get('sports', []) if isinstance(discovery, dict) else []
+    saved_mapping = get_saved_odds_major_mapping()
+    mapping = map_four_majors_to_sport_keys(discovered_sports, saved_mapping=saved_mapping)
+
+    # If active-only discovery leaves gaps, auto-fallback to all=true discovery.
+    all_sports_fallback_used = False
+    if not include_all and mapping.get('unresolvedMajors'):
+        all_discovery, all_error = get_discovered_odds_golf_sports(include_all=True, force_refresh=force_refresh)
+        if not all_error and isinstance(all_discovery, dict):
+            all_sports = all_discovery.get('sports', [])
+            all_mapping = map_four_majors_to_sport_keys(all_sports, saved_mapping=saved_mapping)
+
+            if isinstance(all_mapping, dict) and isinstance(all_mapping.get('majors'), list):
+                by_major_all = {row['majorCode']: row for row in all_mapping['majors'] if isinstance(row, dict) and row.get('majorCode')}
+                for row in mapping['majors']:
+                    if row.get('sportKey'):
+                        continue
+                    replacement = by_major_all.get(row.get('majorCode'))
+                    if replacement and replacement.get('sportKey'):
+                        row.update(replacement)
+                        row['matchedFrom'] = f"{replacement.get('matchedFrom')}_all_sports_fallback"
+                        row['notes'] = (replacement.get('notes') or '') + ' | Resolved via all=true discovery fallback'
+                        all_sports_fallback_used = True
+
+                mapping['unresolvedMajors'] = [r['majorCode'] for r in mapping['majors'] if not r.get('sportKey')]
+                mapping['isHealthy'] = len(mapping['unresolvedMajors']) == 0
+
+    # If unresolved, keep previous saved key for unresolved majors when available.
+    if not mapping['isHealthy'] and saved_mapping:
+        key_to_sport = {sport.get('key'): sport for sport in discovered_sports}
+        for row in mapping['majors']:
+            if row.get('sportKey'):
+                continue
+            fallback_key = saved_mapping.get(row['majorCode'])
+            if fallback_key and fallback_key in key_to_sport:
+                sport = key_to_sport[fallback_key]
+                row.update({
+                    'sportKey': fallback_key,
+                    'confidence': 'fallback_saved',
+                    'matchedFrom': 'saved_mapping_unresolved_fallback',
+                    'matchScore': 50,
+                    'active': sport.get('active'),
+                    'hasOutrights': sport.get('has_outrights'),
+                    'notes': 'Recovered from saved mapping due to unresolved live match'
+                })
+
+        mapping['unresolvedMajors'] = [r['majorCode'] for r in mapping['majors'] if not r.get('sportKey')]
+        mapping['isHealthy'] = len(mapping['unresolvedMajors']) == 0
+
+    if persist_healthy and mapping['isHealthy']:
+        to_save = {row['majorCode']: row['sportKey'] for row in mapping['majors'] if row.get('sportKey')}
+        save_odds_major_mapping(to_save)
+
+    return jsonify({
+        'majors': mapping['majors'],
+        'unresolvedMajors': mapping['unresolvedMajors'],
+        'isHealthy': mapping['isHealthy'],
+        'sportsCandidateCount': len(discovered_sports),
+        'discoveredAt': discovery.get('discoveredAt') if isinstance(discovery, dict) else None,
+        'includeAll': include_all,
+        'forceRefresh': force_refresh,
+        'usedAllSportsFallback': all_sports_fallback_used,
+        'savedMappingCount': len(saved_mapping),
+        'oddsApiUsage': get_odds_api_rate_limit_status(refresh_from_firestore=False)
+    })
 
 @app.route('/api/debug_rate_limit', methods=['GET'])
 def debug_rate_limit():

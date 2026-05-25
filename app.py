@@ -1207,7 +1207,7 @@ def store_calculated_scores(tournament_id, leaderboard_data, team_scores, metada
         return True
         
     except Exception as e:
-        app.logger.error(f"Error storing calculated scores: {e}")
+        app.logger.error(f"Error storing calculated scores: {e}", exc_info=True)
         return False
 
 def get_stored_scores(tournament_id, max_age_minutes=45):

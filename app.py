@@ -25,6 +25,9 @@ import string
 import firebase_admin
 from firebase_admin import credentials, firestore, auth as firebase_auth
 
+# --- Local modules ---
+import notifications as draft_notifications
+
 # Load environment variables from .env file (only for local development)
 load_dotenv()
 
@@ -4344,6 +4347,13 @@ def start_draft(tournament_id):
                 **meta_update,
             })
 
+            # Push notifications: notify all team owners + first picker.
+            try:
+                fresh = doc_ref.get().to_dict() or {}
+                draft_notifications.notify_draft_started(db, tournament_id, fresh)
+            except Exception as notify_err:
+                app.logger.warning(f"notify_draft_started failed for {tournament_id}: {notify_err}")
+
             return jsonify({"message": f"Draft started and odds locked for tournament {tournament_id}."}), 200
 
         except requests.exceptions.RequestException as e:
@@ -4378,6 +4388,11 @@ def start_draft_flag(tournament_id):
             "IsDraftStarted": True,
             "DraftStartedAt": firestore.SERVER_TIMESTAMP
         })
+        try:
+            fresh = doc_ref.get().to_dict() or {}
+            draft_notifications.notify_draft_started(db, tournament_id, fresh)
+        except Exception as notify_err:
+            app.logger.warning(f"notify_draft_started failed for {tournament_id}: {notify_err}")
         return jsonify({"message": f"Draft started for tournament {tournament_id}."}), 200
     except Exception as e:
         app.logger.error(f"Error starting draft flag for tournament {tournament_id}: {e}")
@@ -4781,6 +4796,17 @@ def make_draft_pick(tournament_id):
 
         doc_ref.update(update_data)
         app.logger.info(f"Pick #{next_pick_number}: {player_name} → {current_team.get('name')} (tournament {tournament_id})")
+
+        # Push notifications: either next picker is on the clock or the draft completed.
+        try:
+            fresh = doc_ref.get().to_dict() or {}
+            if fresh.get('IsDraftComplete'):
+                draft_notifications.notify_draft_complete(db, tournament_id, fresh)
+            else:
+                draft_notifications.notify_your_turn(db, tournament_id, fresh)
+        except Exception as notify_err:
+            app.logger.warning(f"draft notify failed for {tournament_id}: {notify_err}")
+
         return jsonify({"message": "Pick recorded", "pick": new_pick, "draftComplete": len(draft_picks) >= total_picks}), 200
 
     except Exception as e:
@@ -4802,6 +4828,11 @@ def complete_draft(tournament_id):
             "IsDraftComplete": True,
             "DraftCompletedAt": firestore.SERVER_TIMESTAMP
         })
+        try:
+            fresh = doc_ref.get().to_dict() or {}
+            draft_notifications.notify_draft_complete(db, tournament_id, fresh)
+        except Exception as notify_err:
+            app.logger.warning(f"notify_draft_complete failed for {tournament_id}: {notify_err}")
         return jsonify({"message": f"Draft marked complete for tournament {tournament_id}."}), 200
     except Exception as e:
         app.logger.error(f"Error marking draft complete for tournament {tournament_id}: {e}")
@@ -6023,6 +6054,48 @@ def opt_out_tournament():
                 {'optedOutTournaments': firestore.ArrayRemove([tournament_id])}, merge=True)
         return jsonify({'message': 'Preference saved', 'optOut': opt_out}), 200
     except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/user/fcm_token', methods=['POST'])
+@require_auth
+def register_fcm_token():
+    """Register an FCM token for the current user (called by the mobile app on login)."""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+    try:
+        data = request.json or {}
+        token = (data.get('token') or '').strip()
+        platform = (data.get('platform') or 'unknown').strip().lower()
+        if not token or len(token) > 4096:
+            return jsonify({'error': 'token is required'}), 400
+        if platform not in ('android', 'ios', 'web', 'unknown'):
+            platform = 'unknown'
+        db.collection('users').document(request.uid).collection('fcmTokens').document(token).set({
+            'platform': platform,
+            'createdAt': firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+        return jsonify({'message': 'Token registered'}), 200
+    except Exception as e:
+        app.logger.error(f"register_fcm_token error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/user/fcm_token', methods=['DELETE'])
+@require_auth
+def unregister_fcm_token():
+    """Remove an FCM token (called on sign-out or when the device invalidates it)."""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+    try:
+        data = request.json or {}
+        token = (data.get('token') or '').strip()
+        if not token:
+            return jsonify({'error': 'token is required'}), 400
+        db.collection('users').document(request.uid).collection('fcmTokens').document(token).delete()
+        return jsonify({'message': 'Token removed'}), 200
+    except Exception as e:
+        app.logger.error(f"unregister_fcm_token error: {e}")
         return jsonify({'error': str(e)}), 500
 
 

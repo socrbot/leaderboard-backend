@@ -4115,15 +4115,38 @@ def get_preview_odds(tournament_id):
     if not db:
         return jsonify({"error": "Firestore not initialized"}), 500
     try:
-        doc = db.collection('tournaments').document(tournament_id).get()
+        doc_ref = db.collection('tournaments').document(tournament_id)
+        doc = doc_ref.get()
         if not doc.exists:
             return jsonify({"error": "Tournament not found"}), 404
         data = doc.to_dict()
+        is_locked = bool(data.get("DraftLockedOdds"))
+
+        # Lazy refresh: if odds are missing or older than PREVIEW_ODDS_REFRESH_AGE
+        # and the draft is not yet locked, refresh them on read. No user action required.
+        if not is_locked:
+            updated_at_raw = data.get("PreviewOddsUpdatedAt")
+            has_odds = bool(data.get("PreviewOdds"))
+            is_stale = True
+            if has_odds and hasattr(updated_at_raw, 'tzinfo'):
+                try:
+                    ts = updated_at_raw if updated_at_raw.tzinfo else updated_at_raw.replace(tzinfo=timezone.utc)
+                    is_stale = (datetime.now(timezone.utc) - ts) > PREVIEW_ODDS_REFRESH_AGE
+                except Exception:
+                    is_stale = True
+            if not has_odds or is_stale:
+                ok, message = _refresh_preview_odds_for_doc(doc_ref, data)
+                if ok:
+                    doc = doc_ref.get()
+                    data = doc.to_dict()
+                else:
+                    app.logger.info(f"Lazy preview-odds refresh skipped for {tournament_id}: {message}")
+
         updated_at = data.get("PreviewOddsUpdatedAt")
         return jsonify({
             "odds": data.get("PreviewOdds") or [],
             "updatedAt": updated_at.isoformat() if hasattr(updated_at, 'isoformat') else None,
-            "isLocked": bool(data.get("DraftLockedOdds")),
+            "isLocked": is_locked,
         }), 200
     except Exception as e:
         app.logger.error(f"Error fetching preview odds for {tournament_id}: {e}")

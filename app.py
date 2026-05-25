@@ -1173,9 +1173,10 @@ def get_tournament_status_from_api(api_response):
 
 # --- Persistent Score Storage Functions ---
 def _sanitize_for_firestore(value):
-    """Recursively unwrap BSON Extended JSON wrappers and strip any keys starting with '$'.
-    Firestore field names cannot start with '$', and grpc serialization rejects such maps
-    with TypeError: bad argument type for built-in operation."""
+    """Recursively unwrap BSON Extended JSON wrappers, strip '$'-prefixed keys,
+    and coerce all map keys to str so Firestore's protobuf encoder accepts the value.
+    Firestore raises 'TypeError: bad argument type for built-in operation' when a
+    nested map contains non-string keys or unsupported keys like '$numberInt'."""
     if isinstance(value, dict):
         # Unwrap common BSON Extended JSON shapes to native scalars
         if len(value) == 1:
@@ -1200,13 +1201,24 @@ def _sanitize_for_firestore(value):
                     except (TypeError, ValueError):
                         return inner['$numberLong']
                 return inner
-        # Strip any remaining keys starting with '$' and recurse
-        return {k: _sanitize_for_firestore(v) for k, v in value.items() if not (isinstance(k, str) and k.startswith('$'))}
-    if isinstance(value, list):
+        out = {}
+        for k, v in value.items():
+            if k is None:
+                continue
+            key_str = k if isinstance(k, str) else str(k)
+            if key_str.startswith('$'):
+                continue
+            out[key_str] = _sanitize_for_firestore(v)
+        return out
+    if isinstance(value, (list, tuple)):
         return [_sanitize_for_firestore(v) for v in value]
-    if isinstance(value, tuple):
-        return [_sanitize_for_firestore(v) for v in value]
-    return value
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    # Fallback: coerce unknown types (Decimal, datetime, bytes, etc.) to a string
+    try:
+        return str(value)
+    except Exception:
+        return None
 
 def store_calculated_scores(tournament_id, leaderboard_data, team_scores, metadata):
     """Store calculated team scores in Firestore for persistence"""

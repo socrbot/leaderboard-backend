@@ -4,6 +4,8 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_compress import Compress
 from flask_caching import Cache
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from dotenv import load_dotenv
 import time
 import json
@@ -43,7 +45,50 @@ cache_config = {
 cache = Cache(app, config=cache_config)
 
 # --- CORS Configuration ---
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+# Allowlist of origins permitted to call the API. Override at runtime via the
+# CORS_ALLOWED_ORIGINS env var (comma-separated). The defaults cover the
+# Firebase Hosting prod + staging sites and local dev.
+_default_cors_origins = ",".join([
+    "https://alumni-golf-tournament.web.app",
+    "https://alumni-golf-tournament.firebaseapp.com",
+    "https://aulmni-leaderboard-v2.web.app",
+    "https://aulmni-leaderboard-v2.firebaseapp.com",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+])
+_cors_origins = [
+    o.strip()
+    for o in os.getenv("CORS_ALLOWED_ORIGINS", _default_cors_origins).split(",")
+    if o.strip()
+]
+CORS(
+    app,
+    resources={r"/api/*": {"origins": _cors_origins}},
+    supports_credentials=False,
+    allow_headers=["Content-Type", "Authorization"],
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+)
+app.logger.info(f"CORS allowlist: {_cors_origins}")
+
+# --- Rate Limiting ---
+# Per-IP defaults applied to all routes. Tighter per-route caps are attached
+# inline (search for `@limiter.limit`). Uses in-memory storage by default —
+# fine for single-instance Cloud Run; set RATELIMIT_STORAGE_URI=redis://...
+# if/when we scale beyond one instance.
+def _rate_limit_key():
+    """Prefer authenticated uid (when present) over IP — defeats trivial IP
+    rotation, gives signed-in users their own bucket, and falls back to the
+    remote address for anonymous traffic."""
+    uid = getattr(request, "uid", None)
+    return f"uid:{uid}" if uid else get_remote_address()
+
+limiter = Limiter(
+    app=app,
+    key_func=_rate_limit_key,
+    default_limits=["600 per minute", "10000 per hour"],
+    storage_uri=os.getenv("RATELIMIT_STORAGE_URI", "memory://"),
+    headers_enabled=True,
+)
 
 
 def get_env_int(name, default):
@@ -3829,6 +3874,7 @@ def sync_tournament_teams(tournament_id):
 
 @app.route('/api/tournaments', methods=['POST'])
 @require_auth
+@limiter.limit("10 per minute; 100 per hour")
 def create_tournament():
     if not db:
         app.logger.error("Firestore DB not initialized.")
@@ -3845,6 +3891,10 @@ def create_tournament():
             return jsonify({"error": "League admin access required"}), 403
 
         tournament_name = data['name'].strip()
+        if not tournament_name:
+            return jsonify({"error": "Tournament name is required"}), 400
+        if len(tournament_name) > 120:
+            return jsonify({"error": "Tournament name too long (max 120 characters)"}), 400
         org_id = data.get('orgId', '1').strip()
         tourn_id = data.get('tournId', '').strip()
         year = data.get('year', '').strip()
@@ -5633,6 +5683,7 @@ LEAGUE_DOC = ('config', 'league')
 
 @app.route('/api/leagues', methods=['POST'])
 @require_auth
+@limiter.limit("5 per minute; 30 per hour")
 def create_league():
     """Create a new league. Any authenticated user may create; the creator becomes that league's admin."""
     if not db:
@@ -5640,6 +5691,8 @@ def create_league():
     try:
         data = request.json or {}
         name = (data.get('name', '') or '').strip() or 'My League'
+        if len(name) > 80:
+            return jsonify({'error': 'League name too long (max 80 characters)'}), 400
         invite_code = _generate_invite_code()
         league_data = {
             'name': name,
@@ -5700,6 +5753,7 @@ def get_my_leagues():
 
 @app.route('/api/leagues/join', methods=['POST'])
 @require_auth
+@limiter.limit("10 per minute; 60 per hour")
 def join_league_by_code():
     """Join a league by invite code — resolves which league from the code"""
     if not db:
@@ -5709,6 +5763,10 @@ def join_league_by_code():
         invite_code = (data.get('inviteCode', '') or '').strip().upper()
         if not invite_code:
             return jsonify({'error': 'inviteCode is required'}), 400
+        # Invite codes are short alphanumeric tokens. Reject anything outside that
+        # shape early — keeps Firestore queries cheap and limits enumeration.
+        if not re.fullmatch(r'[A-Z0-9]{4,16}', invite_code):
+            return jsonify({'error': 'Invalid invite code format'}), 400
 
         leagues_ref = db.collection('leagues').where('inviteCode', '==', invite_code).limit(1).get()
         leagues_list = list(leagues_ref)
@@ -6014,6 +6072,7 @@ def update_league_by_id(league_id):
 
 @app.route('/api/leagues/<league_id>/regenerate_code', methods=['POST'])
 @require_league_admin()
+@limiter.limit("5 per minute; 20 per hour")
 def regenerate_league_code_by_id(league_id):
     """Generate a new invite code (admin only)"""
     if not db:
@@ -6195,6 +6254,8 @@ def join_league():
         invite_code = (data.get('inviteCode', '') or '').strip().upper()
         if not invite_code:
             return jsonify({'error': 'inviteCode is required'}), 400
+        if not re.fullmatch(r'[A-Z0-9]{4,16}', invite_code):
+            return jsonify({'error': 'Invalid invite code format'}), 400
 
         league_ref = db.collection(LEAGUE_DOC[0]).document(LEAGUE_DOC[1])
         league_doc = league_ref.get()

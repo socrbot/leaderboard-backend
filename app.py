@@ -1408,19 +1408,33 @@ def sum_best_n_scores(scores_array, n):
 def calculate_team_scores(players, team_assignments, current_par):
     """Calculate team scores with correct cut player penalty"""
     teams_list = []
-    
-    # Debug logging
-    app.logger.info(f"Number of teams: {len(team_assignments) if team_assignments else 0}")
-    if team_assignments:
-        for i, t in enumerate(team_assignments):
-            t_keys = list(t.keys()) if isinstance(t, dict) else dir(t)
-            app.logger.info(f"Team {i} keys={t_keys}, type={type(t).__name__}")
-            # Log all possible name fields
-            for key in ['teamName', 'name', 'team_name', 'team']:
-                val = t.get(key) if isinstance(t, dict) else getattr(t, key, None)
-                if val is not None:
-                    app.logger.info(f"  Team {i} {key}='{val}' (type={type(val).__name__})")
-    
+
+    # Debug-only diagnostics. Was previously logged at info level on every request
+    # which produced O(teams * teams) info lines under Cloud Run load.
+    if app.logger.isEnabledFor(logging.DEBUG):
+        app.logger.debug(f"Number of teams: {len(team_assignments) if team_assignments else 0}")
+        if team_assignments:
+            for i, t in enumerate(team_assignments):
+                t_keys = list(t.keys()) if isinstance(t, dict) else dir(t)
+                app.logger.debug(f"Team {i} keys={t_keys}, type={type(t).__name__}")
+                for key in ['teamName', 'name', 'team_name', 'team']:
+                    val = t.get(key) if isinstance(t, dict) else getattr(t, key, None)
+                    if val is not None:
+                        app.logger.debug(f"  Team {i} {key}='{val}' (type={type(val).__name__})")
+
+    # O(1) name lookup index. Avoids the previous O(P) `next(...)` scan per golfer slot
+    # which made the whole function O(T * G * P).
+    players_list = players or []
+    name_index = {}
+    last_name_index = {}
+    for p in players_list:
+        full = normalize_name(f"{p.get('firstName', '')} {p.get('lastName', '')}")
+        if full and full not in name_index:
+            name_index[full] = p
+        last = normalize_name(p.get('lastName', ''))
+        if last:
+            last_name_index.setdefault(last, []).append(p)
+
     # Calculate worst score per round for penalty calculation
     # Cut players get the worst score from that specific round + 1 stroke
     # IMPORTANT: Can only calculate penalty AFTER the round is completed
@@ -1430,7 +1444,7 @@ def calculate_team_scores(players, team_assignments, current_par):
         worst_score = None
         round_has_completed_scores = False
         
-        for player in players or []:
+        for player in players_list:
             # Only consider non-cut players who completed the round
             if player.get('status') != 'cut':
                 round_score = get_golfer_round_score(player, round_num, current_par)
@@ -1454,22 +1468,22 @@ def calculate_team_scores(players, team_assignments, current_par):
         for golfer_name in team_def.get('golferNames', []):
             # Normalize the stored golfer name (handles Unicode, hyphens, etc.)
             normalized_stored_name = normalize_name(golfer_name)
-            
-            # Try exact match first using normalized names
-            found_player = next((p for p in players or [] 
-                               if normalize_name(f"{p.get('firstName', '')} {p.get('lastName', '')}") == normalized_stored_name), None)
-            
-            # If no exact match, try matching on last name only (handles Chris vs Christopher, Alex vs Alexander, etc.)
+
+            # O(1) exact full-name lookup.
+            found_player = name_index.get(normalized_stored_name)
+
+            # Last-name fallback (handles Chris vs Christopher, Alex vs Alexander, etc.).
             if not found_player:
                 name_parts = normalized_stored_name.split()
                 if len(name_parts) >= 2:
-                    last_name = name_parts[-1]  # Take the last word as last name
-                    found_player = next((p for p in players or [] 
-                                       if normalize_name(p.get('lastName', '')) == last_name and 
-                                       any(part in normalize_name(p.get('firstName', '')) or
-                                           normalize_name(p.get('firstName', '')) in part
-                                           for part in name_parts[:-1])), None)
-            
+                    last_name = name_parts[-1]
+                    candidates = last_name_index.get(last_name, [])
+                    for candidate in candidates:
+                        first = normalize_name(candidate.get('firstName', ''))
+                        if any(part in first or first in part for part in name_parts[:-1]):
+                            found_player = candidate
+                            break
+
             # Log if still not found
             if not found_player:
                 app.logger.warning(f"Could not find player '{golfer_name}' in leaderboard data")
@@ -2187,6 +2201,26 @@ def get_tournament_info():
     
     return jsonify(data)
 
+def _leaderboard_response(payload):
+    """Wrap a leaderboard payload with Cache-Control headers based on data freshness.
+
+    - live  -> short browser cache + SWR window so quick re-loads are instant
+    - stored / not_started / official complete -> longer cache
+    The server-side `CACHE` is still authoritative; these headers just help
+    browsers and any future CDN absorb duplicate page loads.
+    """
+    resp = jsonify(payload)
+    freshness = (payload or {}).get('dataFreshness')
+    is_complete = (payload or {}).get('isOfficiallyComplete', False)
+    if freshness == 'live' and not is_complete:
+        resp.headers['Cache-Control'] = 'public, max-age=30, stale-while-revalidate=300'
+    elif freshness in ('stored', 'not_started') or is_complete:
+        resp.headers['Cache-Control'] = 'public, max-age=600'
+    else:
+        resp.headers['Cache-Control'] = 'public, max-age=30'
+    return resp
+
+
 @app.route('/api/leaderboard', methods=['GET'])
 def get_optimized_leaderboard():
     """Get optimized leaderboard with team score calculations"""
@@ -2199,12 +2233,13 @@ def get_optimized_leaderboard():
     tournament_id = request.args.get('tournamentId')  # For team calculations
     force_refresh = request.args.get('forceRefresh', 'false').lower() == 'true'
     
-    # Create cache key
+    # Create cache key. Normalize falsy round_id to empty string so callers passing
+    # `roundId=` and callers omitting the param share the same cache slot.
     cache_key_params = {
         'orgId': org_id,
         'tournId': tourn_id,
         'year': year,
-        'roundId': round_id,
+        'roundId': round_id or '',
         'calculateTeams': calculate_teams,
         'tournamentId': tournament_id
     }
@@ -2214,12 +2249,12 @@ def get_optimized_leaderboard():
     if not force_refresh and cache_key in CACHE:
         cached_data, timestamp = CACHE[cache_key]
         if (time.time() - timestamp) < LEADERBOARD_CACHE_TTL:
-            app.logger.info("Returning cached leaderboard data")
-            return jsonify(cached_data)
+            app.logger.debug("Returning cached leaderboard data")
+            return _leaderboard_response(cached_data)
         else:
-            app.logger.info("Cache expired, fetching fresh data")
+            app.logger.debug("Cache expired, fetching fresh data")
     else:
-        app.logger.info("No cache data or force refresh requested, fetching fresh data")
+        app.logger.debug("No cache data or force refresh requested, fetching fresh data")
     
     # --- Skip RapidAPI if tournament is complete or not started ---
     if tournament_id and db:
@@ -2241,7 +2276,7 @@ def get_optimized_leaderboard():
                             'dataFreshness': 'stored'
                         }
                         CACHE[cache_key] = (result, time.time())
-                        return jsonify(result)
+                        return _leaderboard_response(result)
 
                 is_active = t_data.get('isActive', False)
                 is_draft_complete = t_data.get('IsDraftComplete', False)
@@ -2251,7 +2286,7 @@ def get_optimized_leaderboard():
                 if not is_complete and not has_stored_scores and (tournament_not_started_by_date or (not is_active and not is_draft_complete)):
                     app.logger.info(f"Tournament {tournament_id} has not started — skipping RapidAPI call")
                     placeholder_scores = build_not_started_team_scores(t_data.get('teams', []))
-                    return jsonify({
+                    return _leaderboard_response({
                         'teamScores': placeholder_scores,
                         'isOfficiallyComplete': False,
                         'tournamentStatus': {'status': 'Not Started', 'isOfficialComplete': False, 'isInProgress': False},
@@ -2275,7 +2310,7 @@ def get_optimized_leaderboard():
         if "Rate limit" in error and cache_key in CACHE:
             cached_data, timestamp = CACHE[cache_key]
             app.logger.warning(f"Rate limited, returning expired cache data from {timestamp}")
-            return jsonify({**cached_data, 'fromExpiredCache': True, 'cacheWarning': 'Data may be outdated due to API rate limits'})
+            return _leaderboard_response({**cached_data, 'fromExpiredCache': True, 'cacheWarning': 'Data may be outdated due to API rate limits'})
         return jsonify({"error": error}), 429 if "Rate limit" in error else 500
     
     # Add tournament status information
@@ -2338,8 +2373,8 @@ def get_optimized_leaderboard():
     
     # Cache the result
     CACHE[cache_key] = (enhanced_data, time.time())
-    
-    return jsonify(enhanced_data)
+
+    return _leaderboard_response(enhanced_data)
 
 @app.route('/api/tournaments/<tournament_id>/leaderboard', methods=['GET'])
 def get_tournament_leaderboard(tournament_id):

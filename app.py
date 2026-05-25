@@ -231,6 +231,74 @@ def require_admin(f):
         return f(*args, **kwargs)
     return decorated
 
+
+def _is_super_admin(uid):
+    """Developer-only override. Set users/{uid}.role = 'admin' in Firestore to grant."""
+    if not db or not uid:
+        return False
+    try:
+        user_doc = db.collection('users').document(uid).get()
+        return user_doc.exists and user_doc.to_dict().get('role') == 'admin'
+    except Exception:
+        return False
+
+
+def _is_league_admin(uid, league_id):
+    """True if uid is the creator (adminUid) of the given league, or a super-admin."""
+    if not db or not uid or not league_id:
+        return False
+    if _is_super_admin(uid):
+        return True
+    try:
+        league_doc = db.collection('leagues').document(league_id).get()
+        return league_doc.exists and league_doc.to_dict().get('adminUid') == uid
+    except Exception:
+        return False
+
+
+def require_league_admin(param='league_id'):
+    """Require the caller to be the admin (creator) of the league identified by a URL kwarg."""
+    def wrapper(f):
+        @functools.wraps(f)
+        @require_auth
+        def decorated(*args, **kwargs):
+            league_id = kwargs.get(param)
+            if not _is_league_admin(request.uid, league_id):
+                return jsonify({'error': 'League admin access required'}), 403
+            return f(*args, **kwargs)
+        return decorated
+    return wrapper
+
+
+def _resolve_tournament_league_id(tournament_id):
+    """Look up the leagueId for a tournament. Returns None if missing or unreadable."""
+    if not db or not tournament_id:
+        return None
+    try:
+        doc = db.collection('tournaments').document(tournament_id).get()
+        if not doc.exists:
+            return None
+        return (doc.to_dict() or {}).get('leagueId') or None
+    except Exception:
+        return None
+
+
+def require_tournament_admin(param='tournament_id'):
+    """Require the caller to be the admin of the league that owns the given tournament."""
+    def wrapper(f):
+        @functools.wraps(f)
+        @require_auth
+        def decorated(*args, **kwargs):
+            tournament_id = kwargs.get(param)
+            league_id = _resolve_tournament_league_id(tournament_id)
+            if not league_id:
+                return jsonify({'error': 'Tournament not found'}), 404
+            if not _is_league_admin(request.uid, league_id):
+                return jsonify({'error': 'League admin access required'}), 403
+            return f(*args, **kwargs)
+        return decorated
+    return wrapper
+
 # SportsData.io credentials for odds
 SPORTSDATA_IO_API_KEY = os.getenv("SPORTSDATA_IO_API_KEY")
 if SPORTSDATA_IO_API_KEY:
@@ -2004,6 +2072,7 @@ def get_odds_api_major_odds():
 
 
 @app.route('/api/tournaments/<tournament_id>/sync_odds_api', methods=['POST'])
+@require_tournament_admin()
 def sync_tournament_odds_from_odds_api(tournament_id):
     """Phase 2 sync endpoint: write normalized Odds API odds into tournament DraftLockedOdds."""
     if not db:
@@ -3027,6 +3096,7 @@ def get_player_headshots():
 
 # --- Debug API Routes ---
 @app.route('/api/tournaments/<tournament_id>/debug', methods=['GET'])
+@require_tournament_admin()
 def debug_tournament_structure(tournament_id):
     """Debug endpoint to see the actual tournament structure in Firestore"""
     if not db:
@@ -3056,6 +3126,7 @@ def debug_tournament_structure(tournament_id):
 
 # --- Stored Scores Management API ---
 @app.route('/api/tournaments/<tournament_id>/stored_scores', methods=['GET'])
+@require_tournament_admin()
 def get_tournament_stored_scores(tournament_id):
     """Get stored team scores for a tournament"""
     if not db:
@@ -3083,6 +3154,7 @@ def get_tournament_stored_scores(tournament_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/tournaments/<tournament_id>/recalculate_scores', methods=['POST'])
+@require_tournament_admin()
 def force_recalculate_scores(tournament_id):
     """Force recalculation and storage of team scores"""
     if not db:
@@ -3535,6 +3607,7 @@ def get_tournament_team_assignments(tournament_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/tournaments/<tournament_id>/team_assignments', methods=['PUT'])
+@require_tournament_admin()
 def update_tournament_team_assignments(tournament_id):
     """Update team assignments for a tournament (which global teams participate)"""
     if not db:
@@ -3571,6 +3644,7 @@ def update_tournament_team_assignments(tournament_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/tournaments/<tournament_id>/sync_teams', methods=['POST'])
+@require_tournament_admin()
 def sync_tournament_teams(tournament_id):
     """Sync tournament teams from global_teams (only allowed before draft starts)"""
     if not db:
@@ -3640,6 +3714,7 @@ def sync_tournament_teams(tournament_id):
 # --- Tournament Management API Routes (MODIFIED) ---
 
 @app.route('/api/tournaments', methods=['POST'])
+@require_auth
 def create_tournament():
     if not db:
         app.logger.error("Firestore DB not initialized.")
@@ -3648,6 +3723,12 @@ def create_tournament():
         data = request.json
         if not data or 'name' not in data:
             return jsonify({"error": "Missing 'name' for new tournament"}), 400
+
+        league_id = (data.get('leagueId', '') or '').strip()
+        if not league_id:
+            return jsonify({"error": "Missing 'leagueId' for new tournament"}), 400
+        if not _is_league_admin(request.uid, league_id):
+            return jsonify({"error": "League admin access required"}), 403
 
         tournament_name = data['name'].strip()
         org_id = data.get('orgId', '1').strip()
@@ -3981,6 +4062,7 @@ def get_single_tournament(tournament_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/tournaments/<tournament_id>/teams', methods=['PUT'])
+@require_tournament_admin()
 def update_tournament_teams(tournament_id):
     if not db:
         app.logger.error("Firestore DB not initialized.")
@@ -4033,6 +4115,7 @@ def update_tournament_teams(tournament_id):
 
 # NEW: API endpoint to start the draft and lock in odds
 @app.route('/api/tournaments/<tournament_id>/start_draft', methods=['POST'])
+@require_tournament_admin()
 def start_draft(tournament_id):
     if not db:
         app.logger.error("Firestore DB not initialized.")
@@ -4105,6 +4188,7 @@ def start_draft(tournament_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/tournaments/<tournament_id>/start_draft_flag', methods=['POST'])
+@require_tournament_admin()
 def start_draft_flag(tournament_id):
     if not db:
         app.logger.error("Firestore DB not initialized.")
@@ -4127,6 +4211,7 @@ def start_draft_flag(tournament_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/tournaments/<tournament_id>/lock_draft_odds', methods=['POST'])
+@require_tournament_admin()
 def lock_draft_odds(tournament_id):
     """Lock odds, build team list from enrolled league members (opt-out model), randomize draft order."""
     if not db:
@@ -4291,6 +4376,7 @@ def get_preview_odds(tournament_id):
 
 
 @app.route('/api/tournaments/<tournament_id>/refresh_preview_odds', methods=['POST'])
+@require_tournament_admin()
 def refresh_preview_odds(tournament_id):
     """Manually refresh preview odds for a tournament that has not yet locked its draft."""
     if not db:
@@ -4527,6 +4613,7 @@ def make_draft_pick(tournament_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/tournaments/<tournament_id>/complete_draft', methods=['POST'])
+@require_tournament_admin()
 def complete_draft(tournament_id):
     if not db:
         app.logger.error("Firestore DB not initialized.")
@@ -4547,7 +4634,7 @@ def complete_draft(tournament_id):
 
 
 @app.route('/api/tournaments/<tournament_id>/admin_edit_pick', methods=['POST'])
-@require_auth
+@require_tournament_admin()
 def admin_edit_pick(tournament_id):
     """Admin-only: add or remove a golfer from any team's draft picks."""
     if not db:
@@ -5418,9 +5505,9 @@ LEAGUE_DOC = ('config', 'league')
 # ---------------------------------------------------------------------------
 
 @app.route('/api/leagues', methods=['POST'])
-@require_admin
+@require_auth
 def create_league():
-    """Create a new league (admin only)"""
+    """Create a new league. Any authenticated user may create; the creator becomes that league's admin."""
     if not db:
         return jsonify({'error': 'Firestore not initialized'}), 500
     try:
@@ -5462,9 +5549,9 @@ def create_league():
 
 
 @app.route('/api/leagues/mine', methods=['GET'])
-@require_admin
+@require_auth
 def get_my_leagues():
-    """List all leagues owned by the current admin"""
+    """List all leagues owned (created) by the current user."""
     if not db:
         return jsonify({'error': 'Firestore not initialized'}), 500
     try:
@@ -5777,7 +5864,7 @@ def get_league_by_id(league_id):
 
 
 @app.route('/api/leagues/<league_id>', methods=['PUT'])
-@require_admin
+@require_league_admin()
 def update_league_by_id(league_id):
     """Update league name (admin only)"""
     if not db:
@@ -5798,7 +5885,7 @@ def update_league_by_id(league_id):
 
 
 @app.route('/api/leagues/<league_id>/regenerate_code', methods=['POST'])
-@require_admin
+@require_league_admin()
 def regenerate_league_code_by_id(league_id):
     """Generate a new invite code (admin only)"""
     if not db:
@@ -5816,7 +5903,7 @@ def regenerate_league_code_by_id(league_id):
 
 
 @app.route('/api/leagues/<league_id>/members', methods=['GET'])
-@require_admin
+@require_league_admin()
 def get_league_members_by_id(league_id):
     """List all league members (admin only)"""
     if not db:
@@ -5843,7 +5930,7 @@ def get_league_members_by_id(league_id):
 
 
 @app.route('/api/leagues/<league_id>/members/<member_uid>', methods=['DELETE'])
-@require_admin
+@require_league_admin()
 def remove_league_member_by_id(league_id, member_uid):
     """Remove a member from a league (admin only)"""
     if not db:

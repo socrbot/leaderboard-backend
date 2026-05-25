@@ -3643,6 +3643,25 @@ def get_single_tournament(tournament_id):
             "Courses": stored_meta.get('Courses', []),
         }
 
+        # Canonical lifecycleState - single source of truth for tournament phase.
+        # Order matters: finished > live > draft_complete > draft_active > odds_locked > created.
+        is_finished_finalized = bool(
+            tournament_data.get('isOfficiallyComplete')
+            or tournament_data.get('isComplete')
+        )
+        if is_over or is_finished_finalized:
+            lifecycle_state = 'finished'
+        elif is_in_progress or tournament_data.get('isActive'):
+            lifecycle_state = 'live'
+        elif tournament_data.get('IsDraftComplete'):
+            lifecycle_state = 'draft_complete'
+        elif tournament_data.get('IsDraftStarted'):
+            lifecycle_state = 'draft_active'
+        elif tournament_data.get('oddsId'):
+            lifecycle_state = 'odds_locked'
+        else:
+            lifecycle_state = 'created'
+
         response_data = {
             "id": doc.id,
             **tournament_data,
@@ -3652,6 +3671,7 @@ def get_single_tournament(tournament_id):
             "IsDraftStarted": tournament_data.get('IsDraftStarted', False),
             "Tournament": tournament_info_obj,
             "status": tournament_data.get('status', ''),
+            "lifecycleState": lifecycle_state,
         }
         return jsonify(response_data), 200
 

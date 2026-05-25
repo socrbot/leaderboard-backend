@@ -1173,32 +1173,46 @@ def get_tournament_player_scores(tournament_id):
 
         cache_key = ('player_scores', tournament_id)
 
-        # For completed tournaments, return stored leaderboard rows
+        # For completed tournaments, return stored leaderboard rows. We read the
+        # detailed `tournament_scores/<id>_latest` snapshot directly because
+        # `get_stored_scores()` prefers the tournament doc's `lastCalculatedScores`
+        # (team-level only — no `leaderboardData`). If neither snapshot has rows,
+        # we fall through to the live-fetch path below and persist the result so
+        # the final scoreboard becomes permanent.
         is_complete = tournament_data.get('isOfficiallyComplete', False) or tournament_data.get('isComplete', False)
         if is_complete:
             if cache_key in CACHE:
                 cached_data, _ = CACHE[cache_key]
-                return jsonify(cached_data)
-            stored_results = get_stored_scores(tournament_id, max_age_minutes=None)
+                if cached_data.get('leaderboardRows'):
+                    return jsonify(cached_data)
+
             rows = []
-            if stored_results:
-                leaderboard_data = stored_results.get('leaderboardData', {})
-                rows = leaderboard_data.get('leaderboardRows', [])
-            result = {
-                'leaderboardRows': rows,
-                'isOfficiallyComplete': True,
-                'isInProgress': False,
-                'tournamentStatus': 'Official',
-                'dataFreshness': 'stored'
-            }
-            CACHE[cache_key] = (result, time.time())
-            return jsonify(result)
+            try:
+                snapshot = db.collection('tournament_scores').document(f"{tournament_id}_latest").get()
+                if snapshot.exists:
+                    snapshot_data = snapshot.to_dict() or {}
+                    rows = (snapshot_data.get('leaderboardData') or {}).get('leaderboardRows') or []
+            except Exception as snap_err:
+                app.logger.warning(f"Could not read tournament_scores snapshot for {tournament_id}: {snap_err}")
+
+            if rows:
+                result = {
+                    'leaderboardRows': rows,
+                    'isOfficiallyComplete': True,
+                    'isInProgress': False,
+                    'tournamentStatus': 'Official',
+                    'dataFreshness': 'stored'
+                }
+                CACHE[cache_key] = (result, time.time())
+                return jsonify(result)
+            # else: no stored rows — fall through to live fetch + persist below.
+            app.logger.info(f"Completed tournament {tournament_id} has no stored leaderboard rows; fetching live and persisting.")
 
         # For tournaments that have not started
         is_draft_complete = tournament_data.get('IsDraftComplete', False)
         is_active = tournament_data.get('isActive', False)
         has_stored_scores = tournament_data.get('lastCalculatedScores') is not None
-        if not is_active and not has_stored_scores and not is_draft_complete:
+        if not is_complete and not is_active and not has_stored_scores and not is_draft_complete:
             return jsonify({
                 'leaderboardRows': [],
                 'isOfficiallyComplete': False,

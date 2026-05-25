@@ -3796,12 +3796,54 @@ def get_single_tournament(tournament_id):
 
         # Build Tournament info from stored Firestore metadata (populated at lock time)
         stored_meta = tournament_data.get('tournamentMeta', {})
+
+        # Lazy course-name backfill: ensure the course name is available regardless
+        # of tournament lifecycle status. If the stored metadata doesn't have a course
+        # name and we haven't already tried to fetch it, ask RapidAPI's /tournament
+        # endpoint once and persist the result. We use a `CourseFetchAttempted` flag
+        # to avoid repeated calls when the upstream simply doesn't have a course.
+        course_name = stored_meta.get('CourseName', '')
+        if (
+            not course_name
+            and not stored_meta.get('CourseFetchAttempted')
+            and tournament_data.get('tournId')
+        ):
+            try:
+                t_data, t_err = make_rapidapi_request(
+                    '/tournament',
+                    {
+                        'orgId': tournament_data.get('orgId', '1'),
+                        'tournId': tournament_data.get('tournId'),
+                        'year': tournament_data.get('year', '2025'),
+                    },
+                    request_source=f"tournament_info_backfill_{tournament_id}",
+                )
+                if t_data and not t_err:
+                    # Common field names across providers; pick the first non-empty value.
+                    course_name = (
+                        t_data.get('courseName')
+                        or t_data.get('CourseName')
+                        or (t_data.get('courses', [{}])[0].get('courseName') if isinstance(t_data.get('courses'), list) and t_data.get('courses') else '')
+                        or (t_data.get('Courses', [{}])[0].get('Name') if isinstance(t_data.get('Courses'), list) and t_data.get('Courses') else '')
+                        or ''
+                    )
+                # Persist whatever we found (even empty), plus the attempt flag, so we
+                # don't hammer the upstream on every read for tournaments without a course.
+                new_meta = dict(stored_meta)
+                new_meta['CourseName'] = course_name
+                new_meta['CourseFetchAttempted'] = True
+                doc_ref.update({'tournamentMeta': new_meta})
+                stored_meta = new_meta
+            except Exception as course_err:
+                app.logger.warning(f"Could not backfill course name for {tournament_id}: {course_err}")
+
         tournament_info_obj = {
             "Name": tournament_data.get('name', ''),
             "StartDate": start_str,
             "EndDate": end_str,
             "Par": tournament_par,
             "Venue": stored_meta.get('Venue', ''),
+            "CourseName": course_name or stored_meta.get('CourseName', ''),
             "Status": tournament_data.get('status', ''),
             "CurrentRound": stored_meta.get('CurrentRound'),
             "Courses": stored_meta.get('Courses', []),

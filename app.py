@@ -1172,23 +1172,65 @@ def get_tournament_status_from_api(api_response):
         }
 
 # --- Persistent Score Storage Functions ---
+def _sanitize_for_firestore(value):
+    """Recursively unwrap BSON Extended JSON wrappers and strip any keys starting with '$'.
+    Firestore field names cannot start with '$', and grpc serialization rejects such maps
+    with TypeError: bad argument type for built-in operation."""
+    if isinstance(value, dict):
+        # Unwrap common BSON Extended JSON shapes to native scalars
+        if len(value) == 1:
+            only_key = next(iter(value))
+            if only_key == '$numberInt' or only_key == '$numberLong':
+                try:
+                    return int(value[only_key])
+                except (TypeError, ValueError):
+                    return value[only_key]
+            if only_key == '$numberDouble' or only_key == '$numberDecimal':
+                try:
+                    return float(value[only_key])
+                except (TypeError, ValueError):
+                    return value[only_key]
+            if only_key == '$oid':
+                return str(value[only_key])
+            if only_key == '$date':
+                inner = value[only_key]
+                if isinstance(inner, dict) and '$numberLong' in inner:
+                    try:
+                        return int(inner['$numberLong'])
+                    except (TypeError, ValueError):
+                        return inner['$numberLong']
+                return inner
+        # Strip any remaining keys starting with '$' and recurse
+        return {k: _sanitize_for_firestore(v) for k, v in value.items() if not (isinstance(k, str) and k.startswith('$'))}
+    if isinstance(value, list):
+        return [_sanitize_for_firestore(v) for v in value]
+    if isinstance(value, tuple):
+        return [_sanitize_for_firestore(v) for v in value]
+    return value
+
 def store_calculated_scores(tournament_id, leaderboard_data, team_scores, metadata):
     """Store calculated team scores in Firestore for persistence"""
     if not db:
         return False
     
     try:
+        # Sanitize inputs to remove BSON Extended JSON wrappers and '$'-prefixed keys
+        # which Firestore rejects (raises TypeError: bad argument type for built-in operation).
+        safe_leaderboard = _sanitize_for_firestore(leaderboard_data)
+        safe_team_scores = _sanitize_for_firestore(team_scores)
+        safe_metadata = _sanitize_for_firestore(metadata)
+
         # Create score snapshot document
         score_snapshot = {
             'tournamentId': tournament_id,
-            'leaderboardData': leaderboard_data,
-            'teamScores': team_scores,
-            'metadata': metadata,
+            'leaderboardData': safe_leaderboard,
+            'teamScores': safe_team_scores,
+            'metadata': safe_metadata,
             'calculatedAt': firestore.SERVER_TIMESTAMP,
-            'tournamentStatus': leaderboard_data.get('tournamentStatus', {}),
-            'isOfficialComplete': leaderboard_data.get('isOfficiallyComplete', False),
-            'roundId': leaderboard_data.get('roundId'),
-            'dataHash': hashlib.md5(str(leaderboard_data.get('leaderboardRows', [])).encode()).hexdigest()
+            'tournamentStatus': safe_leaderboard.get('tournamentStatus', {}) if isinstance(safe_leaderboard, dict) else {},
+            'isOfficialComplete': safe_leaderboard.get('isOfficiallyComplete', False) if isinstance(safe_leaderboard, dict) else False,
+            'roundId': safe_leaderboard.get('roundId') if isinstance(safe_leaderboard, dict) else None,
+            'dataHash': hashlib.md5(str(safe_leaderboard.get('leaderboardRows', []) if isinstance(safe_leaderboard, dict) else []).encode()).hexdigest()
         }
         
         # Store in tournament_scores collection
@@ -1198,9 +1240,9 @@ def store_calculated_scores(tournament_id, leaderboard_data, team_scores, metada
         # Also store in tournament document for easy access
         tournament_ref = db.collection('tournaments').document(tournament_id)
         tournament_ref.update({
-            'lastCalculatedScores': team_scores,
+            'lastCalculatedScores': safe_team_scores,
             'lastScoreCalculation': firestore.SERVER_TIMESTAMP,
-            'lastScoreMetadata': metadata
+            'lastScoreMetadata': safe_metadata
         })
         
         app.logger.info(f"Stored calculated scores for tournament {tournament_id}")

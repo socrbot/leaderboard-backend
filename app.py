@@ -3781,6 +3781,47 @@ def get_single_tournament(tournament_id):
         today = datetime.utcnow().date()
         start_str = tournament_data.get('startDate', '')
         end_str = tournament_data.get('endDate', '')
+
+        # Lazy date backfill: older tournaments may have been created without dates
+        # (before the schedule lookup existed). Fetch from RapidAPI /tournament once.
+        dates_missing = not start_str or not end_str
+        if (
+            dates_missing
+            and not tournament_data.get('DatesFetchAttempted')
+            and tournament_data.get('tournId')
+        ):
+            try:
+                td, te = make_rapidapi_request(
+                    '/tournament',
+                    {
+                        'orgId': tournament_data.get('orgId', '1'),
+                        'tournId': tournament_data.get('tournId'),
+                        'year': tournament_data.get('year', '2025'),
+                    },
+                    request_source=f"tournament_dates_backfill_{tournament_id}",
+                )
+                update_payload = {'DatesFetchAttempted': True}
+                if td and not te:
+                    date_field = td.get('date') or {}
+                    if isinstance(date_field, dict):
+                        new_start = _parse_rapidapi_date(date_field.get('start')) or ''
+                        new_end = _parse_rapidapi_date(date_field.get('end')) or ''
+                    elif isinstance(date_field, str):
+                        new_start = _parse_rapidapi_date(date_field) or ''
+                        new_end = ''
+                    else:
+                        new_start = ''
+                        new_end = ''
+                    if not start_str and new_start:
+                        start_str = new_start
+                        update_payload['startDate'] = new_start
+                    if not end_str and new_end:
+                        end_str = new_end
+                        update_payload['endDate'] = new_end
+                doc_ref.update(update_payload)
+            except Exception as date_err:
+                app.logger.warning(f"Could not backfill dates for {tournament_id}: {date_err}")
+
         is_in_progress = False
         is_over = False
         if start_str:

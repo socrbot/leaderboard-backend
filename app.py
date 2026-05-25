@@ -325,6 +325,84 @@ def require_any_league_admin(f):
         return f(*args, **kwargs)
     return decorated
 
+
+def _is_league_member(uid, league_id):
+    """True if uid is a super-admin, the league's adminUid, or has a doc in members subcollection."""
+    if not db or not uid or not league_id:
+        return False
+    if _is_super_admin(uid):
+        return True
+    try:
+        league_doc = db.collection('leagues').document(league_id).get()
+        if not league_doc.exists:
+            return False
+        if (league_doc.to_dict() or {}).get('adminUid') == uid:
+            return True
+        member_doc = (
+            db.collection('leagues').document(league_id)
+              .collection('members').document(uid).get()
+        )
+        return member_doc.exists
+    except Exception:
+        return False
+
+
+def _user_league_ids(uid):
+    """Return the set of league IDs the user belongs to (admin of OR member of).
+    Reads users/{uid}.leagueIds (denormalized) plus leagues where adminUid==uid.
+    Returns None for super-admin (meaning: no filter)."""
+    if not db or not uid:
+        return set()
+    if _is_super_admin(uid):
+        return None
+    ids = set()
+    try:
+        user_doc = db.collection('users').document(uid).get()
+        if user_doc.exists:
+            for lid in (user_doc.to_dict() or {}).get('leagueIds', []) or []:
+                if lid:
+                    ids.add(lid)
+    except Exception:
+        pass
+    try:
+        owned = db.collection('leagues').where('adminUid', '==', uid).get()
+        for d in owned:
+            ids.add(d.id)
+    except Exception:
+        pass
+    return ids
+
+
+def require_league_member(param='league_id'):
+    """Require the caller to be a member (or admin/super) of the given league."""
+    def wrapper(f):
+        @functools.wraps(f)
+        @require_auth
+        def decorated(*args, **kwargs):
+            league_id = kwargs.get(param)
+            if not _is_league_member(request.uid, league_id):
+                return jsonify({'error': 'League membership required'}), 403
+            return f(*args, **kwargs)
+        return decorated
+    return wrapper
+
+
+def require_tournament_member(param='tournament_id'):
+    """Require the caller to be a member of the league that owns the given tournament."""
+    def wrapper(f):
+        @functools.wraps(f)
+        @require_auth
+        def decorated(*args, **kwargs):
+            tournament_id = kwargs.get(param)
+            league_id = _resolve_tournament_league_id(tournament_id)
+            if not league_id:
+                return jsonify({'error': 'Tournament not found'}), 404
+            if not _is_league_member(request.uid, league_id):
+                return jsonify({'error': 'League membership required'}), 403
+            return f(*args, **kwargs)
+        return decorated
+    return wrapper
+
 # SportsData.io credentials for odds
 SPORTSDATA_IO_API_KEY = os.getenv("SPORTSDATA_IO_API_KEY")
 if SPORTSDATA_IO_API_KEY:
@@ -2607,6 +2685,7 @@ def get_optimized_leaderboard():
     return _leaderboard_response(enhanced_data)
 
 @app.route('/api/tournaments/<tournament_id>/leaderboard', methods=['GET'])
+@require_tournament_member()
 def get_tournament_leaderboard(tournament_id):
     """Get leaderboard data for a specific tournament (backwards compatibility)"""
     if not db:
@@ -2754,6 +2833,7 @@ def get_tournament_leaderboard(tournament_id):
 
 
 @app.route('/api/tournaments/<tournament_id>/player_scores', methods=['GET'])
+@require_tournament_member()
 def get_tournament_player_scores(tournament_id):
     """Get individual player leaderboard scores for a tournament (for Tournament Scores view)"""
     if not db:
@@ -3621,6 +3701,7 @@ def remove_preferred_tournament(team_id, tournament_id):
 # --- Tournament Team Assignment API Routes ---
 
 @app.route('/api/tournaments/<tournament_id>/team_assignments', methods=['GET'])
+@require_tournament_member()
 def get_tournament_team_assignments(tournament_id):
     """Get team assignments for a tournament"""
     if not db:
@@ -3903,6 +3984,7 @@ def get_tournament_years():
 
 
 @app.route('/api/tournaments', methods=['GET'])
+@require_auth
 def get_tournaments():
     if not db:
         app.logger.error("Firestore DB not initialized.")
@@ -3910,14 +3992,21 @@ def get_tournaments():
     try:
         year_filter = request.args.get('year')
         league_id_filter = request.args.get('leagueId')
+        # Restrict to leagues the caller belongs to (super-admin sees all → None).
+        allowed_league_ids = _user_league_ids(request.uid)
+        if league_id_filter and allowed_league_ids is not None and league_id_filter not in allowed_league_ids:
+            return jsonify([]), 200
         tournaments_ref = db.collection('tournaments').order_by('createdAt').get()
         tournaments_list = []
         for doc in tournaments_ref:
             tournament_data = doc.to_dict()
             tournament_year = tournament_data.get('year', '')
+            t_league_id = tournament_data.get('leagueId', '')
             if year_filter and tournament_year != year_filter:
                 continue
-            if league_id_filter and tournament_data.get('leagueId', '') != league_id_filter:
+            if league_id_filter and t_league_id != league_id_filter:
+                continue
+            if allowed_league_ids is not None and t_league_id not in allowed_league_ids:
                 continue
             tournaments_list.append({
                 "id": doc.id,
@@ -3930,6 +4019,7 @@ def get_tournaments():
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/tournaments/<tournament_id>', methods=['GET'])
+@require_tournament_member()
 def get_single_tournament(tournament_id):
     if not db:
         app.logger.error("Firestore DB not initialized.")
@@ -4364,6 +4454,7 @@ def _refresh_preview_odds_for_doc(doc_ref, tournament_data):
 
 
 @app.route('/api/tournaments/<tournament_id>/preview_odds', methods=['GET'])
+@require_tournament_member()
 def get_preview_odds(tournament_id):
     """Public read of pre-lock-in draft odds + the timestamp they were captured.
     Once draft odds are locked, callers should use /api/player_odds instead."""
@@ -4467,6 +4558,7 @@ def refresh_stale_preview_odds():
         app.logger.error(f"Error in refresh_stale_preview_odds: {e}")
 
 @app.route('/api/tournaments/<tournament_id>/draft_status', methods=['GET'])
+@require_tournament_member()
 def get_draft_status(tournament_id):
     """Return draft state including picks, whose turn it is, and tier info."""
     if not db:
@@ -4768,6 +4860,7 @@ def admin_edit_pick(tournament_id):
 
 # NEW: API endpoint to get draft order information
 @app.route('/api/tournaments/<tournament_id>/draft_order', methods=['GET'])
+@require_tournament_member()
 def get_draft_order(tournament_id):
     if not db:
         app.logger.error("Firestore DB not initialized.")
@@ -5875,8 +5968,9 @@ def opt_out_tournament():
 
 
 @app.route('/api/leagues/<league_id>', methods=['GET'])
+@require_league_member()
 def get_league_by_id(league_id):
-    """Get league info by ID (public)"""
+    """Get league info by ID (members only)"""
     if not db:
         return jsonify({'error': 'Firestore not initialized'}), 500
     try:

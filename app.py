@@ -198,9 +198,9 @@ try:
 
 except Exception as e:
     app.logger.error(f"Error initializing Firebase Admin SDK: {e}")
-    # Depending on the desired behavior, you might want to raise the exception
-    # to prevent the app from running without a database connection.
-    raise
+    # Do NOT crash the process — keep the container alive so /healthz can answer
+    # the platform liveness probe. Endpoints that need Firestore guard on `db is None`.
+    db = None
 
 # --- Auth Decorators ---
 def require_auth(f):
@@ -1679,40 +1679,113 @@ def build_not_started_team_scores(team_assignments):
     return placeholder_rows
 
 # --- Optimized RapidAPI Integration Functions ---
+
+# Circuit breaker for RapidAPI. When the upstream is flapping (e.g. 5xx or timeouts),
+# tripping the breaker prevents us from spending the rate-limit budget and request
+# latency on guaranteed-failing calls. Closed -> Open after `FAILURE_THRESHOLD` failures
+# in `WINDOW_SEC`. Stays Open for `COOLDOWN_SEC`, then Half-Open (one probe allowed).
+_RAPIDAPI_BREAKER = {
+    'failures': [],          # list of failure timestamps within the window
+    'state': 'closed',       # 'closed' | 'open' | 'half_open'
+    'opened_at': 0.0,
+}
+_BREAKER_FAILURE_THRESHOLD = 5
+_BREAKER_WINDOW_SEC = 60
+_BREAKER_COOLDOWN_SEC = 30
+
+
+def _breaker_record_success():
+    _RAPIDAPI_BREAKER['failures'].clear()
+    _RAPIDAPI_BREAKER['state'] = 'closed'
+    _RAPIDAPI_BREAKER['opened_at'] = 0.0
+
+
+def _breaker_record_failure():
+    now = time.time()
+    failures = _RAPIDAPI_BREAKER['failures']
+    failures.append(now)
+    cutoff = now - _BREAKER_WINDOW_SEC
+    _RAPIDAPI_BREAKER['failures'] = [t for t in failures if t >= cutoff]
+    if len(_RAPIDAPI_BREAKER['failures']) >= _BREAKER_FAILURE_THRESHOLD:
+        if _RAPIDAPI_BREAKER['state'] != 'open':
+            app.logger.warning(
+                f"RapidAPI circuit breaker OPEN after {len(_RAPIDAPI_BREAKER['failures'])} failures"
+            )
+        _RAPIDAPI_BREAKER['state'] = 'open'
+        _RAPIDAPI_BREAKER['opened_at'] = now
+
+
+def _breaker_should_block():
+    """Returns (blocked, reason) for the current request."""
+    state = _RAPIDAPI_BREAKER['state']
+    if state == 'closed':
+        return False, None
+    now = time.time()
+    if state == 'open':
+        if now - _RAPIDAPI_BREAKER['opened_at'] >= _BREAKER_COOLDOWN_SEC:
+            # Move to half-open: allow this one request through as a probe.
+            _RAPIDAPI_BREAKER['state'] = 'half_open'
+            return False, None
+        return True, 'circuit_open'
+    # half_open: a probe is already in flight; block additional concurrent calls
+    return True, 'circuit_half_open'
+
+
 def make_rapidapi_request(endpoint, params=None, bypass_rate_limit=False, request_source="api_call"):
     """Make a rate-limited request to RapidAPI using response headers for rate limiting"""
     if not bypass_rate_limit and not check_rate_limit():
         rate_status = get_rate_limit_status()
         app.logger.warning(f"Rate limit exceeded for {request_source}: {rate_status}")
         return None, f"Rate limit exceeded. Remaining: {rate_status['rapidapi_remaining']}/{rate_status['rapidapi_limit']}"
-    
+
+    blocked, reason = _breaker_should_block()
+    if blocked:
+        app.logger.warning(f"RapidAPI circuit breaker blocking request ({reason}) for {request_source}")
+        return None, f"Upstream temporarily unavailable ({reason})"
+
     headers = {
         "X-RapidAPI-Key": RAPIDAPI_KEY,
         "X-RapidAPI-Host": RAPIDAPI_HOST
     }
-    
+
     try:
         log_api_call()  # For compatibility (now a no-op)
         app.logger.info(f"Making RapidAPI request to {endpoint} (source: {request_source})")
-        response = requests.get(f"{RAPIDAPI_BASE_URL}{endpoint}", headers=headers, params=params)
-        
+        response = requests.get(f"{RAPIDAPI_BASE_URL}{endpoint}", headers=headers, params=params, timeout=15)
+
         # Update rate limit info from response headers
         update_rate_limit_info(response.headers)
-        
+
         response.raise_for_status()
+        _breaker_record_success()
         app.logger.info(f"RapidAPI request successful: {response.status_code}")
         return response.json(), None
     except requests.exceptions.RequestException as e:
         error_msg = f"RapidAPI request failed for {request_source}: {e}"
+        status_code = None
         if hasattr(e, 'response') and e.response is not None:
-            error_msg += f" | Status: {e.response.status_code} | Content: {e.response.text}"
-            # Still try to update rate limit info even on error
-            if hasattr(e, 'response') and e.response is not None:
-                update_rate_limit_info(e.response.headers)
+            status_code = e.response.status_code
+            error_msg += f" | Status: {status_code} | Content: {e.response.text}"
+            update_rate_limit_info(e.response.headers)
+        # Treat 5xx, timeouts, and connection errors as failures for the breaker;
+        # do NOT count 4xx (those are caller errors, not upstream outages).
+        is_upstream_failure = (
+            isinstance(e, (requests.exceptions.Timeout, requests.exceptions.ConnectionError))
+            or (status_code is not None and 500 <= status_code < 600)
+        )
+        if is_upstream_failure:
+            _breaker_record_failure()
         app.logger.error(error_msg)
         return None, error_msg
 
 # --- Enhanced API Routes ---
+
+@app.route('/healthz', methods=['GET'])
+def healthz():
+    """Liveness probe. Returns 200 without touching Firestore or RapidAPI so the
+    container can pass health checks even if downstreams are temporarily down."""
+    return jsonify({'status': 'ok', 'firestore': db is not None}), 200
+
 
 @app.route('/api/rate_limit_status', methods=['GET'])
 def get_api_rate_limit_status():
@@ -2306,12 +2379,20 @@ def get_optimized_leaderboard():
                                        bypass_rate_limit=False, 
                                        request_source="user_leaderboard_request")
     if error:
-        # If we hit rate limits, try to return cached data even if expired
-        if "Rate limit" in error and cache_key in CACHE:
+        # On any upstream failure (rate limit, 5xx, timeout, circuit breaker), prefer
+        # returning the previous good payload (even if expired) over an error page.
+        if cache_key in CACHE:
             cached_data, timestamp = CACHE[cache_key]
-            app.logger.warning(f"Rate limited, returning expired cache data from {timestamp}")
-            return _leaderboard_response({**cached_data, 'fromExpiredCache': True, 'cacheWarning': 'Data may be outdated due to API rate limits'})
-        return jsonify({"error": error}), 429 if "Rate limit" in error else 500
+            app.logger.warning(
+                f"Upstream error '{error}', returning expired cache data from {timestamp}"
+            )
+            return _leaderboard_response({
+                **cached_data,
+                'fromExpiredCache': True,
+                'cacheWarning': f'Upstream temporarily unavailable: {error}',
+            })
+        status_code = 429 if "Rate limit" in error else 503 if "circuit" in error.lower() else 500
+        return jsonify({"error": error}), status_code
     
     # Add tournament status information
     tournament_status = get_tournament_status_from_api(data)

@@ -4969,6 +4969,7 @@ def optimize_response(data, request_args=None):
 
 # --- Batch API Endpoint ---
 @app.route('/api/batch', methods=['POST'])
+@require_admin
 @performance_monitor
 def batch_requests():
     """Handle multiple API requests in a single call"""

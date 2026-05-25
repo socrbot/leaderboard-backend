@@ -7,7 +7,7 @@ from flask_caching import Cache
 from dotenv import load_dotenv
 import time
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import hashlib
 import functools
 import logging
@@ -2872,6 +2872,25 @@ def calculate_average_odds(player_odds_data):
     averaged_odds.sort(key=lambda x: x['averageOdds'] if x['averageOdds'] is not None else float('inf'))
     return averaged_odds
 
+
+def fetch_normalized_player_odds(odds_id):
+    """Fetch live odds from SportsData.io for `odds_id` and normalize them into the
+    same `[{name, averageOdds, playerId, photoUrl, headshot}, ...]` shape used by
+    `DraftLockedOdds`. Returns (odds_list, tournament_meta). Raises on HTTP / data errors."""
+    if not odds_id:
+        raise ValueError("odds_id is required")
+    endpoint = f"https://api.sportsdata.io/v3/golf/odds/json/TournamentOdds/{odds_id}"
+    response = requests.get(endpoint, params={"key": SPORTSDATA_IO_API_KEY}, timeout=15)
+    response.raise_for_status()
+    data = response.json() or {}
+    raw_player_odds = data.get("PlayerTournamentOdds") or []
+    if not raw_player_odds:
+        raise ValueError("SportsData.io response missing PlayerTournamentOdds")
+    averaged = calculate_average_odds(raw_player_odds)
+    averaged = enrich_player_odds_with_headshots(averaged)
+    return averaged, data.get("Tournament") or {}
+
+
 # --- Player Odds API Route (ENHANCED) ---
 @app.route('/api/player_odds', methods=['GET'])
 def get_player_odds():
@@ -3614,10 +3633,25 @@ def create_tournament():
             "IsDraftStarted": False,
             "IsDraftComplete": False,
             "DraftLockedOdds": [],
+            "PreviewOdds": [],
+            "PreviewOddsUpdatedAt": None,
             "createdAt": firestore.SERVER_TIMESTAMP
         }
         doc_ref = db.collection('tournaments').add(new_tournament_data)
         tournament_id = doc_ref[1].id
+
+        # Best-effort seed of preview odds so the new tournament has something to
+        # render on the pre-lock draft board. Failure here must NOT block creation.
+        if odds_id:
+            try:
+                preview_odds, _ = fetch_normalized_player_odds(odds_id)
+                doc_ref[1].update({
+                    "PreviewOdds": preview_odds,
+                    "PreviewOddsUpdatedAt": firestore.SERVER_TIMESTAMP,
+                })
+                app.logger.info(f"Seeded {len(preview_odds)} preview odds for new tournament {tournament_id}")
+            except Exception as preview_err:
+                app.logger.warning(f"Could not seed preview odds for new tournament {tournament_id}: {preview_err}")
 
         # Auto-assign all global teams for this year to the new tournament
         # Skip for league-based tournaments — teams[] will be populated at lock_draft_odds time
@@ -3997,16 +4031,10 @@ def lock_draft_odds(tournament_id):
         teams.sort(key=lambda t: t["draftOrder"])
 
         # --- 3. Fetch and lock odds ---
-        dynamic_odds_api_endpoint = f"https://api.sportsdata.io/v3/golf/odds/json/TournamentOdds/{odds_id}"
-        params = {"key": SPORTSDATA_IO_API_KEY}
-        response = requests.get(dynamic_odds_api_endpoint, params=params)
-        response.raise_for_status()
-        data = response.json()
-        if not data or not data.get("PlayerTournamentOdds"):
-            return jsonify({"error": "Could not retrieve live odds to lock in. API response missing player data."}), 500
-        raw_player_odds = data["PlayerTournamentOdds"]
-        averaged_odds_list = calculate_average_odds(raw_player_odds)
-        averaged_odds_list = enrich_player_odds_with_headshots(averaged_odds_list)
+        try:
+            averaged_odds_list, tourn_meta = fetch_normalized_player_odds(odds_id)
+        except Exception as fetch_err:
+            return jsonify({"error": f"Could not retrieve live odds to lock in: {fetch_err}"}), 500
 
         # Store how many players form the "tiered" draft pool (4 × num_teams),
         # but keep the full list in DraftLockedOdds so search works across all players.
@@ -4014,7 +4042,6 @@ def lock_draft_odds(tournament_id):
         draft_pool_size = 4 * num_teams
 
         # Store tournament metadata from this one-time API call so get_single_tournament never re-calls
-        tourn_meta = data.get("Tournament", {})
         meta_update = {}
         if tourn_meta:
             meta_update['tournamentMeta'] = {
@@ -4043,6 +4070,108 @@ def lock_draft_odds(tournament_id):
     except Exception as e:
         app.logger.error(f"Error locking draft odds for tournament {tournament_id}: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+# --- Preview Odds (pre-lock-in draft board) ---
+
+PREVIEW_ODDS_REFRESH_AGE = timedelta(days=7)
+
+
+def _refresh_preview_odds_for_doc(doc_ref, tournament_data):
+    """Internal helper: fetch + persist preview odds for one tournament doc.
+    Returns (success, message). Does NOT validate lifecycle — caller must check."""
+    odds_id = tournament_data.get("oddsId")
+    if not odds_id:
+        return False, "Tournament has no oddsId configured"
+    try:
+        preview_odds, _ = fetch_normalized_player_odds(odds_id)
+    except Exception as e:
+        return False, f"Could not fetch odds: {e}"
+    doc_ref.update({
+        "PreviewOdds": preview_odds,
+        "PreviewOddsUpdatedAt": firestore.SERVER_TIMESTAMP,
+    })
+    return True, f"Refreshed {len(preview_odds)} preview odds"
+
+
+@app.route('/api/tournaments/<tournament_id>/preview_odds', methods=['GET'])
+def get_preview_odds(tournament_id):
+    """Public read of pre-lock-in draft odds + the timestamp they were captured.
+    Once draft odds are locked, callers should use /api/player_odds instead."""
+    if not db:
+        return jsonify({"error": "Firestore not initialized"}), 500
+    try:
+        doc = db.collection('tournaments').document(tournament_id).get()
+        if not doc.exists:
+            return jsonify({"error": "Tournament not found"}), 404
+        data = doc.to_dict()
+        updated_at = data.get("PreviewOddsUpdatedAt")
+        return jsonify({
+            "odds": data.get("PreviewOdds") or [],
+            "updatedAt": updated_at.isoformat() if hasattr(updated_at, 'isoformat') else None,
+            "isLocked": bool(data.get("DraftLockedOdds")),
+        }), 200
+    except Exception as e:
+        app.logger.error(f"Error fetching preview odds for {tournament_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/tournaments/<tournament_id>/refresh_preview_odds', methods=['POST'])
+def refresh_preview_odds(tournament_id):
+    """Manually refresh preview odds for a tournament that has not yet locked its draft."""
+    if not db:
+        return jsonify({"error": "Firestore not initialized"}), 500
+    try:
+        doc_ref = db.collection('tournaments').document(tournament_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return jsonify({"error": "Tournament not found"}), 404
+        data = doc.to_dict()
+        if data.get("DraftLockedOdds"):
+            return jsonify({"error": "Draft odds are already locked for this tournament."}), 400
+        ok, message = _refresh_preview_odds_for_doc(doc_ref, data)
+        status_code = 200 if ok else 502
+        return jsonify({"message": message}), status_code
+    except Exception as e:
+        app.logger.error(f"Error refreshing preview odds for {tournament_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+def refresh_stale_preview_odds():
+    """Scheduled job: refresh preview odds for any unlocked tournament whose
+    `PreviewOddsUpdatedAt` is older than `PREVIEW_ODDS_REFRESH_AGE`, or missing."""
+    if not db:
+        app.logger.warning("Preview-odds refresh skipped: Firestore not initialized")
+        return
+    try:
+        cutoff = datetime.now(timezone.utc) - PREVIEW_ODDS_REFRESH_AGE
+        refreshed = 0
+        skipped = 0
+        # We can't easily query on (DraftLockedOdds == []) so we stream candidates and filter.
+        # Limit to tournaments created in the past 18 months to bound the scan cost.
+        recent_cutoff = datetime.now(timezone.utc) - timedelta(days=540)
+        docs = db.collection('tournaments').where('createdAt', '>=', recent_cutoff).stream()
+        for doc in docs:
+            data = doc.to_dict()
+            if data.get('DraftLockedOdds'):
+                continue  # locked — skip
+            if not data.get('oddsId'):
+                continue
+            updated_at = data.get('PreviewOddsUpdatedAt')
+            if updated_at and hasattr(updated_at, 'replace'):
+                # Firestore timestamps come back as timezone-aware datetimes.
+                if updated_at > cutoff:
+                    skipped += 1
+                    continue
+            ok, message = _refresh_preview_odds_for_doc(doc.reference, data)
+            if ok:
+                refreshed += 1
+                app.logger.info(f"Preview odds refreshed for {doc.id}: {message}")
+            else:
+                app.logger.warning(f"Preview odds refresh failed for {doc.id}: {message}")
+        app.logger.info(f"Preview odds refresh complete: {refreshed} refreshed, {skipped} still fresh")
+    except Exception as e:
+        app.logger.error(f"Error in refresh_stale_preview_odds: {e}")
 
 @app.route('/api/tournaments/<tournament_id>/draft_status', methods=['GET'])
 def get_draft_status(tournament_id):
@@ -4892,6 +5021,16 @@ def start_tournament_monitoring():
         trigger=CronTrigger(hour=20, minute=0),
         id='auto_pick_expired_drafts',
         name='Auto-pick expired drafts at 20:00',
+        replace_existing=True
+    )
+
+    # Preview-odds refresh: 03:30 daily — refreshes preview odds for any unlocked
+    # tournament whose odds are older than 7 days (no-op for ones that are fresh).
+    scheduler.add_job(
+        func=refresh_stale_preview_odds,
+        trigger=CronTrigger(hour=3, minute=30),
+        id='refresh_stale_preview_odds',
+        name='Refresh stale preview odds (>7d) at 03:30',
         replace_existing=True
     )
 

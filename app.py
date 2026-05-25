@@ -299,6 +299,32 @@ def require_tournament_admin(param='tournament_id'):
         return decorated
     return wrapper
 
+
+def _is_any_league_admin(uid):
+    """True if uid is a super-admin or the adminUid of at least one league.
+    Used for shared/global resources (e.g. global_teams) that any league admin may manage.
+    """
+    if not db or not uid:
+        return False
+    if _is_super_admin(uid):
+        return True
+    try:
+        hit = db.collection('leagues').where('adminUid', '==', uid).limit(1).get()
+        return len(list(hit)) > 0
+    except Exception:
+        return False
+
+
+def require_any_league_admin(f):
+    """Require the caller to be the admin of at least one league (or a super-admin)."""
+    @functools.wraps(f)
+    @require_auth
+    def decorated(*args, **kwargs):
+        if not _is_any_league_admin(request.uid):
+            return jsonify({'error': 'League admin access required'}), 403
+        return f(*args, **kwargs)
+    return decorated
+
 # SportsData.io credentials for odds
 SPORTSDATA_IO_API_KEY = os.getenv("SPORTSDATA_IO_API_KEY")
 if SPORTSDATA_IO_API_KEY:
@@ -3253,6 +3279,7 @@ def get_global_teams():
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/global_teams', methods=['POST'])
+@require_any_league_admin
 def create_global_team():
     """Create a new global team for a specific year"""
     if not db:
@@ -3293,6 +3320,7 @@ def create_global_team():
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/global_teams/<team_id>', methods=['PUT'])
+@require_any_league_admin
 def update_global_team(team_id):
     """Update a global team"""
     if not db:
@@ -3355,6 +3383,7 @@ def update_global_team(team_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/global_teams/<team_id>', methods=['DELETE'])
+@require_any_league_admin
 def delete_global_team(team_id):
     """Delete a global team"""
     if not db:
@@ -3373,6 +3402,7 @@ def delete_global_team(team_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/global_teams/copy_year', methods=['POST'])
+@require_any_league_admin
 def copy_global_teams_year():
     """Copy all global teams from one year to another"""
     if not db:
@@ -3459,6 +3489,7 @@ def get_team_preferred_tournaments(team_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/global_teams/<team_id>/preferred_tournaments', methods=['PUT'])
+@require_any_league_admin
 def update_team_preferred_tournaments(team_id):
     """Update preferred tournaments for a specific team"""
     if not db:
@@ -3503,6 +3534,7 @@ def update_team_preferred_tournaments(team_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/global_teams/<team_id>/preferred_tournaments/<tournament_id>', methods=['POST'])
+@require_any_league_admin
 def add_preferred_tournament(team_id, tournament_id):
     """Add a tournament to team's preferred tournaments"""
     if not db:
@@ -3548,6 +3580,7 @@ def add_preferred_tournament(team_id, tournament_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/global_teams/<team_id>/preferred_tournaments/<tournament_id>', methods=['DELETE'])
+@require_any_league_admin
 def remove_preferred_tournament(team_id, tournament_id):
     """Remove a tournament from team's preferred tournaments"""
     if not db:

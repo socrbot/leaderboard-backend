@@ -5969,6 +5969,11 @@ def get_user_settings():
             'participatesInAnnual': d.get('participatesInAnnual', True),
             'leagueAnnualPreferences': league_annual_preferences,
             'teamName': d.get('teamName', ''),
+            'notificationPreferences': d.get('notificationPreferences', {
+                'draftOnClock': True,
+                'draftReminder': True,
+                'emailUpdates': False,
+            }),
         }), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -5989,6 +5994,16 @@ def update_user_settings():
             update['enrolledTournaments'] = data['enrolledTournaments']
         if 'participatesInAnnual' in data:
             update['participatesInAnnual'] = bool(data['participatesInAnnual'])
+
+        if 'notificationPreferences' in data:
+            prefs = data.get('notificationPreferences')
+            if not isinstance(prefs, dict):
+                return jsonify({'error': 'notificationPreferences must be an object'}), 400
+            update['notificationPreferences'] = {
+                'draftOnClock': bool(prefs.get('draftOnClock', True)),
+                'draftReminder': bool(prefs.get('draftReminder', True)),
+                'emailUpdates': bool(prefs.get('emailUpdates', False)),
+            }
 
         team_name = None
         if 'teamName' in data:

@@ -27,6 +27,20 @@ def _read_user_tokens(db, uid: str) -> list[str]:
         return []
 
 
+def _is_draft_notifications_enabled(db, uid: str) -> bool:
+    if not uid:
+        return False
+    try:
+        user_doc = db.collection('users').document(uid).get()
+        if not user_doc.exists:
+            return True
+        prefs = (user_doc.to_dict() or {}).get('notificationPreferences') or {}
+        return bool(prefs.get('draftOnClock', True))
+    except Exception as e:  # pragma: no cover
+        logger.warning("Failed to read notification preferences for %s: %s", uid, e)
+        return True
+
+
 def _delete_stale_token(db, uid: str, token: str) -> None:
     try:
         db.collection('users').document(uid).collection('fcmTokens').document(token).delete()
@@ -52,6 +66,9 @@ def send_to_user(
     data: Optional[dict] = None,
 ) -> int:
     """Send a notification to every device registered for uid. Returns success count."""
+    if not _is_draft_notifications_enabled(db, uid):
+        return 0
+
     tokens = _read_user_tokens(db, uid)
     if not tokens:
         return 0

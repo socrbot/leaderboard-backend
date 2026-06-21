@@ -2840,10 +2840,11 @@ def get_annual_championship():
     # Get year parameter from query string (default to current year)
     year = request.args.get('year', str(datetime.now().year))
     force_refresh = request.args.get('refresh', 'false').lower() == 'true'
-    app.logger.info(f"Fetching annual championship data for year: {year}")
+    include_in_progress = request.args.get('includeInProgress', 'false').lower() == 'true'
+    app.logger.info(f"Fetching annual championship data for year: {year}, includeInProgress: {include_in_progress}")
     
-    # Create year-specific cache key
-    cache_key = f'annual_championship_{year}'
+    # Create year-specific cache key (include includeInProgress in cache key)
+    cache_key = f'annual_championship_{year}:inProgress:{include_in_progress}'
     cached_result = cache.get(cache_key)
     if cached_result and not force_refresh:
         app.logger.info(f"Returning cached annual championship data for year {year}")
@@ -2857,6 +2858,7 @@ def get_annual_championship():
         annual_standings = {}
         processed_tournaments = []
         skipped_tournaments = []
+        in_progress_count = 0
         
         for doc in all_tournament_docs:
             tournament_data = doc.to_dict()
@@ -2932,9 +2934,18 @@ def get_annual_championship():
             
             # Check if tournament is officially complete
             tournament_status = get_tournament_status_from_api(leaderboard_data)
-            if not tournament_status['isOfficialComplete']:
+            is_complete = tournament_status['isOfficialComplete']
+            
+            # Filter based on includeInProgress parameter and isDraftComplete status
+            if not include_in_progress and not is_complete:
                 app.logger.info(f"Skipping incomplete tournament {tournament_id} (status: {tournament_status['status']})")
                 skipped_tournaments.append({'id': tournament_id, 'name': tournament_data.get('name'), 'reason': f'not_complete (status: {tournament_status["status"]})'})
+                continue
+            
+            # Skip tournaments where draft hasn't completed yet
+            if not tournament_data.get('isDraftComplete', False):
+                app.logger.info(f"Skipping tournament {tournament_id} (draft not complete)")
+                skipped_tournaments.append({'id': tournament_id, 'name': tournament_data.get('name'), 'reason': 'draft_not_complete'})
                 continue
             
             # Calculate team scores for this tournament
@@ -2948,6 +2959,7 @@ def get_annual_championship():
                 'tournamentId': tournament_id,
                 'name': tournament_data.get('name', 'Unknown Tournament'),
                 'completedAt': tournament_status['lastUpdated'],
+                'isComplete': is_complete,
                 'teamResults': []
             }
             
@@ -2977,6 +2989,10 @@ def get_annual_championship():
                         'score': team['totalScore']
                     })
             
+            # Count in-progress tournaments
+            if not is_complete:
+                in_progress_count += 1
+            
             processed_tournaments.append(tournament_info)
         
         # Sort annual standings by total score (lowest score wins)
@@ -2990,6 +3006,7 @@ def get_annual_championship():
                 'calculatedAt': datetime.now().isoformat(),
                 'tournamentCount': len(processed_tournaments),
                 'teamCount': len(final_standings),
+                'inProgressCount': in_progress_count,
                 'totalTournamentsFound': len(all_tournament_docs),
                 'skippedTournaments': skipped_tournaments
             }

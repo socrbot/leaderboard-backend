@@ -73,7 +73,14 @@ Get optimized leaderboard with optional team score calculations.
 ### Annual Championship
 
 #### GET /annual_championship
-Calculate annual championship standings from all completed tournaments.
+Calculate annual championship standings from completed tournaments and optionally include live/in-progress tournaments.
+
+**Parameters:**
+- `year` (string): Tournament year (default: current year)
+- `includeInProgress` (boolean): Include in-progress tournaments in standings (default: false)
+- `refresh` (boolean): Force refresh cached data (default: false)
+
+**Example:** `/annual_championship?year=2026&includeInProgress=true`
 
 **Response:**
 ```json
@@ -81,20 +88,71 @@ Calculate annual championship standings from all completed tournaments.
   "standings": [
     {
       "teamName": "Team Alpha",
-      "totalPoints": 85,
-      "tournaments": [...],
-      "wins": 2,
-      "top3": 4
+      "totalScore": 85,
+      "tournaments": [
+        {
+          "tournamentId": "doc_id_1",
+          "name": "Tournament Name",
+          "position": 1,
+          "score": 42
+        }
+      ]
     }
   ],
-  "tournaments": [...],
+  "tournaments": [
+    {
+      "tournamentId": "doc_id_1",
+      "name": "Tournament Name",
+      "completedAt": "2026-06-15T18:30:00Z",
+      "isComplete": true,
+      "teamResults": [
+        {
+          "teamName": "Team Alpha",
+          "position": 1,
+          "score": 42
+        }
+      ]
+    },
+    {
+      "tournamentId": "doc_id_2",
+      "name": "Live Tournament",
+      "completedAt": "2026-06-20T14:30:00Z",
+      "isComplete": false,
+      "teamResults": [...]
+    }
+  ],
   "metadata": {
-    "calculatedAt": "2025-07-18T10:30:00Z",
-    "tournamentCount": 5,
-    "teamCount": 8
+    "calculatedAt": "2026-06-20T14:30:00Z",
+    "tournamentCount": 2,
+    "teamCount": 8,
+    "inProgressCount": 1,
+    "totalTournamentsFound": 3,
+    "skippedTournaments": []
   }
 }
 ```
+
+**Response Fields:**
+- `standings`: Array of team standings with cumulative scores
+  - `teamName`: Team identifier
+  - `totalScore`: Cumulative stroke total across all tournaments (lower is better)
+  - `tournaments`: Array of tournament results for this team
+- `tournaments`: Array of tournament details
+  - `isComplete`: Boolean indicating if tournament is officially complete
+  - `completedAt`: Timestamp of last update
+  - `teamResults`: Team positions and scores for this tournament
+- `metadata`: Summary information
+  - `calculatedAt`: When the standings were calculated
+  - `tournamentCount`: Number of tournaments included in standings
+  - `inProgressCount`: Number of in-progress tournaments included
+  - `skippedTournaments`: Tournaments excluded with reasons
+
+**Live Tournament Support:**
+- Set `includeInProgress=true` to include tournaments with status "In Progress" or "Suspended"
+- Live tournaments are marked with `isComplete: false` in the response
+- The `inProgressCount` field indicates how many live tournaments are included
+- Recommended to poll every 3-5 minutes when live tournaments exist
+- Use `refresh=true` to bypass cache for latest data
 
 ### Player Odds
 

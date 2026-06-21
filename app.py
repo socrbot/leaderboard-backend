@@ -2923,6 +2923,12 @@ def get_annual_championship():
                 skipped_tournaments.append({'id': tournament_id, 'name': tournament_data.get('name'), 'reason': 'no_tourn_id'})
                 continue
             
+            # Skip tournaments where draft hasn't completed yet (cheap check, do this first)
+            if not tournament_data.get('isDraftComplete', False):
+                app.logger.info(f"Skipping tournament {tournament_id} (draft not complete)")
+                skipped_tournaments.append({'id': tournament_id, 'name': tournament_data.get('name'), 'reason': 'draft_not_complete'})
+                continue
+            
             # Fetch leaderboard data
             params = {'orgId': org_id, 'tournId': tourn_id, 'year': tournament_year}
             leaderboard_data, error = make_rapidapi_request('/leaderboard', params)
@@ -2936,16 +2942,11 @@ def get_annual_championship():
             tournament_status = get_tournament_status_from_api(leaderboard_data)
             is_complete = tournament_status['isOfficialComplete']
             
-            # Filter based on includeInProgress parameter and isDraftComplete status
-            if not include_in_progress and not is_complete:
+            # Filter based on includeInProgress parameter
+            # Include tournament if it's complete OR if we're including in-progress tournaments
+            if not (is_complete or include_in_progress):
                 app.logger.info(f"Skipping incomplete tournament {tournament_id} (status: {tournament_status['status']})")
                 skipped_tournaments.append({'id': tournament_id, 'name': tournament_data.get('name'), 'reason': f'not_complete (status: {tournament_status["status"]})'})
-                continue
-            
-            # Skip tournaments where draft hasn't completed yet
-            if not tournament_data.get('isDraftComplete', False):
-                app.logger.info(f"Skipping tournament {tournament_id} (draft not complete)")
-                skipped_tournaments.append({'id': tournament_id, 'name': tournament_data.get('name'), 'reason': 'draft_not_complete'})
                 continue
             
             # Calculate team scores for this tournament

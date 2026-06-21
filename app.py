@@ -2924,7 +2924,7 @@ def get_annual_championship():
                 continue
             
             # Skip tournaments where draft hasn't completed yet (cheap check, do this first)
-            if not tournament_data.get('isDraftComplete', False):
+            if not tournament_data.get('IsDraftComplete', False):
                 app.logger.info(f"Skipping tournament {tournament_id} (draft not complete)")
                 skipped_tournaments.append({'id': tournament_id, 'name': tournament_data.get('name'), 'reason': 'draft_not_complete'})
                 continue

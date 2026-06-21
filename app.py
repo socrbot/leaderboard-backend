@@ -72,14 +72,20 @@ CALL_INTERVAL_MINUTES = 45  # 45 minutes between calls for optimal distribution
 
 # --- Tournament Status Constants ---
 TOURNAMENT_STATUS = {
+    'SCHEDULED': 'Scheduled',
     'NOT_STARTED': 'Not Started',
     'IN_PROGRESS': 'In Progress',
+    'SUSPENDED': 'Suspended',
     'COMPLETE': 'Complete',
-    'OFFICIAL': 'Official'
+    'OFFICIAL': 'Official',
+    'POSTPONED': 'Postponed',
+    'CANCELLED': 'Cancelled'
 }
 
 COMPLETED_STATUSES = [TOURNAMENT_STATUS['COMPLETE'], TOURNAMENT_STATUS['OFFICIAL']]
-ACTIVE_STATUSES = [TOURNAMENT_STATUS['IN_PROGRESS']]
+ACTIVE_STATUSES = [TOURNAMENT_STATUS['IN_PROGRESS'], TOURNAMENT_STATUS['SUSPENDED']]
+SCHEDULED_STATUSES = [TOURNAMENT_STATUS['SCHEDULED'], TOURNAMENT_STATUS['NOT_STARTED']]
+CANCELLED_STATUSES = [TOURNAMENT_STATUS['CANCELLED'], TOURNAMENT_STATUS['POSTPONED']]
 
 # --- Cache TTL Configuration ---
 CACHE_TTL_SECONDS = 5 * 60  # 5 minutes for general data

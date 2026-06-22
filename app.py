@@ -2751,7 +2751,7 @@ def get_optimized_leaderboard():
     return _leaderboard_response(enhanced_data)
 
 @app.route('/api/tournaments/<tournament_id>/leaderboard', methods=['GET'])
-@require_tournament_member()
+
 def get_tournament_leaderboard(tournament_id):
     """Get leaderboard data for a specific tournament (backwards compatibility)"""
     if not db:
@@ -2899,7 +2899,7 @@ def get_tournament_leaderboard(tournament_id):
 
 
 @app.route('/api/tournaments/<tournament_id>/player_scores', methods=['GET'])
-@require_tournament_member()
+
 def get_tournament_player_scores(tournament_id):
     """Get individual player leaderboard scores for a tournament (for Tournament Scores view)"""
     if not db:
@@ -3767,7 +3767,7 @@ def remove_preferred_tournament(team_id, tournament_id):
 # --- Tournament Team Assignment API Routes ---
 
 @app.route('/api/tournaments/<tournament_id>/team_assignments', methods=['GET'])
-@require_tournament_member()
+
 def get_tournament_team_assignments(tournament_id):
     """Get team assignments for a tournament"""
     if not db:
@@ -4094,7 +4094,7 @@ def get_tournaments():
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/tournaments/<tournament_id>', methods=['GET'])
-@require_tournament_member()
+
 def get_single_tournament(tournament_id):
     if not db:
         app.logger.error("Firestore DB not initialized.")
@@ -4541,7 +4541,7 @@ def _refresh_preview_odds_for_doc(doc_ref, tournament_data):
 
 
 @app.route('/api/tournaments/<tournament_id>/preview_odds', methods=['GET'])
-@require_tournament_member()
+
 def get_preview_odds(tournament_id):
     """Public read of pre-lock-in draft odds + the timestamp they were captured.
     Once draft odds are locked, callers should use /api/player_odds instead."""
@@ -4645,7 +4645,7 @@ def refresh_stale_preview_odds():
         app.logger.error(f"Error in refresh_stale_preview_odds: {e}")
 
 @app.route('/api/tournaments/<tournament_id>/draft_status', methods=['GET'])
-@require_tournament_member()
+
 def get_draft_status(tournament_id):
     """Return draft state including picks, whose turn it is, and tier info."""
     if not db:
@@ -4963,7 +4963,7 @@ def admin_edit_pick(tournament_id):
 
 # NEW: API endpoint to get draft order information
 @app.route('/api/tournaments/<tournament_id>/draft_order', methods=['GET'])
-@require_tournament_member()
+
 def get_draft_order(tournament_id):
     if not db:
         app.logger.error("Firestore DB not initialized.")

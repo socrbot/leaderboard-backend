@@ -4,10 +4,12 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_compress import Compress
 from flask_caching import Cache
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from dotenv import load_dotenv
 import time
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import hashlib
 import functools
 import logging
@@ -22,6 +24,9 @@ import string
 # --- Firebase Admin SDK Imports ---
 import firebase_admin
 from firebase_admin import credentials, firestore, auth as firebase_auth
+
+# --- Local modules ---
+import notifications as draft_notifications
 
 # Load environment variables from .env file (only for local development)
 load_dotenv()
@@ -43,7 +48,62 @@ cache_config = {
 cache = Cache(app, config=cache_config)
 
 # --- CORS Configuration ---
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+# Allowlist of origins permitted to call the API. Override at runtime via the
+# CORS_ALLOWED_ORIGINS env var (comma-separated). The defaults cover the
+# Firebase Hosting prod + staging sites and local dev.
+_default_cors_origins = ",".join([
+    "https://alumni-golf-tournament.web.app",
+    "https://alumni-golf-tournament.firebaseapp.com",
+    "https://aulmni-leaderboard-v2.web.app",
+    "https://aulmni-leaderboard-v2.firebaseapp.com",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+])
+_cors_origins = [
+    o.strip()
+    for o in os.getenv("CORS_ALLOWED_ORIGINS", _default_cors_origins).split(",")
+    if o.strip()
+]
+CORS(
+    app,
+    resources={r"/api/*": {"origins": _cors_origins}},
+    supports_credentials=False,
+    allow_headers=["Content-Type", "Authorization"],
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+)
+app.logger.info(f"CORS allowlist: {_cors_origins}")
+
+# --- Rate Limiting ---
+# Per-IP defaults applied to all routes. Tighter per-route caps are attached
+# inline (search for `@limiter.limit`). Uses in-memory storage by default —
+# fine for single-instance Cloud Run; set RATELIMIT_STORAGE_URI=redis://...
+# if/when we scale beyond one instance.
+def _rate_limit_key():
+    """Prefer authenticated uid (when present) over IP — defeats trivial IP
+    rotation, gives signed-in users their own bucket, and falls back to the
+    remote address for anonymous traffic."""
+    uid = getattr(request, "uid", None)
+    return f"uid:{uid}" if uid else get_remote_address()
+
+limiter = Limiter(
+    app=app,
+    key_func=_rate_limit_key,
+    default_limits=["600 per minute", "10000 per hour"],
+    storage_uri=os.getenv("RATELIMIT_STORAGE_URI", "memory://"),
+    headers_enabled=True,
+)
+
+
+def get_env_int(name, default):
+    """Read an integer env var with fallback."""
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        return int(raw_value)
+    except (TypeError, ValueError):
+        app.logger.warning(f"Invalid integer for {name}: {raw_value}. Using default {default}.")
+        return default
 
 # --- RapidAPI Configuration ---
 RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
@@ -56,6 +116,76 @@ else:
     
 RAPIDAPI_HOST = "live-golf-data.p.rapidapi.com"
 RAPIDAPI_BASE_URL = "https://live-golf-data.p.rapidapi.com"
+
+# --- Odds API Configuration ---
+ODDS_API_KEY = os.getenv("ODDS_API_KEY")
+if ODDS_API_KEY:
+    ODDS_API_KEY = ODDS_API_KEY.strip().replace('\r', '').replace('\n', '')
+    app.logger.info(f"Odds API key loaded and cleaned (length: {len(ODDS_API_KEY)})")
+else:
+    app.logger.warning("ODDS_API_KEY environment variable not found")
+
+ODDS_API_BASE_URL = "https://api.the-odds-api.com/v4"
+ODDS_API_MONTHLY_LIMIT = get_env_int("ODDS_API_MONTHLY_LIMIT", 500)
+ODDS_API_SOFT_LIMIT = get_env_int("ODDS_API_SOFT_LIMIT", 450)
+ODDS_API_WARNING_THRESHOLD = get_env_int("ODDS_API_WARNING_THRESHOLD", 400)
+ODDS_SPORTS_DISCOVERY_CACHE_TTL_SECONDS = 6 * 60 * 60
+
+ODDS_MAJOR_DEFINITIONS = [
+    {
+        'majorCode': 'masters',
+        'majorName': 'The Masters',
+        'fallbackKeys': [
+            'golf_masters_winner',
+            'golf_masters_tournament_winner',
+        ],
+    },
+    {
+        'majorCode': 'pga_championship',
+        'majorName': 'PGA Championship',
+        'fallbackKeys': [
+            'golf_pga_championship_winner',
+            'golf_pga_winner',
+        ],
+    },
+    {
+        'majorCode': 'us_open',
+        'majorName': 'U.S. Open',
+        'fallbackKeys': [
+            'golf_us_open_winner',
+            'golf_u_s_open_winner',
+        ],
+    },
+    {
+        'majorCode': 'open_championship',
+        'majorName': 'The Open Championship',
+        'fallbackKeys': [
+            'golf_the_open_championship_winner',
+            'golf_open_championship_winner',
+            'golf_british_open_winner',
+        ],
+    },
+]
+
+ODDS_MAJOR_MAPPING_DOC_ID = 'odds_major_sport_key_mapping'
+
+ODDS_API_USAGE_LOCK = Lock()
+ODDS_API_USAGE_STATE = {
+    'month_key': None,
+    'requests_used': 0,
+    'requests_remaining': None,
+    'last_request_cost': None,
+    'last_updated': None,
+    'source': 'startup_default'
+}
+
+
+def normalize_lookup_text(value):
+    if value is None:
+        return ""
+    normalized = unicodedata.normalize('NFKD', str(value))
+    ascii_text = ''.join(c for c in normalized if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]+", " ", ascii_text.lower()).strip()
 
 # --- API Rate Limiting Configuration ---
 API_CALL_LOCK = Lock()
@@ -122,9 +252,9 @@ try:
 
 except Exception as e:
     app.logger.error(f"Error initializing Firebase Admin SDK: {e}")
-    # Depending on the desired behavior, you might want to raise the exception
-    # to prevent the app from running without a database connection.
-    raise
+    # Do NOT crash the process — keep the container alive so /healthz can answer
+    # the platform liveness probe. Endpoints that need Firestore guard on `db is None`.
+    db = None
 
 # --- Auth Decorators ---
 def require_auth(f):
@@ -155,6 +285,178 @@ def require_admin(f):
         return f(*args, **kwargs)
     return decorated
 
+
+def _is_super_admin(uid):
+    """Developer-only override. Set users/{uid}.role = 'admin' in Firestore to grant."""
+    if not db or not uid:
+        return False
+    try:
+        user_doc = db.collection('users').document(uid).get()
+        return user_doc.exists and user_doc.to_dict().get('role') == 'admin'
+    except Exception:
+        return False
+
+
+def _is_league_admin(uid, league_id):
+    """True if uid is the creator (adminUid) of the given league, or a super-admin."""
+    if not db or not uid or not league_id:
+        return False
+    if _is_super_admin(uid):
+        return True
+    try:
+        league_doc = db.collection('leagues').document(league_id).get()
+        return league_doc.exists and league_doc.to_dict().get('adminUid') == uid
+    except Exception:
+        return False
+
+
+def require_league_admin(param='league_id'):
+    """Require the caller to be the admin (creator) of the league identified by a URL kwarg."""
+    def wrapper(f):
+        @functools.wraps(f)
+        @require_auth
+        def decorated(*args, **kwargs):
+            league_id = kwargs.get(param)
+            if not _is_league_admin(request.uid, league_id):
+                return jsonify({'error': 'League admin access required'}), 403
+            return f(*args, **kwargs)
+        return decorated
+    return wrapper
+
+
+def _resolve_tournament_league_id(tournament_id):
+    """Look up the leagueId for a tournament. Returns None if missing or unreadable."""
+    if not db or not tournament_id:
+        return None
+    try:
+        doc = db.collection('tournaments').document(tournament_id).get()
+        if not doc.exists:
+            return None
+        return (doc.to_dict() or {}).get('leagueId') or None
+    except Exception:
+        return None
+
+
+def require_tournament_admin(param='tournament_id'):
+    """Require the caller to be the admin of the league that owns the given tournament."""
+    def wrapper(f):
+        @functools.wraps(f)
+        @require_auth
+        def decorated(*args, **kwargs):
+            tournament_id = kwargs.get(param)
+            league_id = _resolve_tournament_league_id(tournament_id)
+            if not league_id:
+                return jsonify({'error': 'Tournament not found'}), 404
+            if not _is_league_admin(request.uid, league_id):
+                return jsonify({'error': 'League admin access required'}), 403
+            return f(*args, **kwargs)
+        return decorated
+    return wrapper
+
+
+def _is_any_league_admin(uid):
+    """True if uid is a super-admin or the adminUid of at least one league.
+    Used for shared/global resources (e.g. global_teams) that any league admin may manage.
+    """
+    if not db or not uid:
+        return False
+    if _is_super_admin(uid):
+        return True
+    try:
+        hit = db.collection('leagues').where('adminUid', '==', uid).limit(1).get()
+        return len(list(hit)) > 0
+    except Exception:
+        return False
+
+
+def require_any_league_admin(f):
+    """Require the caller to be the admin of at least one league (or a super-admin)."""
+    @functools.wraps(f)
+    @require_auth
+    def decorated(*args, **kwargs):
+        if not _is_any_league_admin(request.uid):
+            return jsonify({'error': 'League admin access required'}), 403
+        return f(*args, **kwargs)
+    return decorated
+
+
+def _is_league_member(uid, league_id):
+    """True if uid is a super-admin, the league's adminUid, or has a doc in members subcollection."""
+    if not db or not uid or not league_id:
+        return False
+    if _is_super_admin(uid):
+        return True
+    try:
+        league_doc = db.collection('leagues').document(league_id).get()
+        if not league_doc.exists:
+            return False
+        if (league_doc.to_dict() or {}).get('adminUid') == uid:
+            return True
+        member_doc = (
+            db.collection('leagues').document(league_id)
+              .collection('members').document(uid).get()
+        )
+        return member_doc.exists
+    except Exception:
+        return False
+
+
+def _user_league_ids(uid):
+    """Return the set of league IDs the user belongs to (admin of OR member of).
+    Reads users/{uid}.leagueIds (denormalized) plus leagues where adminUid==uid.
+    Returns None for super-admin (meaning: no filter)."""
+    if not db or not uid:
+        return set()
+    if _is_super_admin(uid):
+        return None
+    ids = set()
+    try:
+        user_doc = db.collection('users').document(uid).get()
+        if user_doc.exists:
+            for lid in (user_doc.to_dict() or {}).get('leagueIds', []) or []:
+                if lid:
+                    ids.add(lid)
+    except Exception:
+        pass
+    try:
+        owned = db.collection('leagues').where('adminUid', '==', uid).get()
+        for d in owned:
+            ids.add(d.id)
+    except Exception:
+        pass
+    return ids
+
+
+def require_league_member(param='league_id'):
+    """Require the caller to be a member (or admin/super) of the given league."""
+    def wrapper(f):
+        @functools.wraps(f)
+        @require_auth
+        def decorated(*args, **kwargs):
+            league_id = kwargs.get(param)
+            if not _is_league_member(request.uid, league_id):
+                return jsonify({'error': 'League membership required'}), 403
+            return f(*args, **kwargs)
+        return decorated
+    return wrapper
+
+
+def require_tournament_member(param='tournament_id'):
+    """Require the caller to be a member of the league that owns the given tournament."""
+    def wrapper(f):
+        @functools.wraps(f)
+        @require_auth
+        def decorated(*args, **kwargs):
+            tournament_id = kwargs.get(param)
+            league_id = _resolve_tournament_league_id(tournament_id)
+            if not league_id:
+                return jsonify({'error': 'Tournament not found'}), 404
+            if not _is_league_member(request.uid, league_id):
+                return jsonify({'error': 'League membership required'}), 403
+            return f(*args, **kwargs)
+        return decorated
+    return wrapper
+
 # SportsData.io credentials for odds
 SPORTSDATA_IO_API_KEY = os.getenv("SPORTSDATA_IO_API_KEY")
 if SPORTSDATA_IO_API_KEY:
@@ -171,8 +473,23 @@ if not SPORTSDATA_IO_API_KEY:
     app.logger.warning("SPORTSDATA_IO_API_KEY environment variable not set. Using dummy key.")
     SPORTSDATA_IO_API_KEY = "dummy_sportsdataio_key"
 
+SPORTSDATA_HEADSHOTS_ENDPOINT = "https://api.sportsdata.io/v3/golf/headshots/json/Headshots"
+HEADSHOT_CACHE_TTL_SECONDS = 24 * 60 * 60
+
 # --- Cache variables (for both APIs) ---
 CACHE = {}
+
+
+def normalize_player_name(name):
+    """Normalize player names to improve matching across APIs."""
+    if not name:
+        return ""
+
+    normalized = unicodedata.normalize('NFKD', str(name))
+    ascii_name = ''.join(c for c in normalized if not unicodedata.combining(c))
+    ascii_name = re.sub(r"[^a-zA-Z0-9 ]", "", ascii_name)
+    ascii_name = re.sub(r"\s+", " ", ascii_name).strip().lower()
+    return ascii_name
 
 # --- API Rate Limiting Functions ---
 def update_rate_limit_info(response_headers):
@@ -285,6 +602,766 @@ def get_rate_limit_status():
             'last_updated': RATE_LIMIT_INFO['last_updated'].isoformat() if RATE_LIMIT_INFO['last_updated'] else None
         }
 
+
+def get_month_key(now=None):
+    """Return UTC month key in YYYY-MM format."""
+    timestamp = now or datetime.utcnow()
+    return timestamp.strftime('%Y-%m')
+
+
+def get_odds_usage_doc_ref(month_key):
+    """Return Firestore document ref for monthly Odds API usage."""
+    if not db:
+        return None
+    return db.collection('api_usage').document(f"odds_api_{month_key}")
+
+
+def _reset_local_odds_usage_if_new_month(month_key):
+    if ODDS_API_USAGE_STATE['month_key'] != month_key:
+        ODDS_API_USAGE_STATE.update({
+            'month_key': month_key,
+            'requests_used': 0,
+            'requests_remaining': max(0, ODDS_API_MONTHLY_LIMIT),
+            'last_request_cost': None,
+            'last_updated': datetime.utcnow(),
+            'source': 'month_reset'
+        })
+
+
+def refresh_odds_api_usage_from_firestore(month_key=None):
+    """Load monthly usage snapshot from Firestore when available."""
+    current_month_key = month_key or get_month_key()
+
+    with ODDS_API_USAGE_LOCK:
+        _reset_local_odds_usage_if_new_month(current_month_key)
+
+        doc_ref = get_odds_usage_doc_ref(current_month_key)
+        if not doc_ref:
+            return dict(ODDS_API_USAGE_STATE)
+
+        try:
+            snapshot = doc_ref.get()
+            if snapshot.exists:
+                payload = snapshot.to_dict() or {}
+                used = int(payload.get('requestsUsed', 0) or 0)
+                remaining_from_provider = payload.get('providerRemaining')
+
+                ODDS_API_USAGE_STATE.update({
+                    'month_key': current_month_key,
+                    'requests_used': max(0, used),
+                    'requests_remaining': remaining_from_provider if remaining_from_provider is not None else max(0, ODDS_API_MONTHLY_LIMIT - used),
+                    'last_request_cost': payload.get('lastRequestCost'),
+                    'last_updated': datetime.utcnow(),
+                    'source': 'firestore_snapshot'
+                })
+        except Exception as e:
+            app.logger.warning(f"Could not refresh Odds API usage from Firestore: {e}")
+
+        return dict(ODDS_API_USAGE_STATE)
+
+
+def reserve_odds_api_quota(expected_cost=1, request_source='odds_api_call'):
+    """Reserve quota before a billable Odds API call to prevent overage."""
+    expected_cost = max(0, int(expected_cost or 0))
+    current_month_key = get_month_key()
+
+    with ODDS_API_USAGE_LOCK:
+        _reset_local_odds_usage_if_new_month(current_month_key)
+
+        # Free requests (for example /sports, /events) don't need reservation.
+        if expected_cost == 0:
+            return True, dict(ODDS_API_USAGE_STATE)
+
+        if db:
+            try:
+                doc_ref = get_odds_usage_doc_ref(current_month_key)
+                snapshot = doc_ref.get()
+                current_used = int((snapshot.to_dict() or {}).get('requestsUsed', 0)) if snapshot.exists else 0
+
+                if current_used + expected_cost > ODDS_API_MONTHLY_LIMIT:
+                    status = {
+                        'month_key': current_month_key,
+                        'requests_used': current_used,
+                        'requests_remaining': max(0, ODDS_API_MONTHLY_LIMIT - current_used),
+                        'monthly_limit': ODDS_API_MONTHLY_LIMIT,
+                        'blocked': True,
+                        'reason': f"Monthly Odds API limit would be exceeded by {request_source}"
+                    }
+                    return False, status
+
+                doc_ref.set({
+                    'provider': 'odds_api',
+                    'monthKey': current_month_key,
+                    'requestsUsed': firestore.Increment(expected_cost),
+                    'lastRequestSource': request_source,
+                    'updatedAt': firestore.SERVER_TIMESTAMP,
+                }, merge=True)
+
+                current_used += expected_cost
+                ODDS_API_USAGE_STATE.update({
+                    'month_key': current_month_key,
+                    'requests_used': current_used,
+                    'requests_remaining': max(0, ODDS_API_MONTHLY_LIMIT - current_used),
+                    'last_request_cost': expected_cost,
+                    'last_updated': datetime.utcnow(),
+                    'source': 'firestore_reservation'
+                })
+                return True, dict(ODDS_API_USAGE_STATE)
+            except Exception as e:
+                app.logger.warning(f"Firestore quota reservation failed for Odds API: {e}. Falling back to local limiter.")
+
+        # Local fallback limiter (covers local dev without Firestore, or Firestore failures)
+        current_used = int(ODDS_API_USAGE_STATE.get('requests_used', 0) or 0)
+        if current_used + expected_cost > ODDS_API_MONTHLY_LIMIT:
+            status = {
+                'month_key': current_month_key,
+                'requests_used': current_used,
+                'requests_remaining': max(0, ODDS_API_MONTHLY_LIMIT - current_used),
+                'monthly_limit': ODDS_API_MONTHLY_LIMIT,
+                'blocked': True,
+                'reason': f"Monthly Odds API limit would be exceeded by {request_source} (local limiter)"
+            }
+            return False, status
+
+        current_used += expected_cost
+        ODDS_API_USAGE_STATE.update({
+            'month_key': current_month_key,
+            'requests_used': current_used,
+            'requests_remaining': max(0, ODDS_API_MONTHLY_LIMIT - current_used),
+            'last_request_cost': expected_cost,
+            'last_updated': datetime.utcnow(),
+            'source': 'local_reservation'
+        })
+        return True, dict(ODDS_API_USAGE_STATE)
+
+
+def reconcile_odds_api_quota(actual_cost, expected_cost=1, request_source='odds_api_call'):
+    """Adjust reserved quota to match actual billed cost from x-requests-last."""
+    expected = max(0, int(expected_cost or 0))
+    actual = max(0, int(actual_cost or 0))
+    delta = actual - expected
+
+    if delta == 0:
+        return
+
+    month_key = get_month_key()
+    with ODDS_API_USAGE_LOCK:
+        _reset_local_odds_usage_if_new_month(month_key)
+
+        if db:
+            try:
+                doc_ref = get_odds_usage_doc_ref(month_key)
+                doc_ref.set({
+                    'provider': 'odds_api',
+                    'monthKey': month_key,
+                    'requestsUsed': firestore.Increment(delta),
+                    'lastRequestSource': request_source,
+                    'updatedAt': firestore.SERVER_TIMESTAMP,
+                }, merge=True)
+            except Exception as e:
+                app.logger.warning(f"Could not reconcile Odds API quota in Firestore: {e}")
+
+        new_used = max(0, int(ODDS_API_USAGE_STATE.get('requests_used', 0) or 0) + delta)
+        ODDS_API_USAGE_STATE.update({
+            'month_key': month_key,
+            'requests_used': new_used,
+            'requests_remaining': max(0, ODDS_API_MONTHLY_LIMIT - new_used),
+            'last_request_cost': actual,
+            'last_updated': datetime.utcnow(),
+            'source': 'reconciled_from_headers'
+        })
+
+
+def update_odds_api_usage_from_headers(response_headers):
+    """Update usage state from Odds API x-requests-* headers."""
+    remaining_raw = response_headers.get('x-requests-remaining')
+    used_raw = response_headers.get('x-requests-used')
+    last_raw = response_headers.get('x-requests-last')
+
+    remaining = None
+    used = None
+    last = None
+    try:
+        if remaining_raw is not None:
+            remaining = int(remaining_raw)
+    except (TypeError, ValueError):
+        pass
+    try:
+        if used_raw is not None:
+            used = int(used_raw)
+    except (TypeError, ValueError):
+        pass
+    try:
+        if last_raw is not None:
+            last = int(last_raw)
+    except (TypeError, ValueError):
+        pass
+
+    month_key = get_month_key()
+    with ODDS_API_USAGE_LOCK:
+        _reset_local_odds_usage_if_new_month(month_key)
+
+        if used is not None:
+            ODDS_API_USAGE_STATE['requests_used'] = max(ODDS_API_USAGE_STATE['requests_used'], used)
+        if remaining is not None:
+            ODDS_API_USAGE_STATE['requests_remaining'] = remaining
+        else:
+            ODDS_API_USAGE_STATE['requests_remaining'] = max(0, ODDS_API_MONTHLY_LIMIT - ODDS_API_USAGE_STATE['requests_used'])
+
+        ODDS_API_USAGE_STATE['last_request_cost'] = last
+        ODDS_API_USAGE_STATE['last_updated'] = datetime.utcnow()
+        ODDS_API_USAGE_STATE['source'] = 'provider_headers'
+
+        if db:
+            try:
+                doc_ref = get_odds_usage_doc_ref(month_key)
+                doc_ref.set({
+                    'provider': 'odds_api',
+                    'monthKey': month_key,
+                    'providerUsed': used,
+                    'providerRemaining': remaining,
+                    'lastRequestCost': last,
+                    'updatedAt': firestore.SERVER_TIMESTAMP,
+                }, merge=True)
+            except Exception as e:
+                app.logger.warning(f"Could not persist Odds API header usage snapshot: {e}")
+
+
+def get_odds_api_rate_limit_status(refresh_from_firestore=True):
+    """Return normalized status payload for Odds API monthly usage."""
+    month_key = get_month_key()
+    if refresh_from_firestore:
+        refresh_odds_api_usage_from_firestore(month_key=month_key)
+
+    with ODDS_API_USAGE_LOCK:
+        _reset_local_odds_usage_if_new_month(month_key)
+        used = int(ODDS_API_USAGE_STATE.get('requests_used', 0) or 0)
+        remaining = ODDS_API_USAGE_STATE.get('requests_remaining')
+        if remaining is None:
+            remaining = max(0, ODDS_API_MONTHLY_LIMIT - used)
+
+        blocked = used >= ODDS_API_MONTHLY_LIMIT or remaining <= 0
+        warning = used >= ODDS_API_WARNING_THRESHOLD or remaining <= (ODDS_API_MONTHLY_LIMIT - ODDS_API_SOFT_LIMIT)
+
+        return {
+            'provider': 'odds_api',
+            'month_key': month_key,
+            'requests_used': used,
+            'requests_remaining': remaining,
+            'monthly_limit': ODDS_API_MONTHLY_LIMIT,
+            'soft_limit': ODDS_API_SOFT_LIMIT,
+            'warning_threshold': ODDS_API_WARNING_THRESHOLD,
+            'is_blocked': blocked,
+            'is_warning': warning,
+            'last_request_cost': ODDS_API_USAGE_STATE.get('last_request_cost'),
+            'last_updated': ODDS_API_USAGE_STATE['last_updated'].isoformat() if ODDS_API_USAGE_STATE['last_updated'] else None,
+            'state_source': ODDS_API_USAGE_STATE.get('source')
+        }
+
+
+def make_odds_api_request(endpoint_path, params=None, expected_cost=1, request_source='odds_api_call'):
+    """Make an Odds API request with strict monthly usage controls."""
+    if not ODDS_API_KEY:
+        return None, "ODDS_API_KEY not configured"
+
+    clean_path = endpoint_path if endpoint_path.startswith('/') else f"/{endpoint_path}"
+    query_params = dict(params or {})
+    query_params['apiKey'] = ODDS_API_KEY
+
+    reserve_ok, reserve_status = reserve_odds_api_quota(expected_cost=expected_cost, request_source=request_source)
+    if not reserve_ok:
+        app.logger.warning(f"Blocked Odds API request for {request_source}: {reserve_status}")
+        return None, f"Odds API monthly limit reached ({reserve_status.get('requests_used')}/{reserve_status.get('monthly_limit')})"
+
+    url = f"{ODDS_API_BASE_URL}{clean_path}"
+    try:
+        response = requests.get(url, params=query_params, timeout=20)
+        update_odds_api_usage_from_headers(response.headers)
+        response.raise_for_status()
+
+        billed_cost = response.headers.get('x-requests-last')
+        if billed_cost is not None:
+            try:
+                reconcile_odds_api_quota(int(billed_cost), expected_cost=expected_cost, request_source=request_source)
+            except (TypeError, ValueError):
+                pass
+
+        status = get_odds_api_rate_limit_status(refresh_from_firestore=False)
+        if status['is_warning']:
+            app.logger.warning(f"Odds API usage warning: {status['requests_used']}/{status['monthly_limit']}")
+
+        return response.json(), None
+    except requests.exceptions.RequestException as e:
+        # If no response headers are available, release reserved cost back to 0 billed.
+        if not hasattr(e, 'response') or e.response is None:
+            reconcile_odds_api_quota(0, expected_cost=expected_cost, request_source=request_source)
+        else:
+            update_odds_api_usage_from_headers(e.response.headers)
+
+        error_msg = f"Odds API request failed for {request_source}: {e}"
+        if hasattr(e, 'response') and e.response is not None:
+            error_msg += f" | Status: {e.response.status_code} | Content: {e.response.text}"
+        app.logger.error(error_msg)
+        return None, error_msg
+
+
+def get_odds_major_mapping_doc_ref():
+    if not db:
+        return None
+    return db.collection('api_usage').document(ODDS_MAJOR_MAPPING_DOC_ID)
+
+
+def get_saved_odds_major_mapping():
+    """Return last-known 4-major mapping from Firestore when available."""
+    doc_ref = get_odds_major_mapping_doc_ref()
+    if not doc_ref:
+        return {}
+
+    try:
+        snapshot = doc_ref.get()
+        if not snapshot.exists:
+            return {}
+        payload = snapshot.to_dict() or {}
+        mapping = payload.get('mapping') or {}
+        return mapping if isinstance(mapping, dict) else {}
+    except Exception as e:
+        app.logger.warning(f"Could not load saved Odds major mapping: {e}")
+        return {}
+
+
+def save_odds_major_mapping(mapping):
+    """Persist last-known healthy mapping to Firestore for fallback use."""
+    doc_ref = get_odds_major_mapping_doc_ref()
+    if not doc_ref or not isinstance(mapping, dict):
+        return
+
+    try:
+        doc_ref.set({
+            'provider': 'odds_api',
+            'mapping': mapping,
+            'updatedAt': firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+    except Exception as e:
+        app.logger.warning(f"Could not save Odds major mapping: {e}")
+
+
+def get_discovered_odds_golf_sports(include_all=False, force_refresh=False):
+    """Fetch and cache discovered golf outright sports from Odds API."""
+    cache_key = ('odds_api_sports_discovery', bool(include_all))
+    if not force_refresh and cache_key in CACHE:
+        cached_value, cached_at = CACHE[cache_key]
+        if (time.time() - cached_at) < ODDS_SPORTS_DISCOVERY_CACHE_TTL_SECONDS:
+            return cached_value, None
+
+    params = {'all': 'true'} if include_all else {}
+    data, error = make_odds_api_request(
+        '/sports/',
+        params=params,
+        expected_cost=0,
+        request_source='odds_api_sports_discovery'
+    )
+    if error:
+        return None, error
+
+    if not isinstance(data, list):
+        return None, 'Unexpected Odds API sports response shape'
+
+    discovered = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+
+        key = str(row.get('key', '')).strip()
+        if not key.startswith('golf_'):
+            continue
+
+        if not row.get('has_outrights', False):
+            continue
+
+        if not include_all and not row.get('active', False):
+            continue
+
+        discovered.append({
+            'key': key,
+            'title': str(row.get('title', '')).strip(),
+            'description': str(row.get('description', '')).strip(),
+            'group': str(row.get('group', '')).strip(),
+            'active': bool(row.get('active', False)),
+            'has_outrights': bool(row.get('has_outrights', False)),
+        })
+
+    payload = {
+        'sports': discovered,
+        'count': len(discovered),
+        'include_all': bool(include_all),
+        'discoveredAt': datetime.utcnow().isoformat()
+    }
+    CACHE[cache_key] = (payload, time.time())
+    return payload, None
+
+
+def score_major_sport_candidate(major_code, candidate):
+    key = normalize_lookup_text(candidate.get('key', ''))
+    title = normalize_lookup_text(candidate.get('title', ''))
+    description = normalize_lookup_text(candidate.get('description', ''))
+    blob = f"{key} {title} {description}".strip()
+
+    score = 0
+    reason = []
+
+    if major_code == 'masters':
+        if 'masters' in blob:
+            score += 6
+            reason.append('contains masters')
+        if 'augusta' in blob:
+            score += 1
+            reason.append('contains augusta')
+
+    elif major_code == 'pga_championship':
+        if 'pga championship' in blob:
+            score += 7
+            reason.append('contains pga championship phrase')
+        if 'pga' in blob:
+            score += 3
+            reason.append('contains pga')
+        if 'championship' in blob:
+            score += 2
+            reason.append('contains championship')
+
+    elif major_code == 'us_open':
+        if 'us open' in blob or 'u s open' in blob:
+            score += 7
+            reason.append('contains us open phrase')
+        if 'us_open' in candidate.get('key', ''):
+            score += 3
+            reason.append('contains us_open key token')
+        if 'open championship' in blob or 'british open' in blob:
+            score -= 4
+            reason.append('penalty for open championship overlap')
+
+    elif major_code == 'open_championship':
+        if 'open championship' in blob:
+            score += 8
+            reason.append('contains open championship phrase')
+        if 'british open' in blob:
+            score += 6
+            reason.append('contains british open phrase')
+        if 'the open' in blob:
+            score += 2
+            reason.append('contains the open phrase')
+        if 'us open' in blob or 'u s open' in blob:
+            score -= 5
+            reason.append('penalty for us open overlap')
+
+    return score, '; '.join(reason)
+
+
+def map_four_majors_to_sport_keys(discovered_sports, saved_mapping=None):
+    """Return deterministic mapping for 4 majors with confidence metadata."""
+    saved_mapping = saved_mapping or {}
+    key_to_sport = {sport.get('key'): sport for sport in discovered_sports}
+    used_keys = set()
+    result = []
+
+    for definition in ODDS_MAJOR_DEFINITIONS:
+        major_code = definition['majorCode']
+        major_name = definition['majorName']
+
+        resolved = {
+            'majorCode': major_code,
+            'majorName': major_name,
+            'sportKey': None,
+            'confidence': 'unresolved',
+            'matchedFrom': 'none',
+            'matchScore': 0,
+            'active': None,
+            'hasOutrights': None,
+            'notes': ''
+        }
+
+        # 1) Previous exact key mapping.
+        # If key is not currently listed (common after a major completes),
+        # still treat it as usable historical mapping for this season flow.
+        previous_key = saved_mapping.get(major_code)
+        if previous_key and previous_key not in used_keys:
+            if previous_key in key_to_sport:
+                sport = key_to_sport[previous_key]
+                resolved.update({
+                    'sportKey': previous_key,
+                    'confidence': 'exact_key',
+                    'matchedFrom': 'saved_mapping',
+                    'matchScore': 100,
+                    'active': sport.get('active'),
+                    'hasOutrights': sport.get('has_outrights'),
+                    'notes': 'Matched previous saved mapping'
+                })
+            else:
+                resolved.update({
+                    'sportKey': previous_key,
+                    'confidence': 'archived_saved_key',
+                    'matchedFrom': 'saved_mapping_not_currently_listed',
+                    'matchScore': 70,
+                    'active': False,
+                    'hasOutrights': None,
+                    'notes': 'Using last-known key; currently not listed in Odds API sports discovery'
+                })
+
+            used_keys.add(previous_key)
+            result.append(resolved)
+            continue
+
+        # 2) Known fallback keys if available in discovery response.
+        fallback_match = None
+        for fallback_key in definition.get('fallbackKeys', []):
+            if fallback_key in key_to_sport and fallback_key not in used_keys:
+                fallback_match = key_to_sport[fallback_key]
+                break
+
+        if fallback_match:
+            fallback_key = fallback_match.get('key')
+            resolved.update({
+                'sportKey': fallback_key,
+                'confidence': 'fallback',
+                'matchedFrom': 'known_fallback_keys',
+                'matchScore': 90,
+                'active': fallback_match.get('active'),
+                'hasOutrights': fallback_match.get('has_outrights'),
+                'notes': 'Matched predefined fallback key'
+            })
+            used_keys.add(fallback_key)
+            result.append(resolved)
+            continue
+
+        # 3) Score all remaining candidates and pick best above threshold.
+        scored = []
+        for candidate in discovered_sports:
+            key = candidate.get('key')
+            if key in used_keys:
+                continue
+            score, reason = score_major_sport_candidate(major_code, candidate)
+            if score > 0:
+                scored.append((score, reason, candidate))
+
+        scored.sort(key=lambda row: row[0], reverse=True)
+        if scored and scored[0][0] >= 5:
+            top_score, top_reason, top_sport = scored[0]
+            top_key = top_sport.get('key')
+            resolved.update({
+                'sportKey': top_key,
+                'confidence': 'fuzzy',
+                'matchedFrom': 'keyword_scoring',
+                'matchScore': top_score,
+                'active': top_sport.get('active'),
+                'hasOutrights': top_sport.get('has_outrights'),
+                'notes': top_reason
+            })
+            used_keys.add(top_key)
+
+        result.append(resolved)
+
+    unresolved = [row for row in result if not row.get('sportKey')]
+    return {
+        'majors': result,
+        'isHealthy': len(unresolved) == 0,
+        'unresolvedMajors': [r['majorCode'] for r in unresolved],
+    }
+
+
+def get_major_definition(major_code):
+    """Return a major definition object by code."""
+    for definition in ODDS_MAJOR_DEFINITIONS:
+        if definition.get('majorCode') == major_code:
+            return definition
+    return None
+
+
+def resolve_major_sport_key(major_code, force_refresh=False, include_all=False):
+    """Resolve sport key for a major using discovery + fallback mapping logic."""
+    major_definition = get_major_definition(major_code)
+    if not major_definition:
+        return None, f"Unknown majorCode: {major_code}"
+
+    saved_mapping = get_saved_odds_major_mapping()
+    discovery, error = get_discovered_odds_golf_sports(include_all=include_all, force_refresh=force_refresh)
+    if error:
+        cache_key = ('odds_api_sports_discovery', bool(include_all))
+        if cache_key in CACHE:
+            discovery = CACHE[cache_key][0]
+        else:
+            return None, error
+
+    discovered_sports = discovery.get('sports', []) if isinstance(discovery, dict) else []
+    mapping = map_four_majors_to_sport_keys(discovered_sports, saved_mapping=saved_mapping)
+    by_major = {row.get('majorCode'): row for row in mapping.get('majors', []) if isinstance(row, dict)}
+    row = by_major.get(major_code)
+
+    # Fallback to all=true discovery if needed.
+    if (not row or not row.get('sportKey')) and not include_all:
+        all_discovery, all_error = get_discovered_odds_golf_sports(include_all=True, force_refresh=force_refresh)
+        if not all_error and isinstance(all_discovery, dict):
+            all_mapping = map_four_majors_to_sport_keys(all_discovery.get('sports', []), saved_mapping=saved_mapping)
+            all_by_major = {item.get('majorCode'): item for item in all_mapping.get('majors', []) if isinstance(item, dict)}
+            all_row = all_by_major.get(major_code)
+            if all_row and all_row.get('sportKey'):
+                row = all_row
+
+    if not row or not row.get('sportKey'):
+        return None, f"Could not resolve sport key for major {major_code}"
+
+    return row, None
+
+
+def compute_odds_api_expected_cost(regions, markets):
+    """Approximate Odds API call cost: number_of_regions * number_of_markets."""
+    region_count = len([r.strip() for r in str(regions or '').split(',') if r.strip()])
+    market_count = len([m.strip() for m in str(markets or '').split(',') if m.strip()])
+    if region_count <= 0:
+        region_count = 1
+    if market_count <= 0:
+        market_count = 1
+    return region_count * market_count
+
+
+def normalize_odds_api_outrights(odds_events, sport_key, major_code=None):
+    """Normalize Odds API outrights payload into DraftLockedOdds-compatible player rows."""
+    if not isinstance(odds_events, list):
+        return []
+
+    aggregate = {}
+    for event in odds_events:
+        if not isinstance(event, dict):
+            continue
+
+        event_id = event.get('id')
+        bookmakers = event.get('bookmakers', [])
+        if not isinstance(bookmakers, list):
+            continue
+
+        for bookmaker in bookmakers:
+            if not isinstance(bookmaker, dict):
+                continue
+
+            book_key = bookmaker.get('key') or bookmaker.get('title')
+            markets = bookmaker.get('markets', [])
+            if not isinstance(markets, list):
+                continue
+
+            for market in markets:
+                if not isinstance(market, dict):
+                    continue
+                if market.get('key') != 'outrights':
+                    continue
+
+                outcomes = market.get('outcomes', [])
+                if not isinstance(outcomes, list):
+                    continue
+
+                for outcome in outcomes:
+                    if not isinstance(outcome, dict):
+                        continue
+
+                    player_name = (outcome.get('name') or '').strip()
+                    if not player_name:
+                        continue
+
+                    raw_price = outcome.get('price')
+                    try:
+                        numeric_price = float(raw_price)
+                    except (TypeError, ValueError):
+                        continue
+
+                    norm_name = normalize_player_name(player_name)
+                    if not norm_name:
+                        continue
+
+                    if norm_name not in aggregate:
+                        aggregate[norm_name] = {
+                            'name': player_name,
+                            'prices': [],
+                            'eventIds': set(),
+                            'bookmakers': set(),
+                        }
+
+                    aggregate[norm_name]['prices'].append(numeric_price)
+                    if event_id:
+                        aggregate[norm_name]['eventIds'].add(str(event_id))
+                    if book_key:
+                        aggregate[norm_name]['bookmakers'].add(str(book_key))
+
+    normalized_rows = []
+    for player_data in aggregate.values():
+        prices = player_data.get('prices', [])
+        if not prices:
+            continue
+
+        average_odds = sum(prices) / len(prices)
+        normalized_rows.append({
+            'name': player_data.get('name'),
+            'averageOdds': round(average_odds, 2),
+            'playerId': None,
+            'photoUrl': None,
+            'bestOdds': min(prices),
+            'worstOdds': max(prices),
+            'source': 'odds_api',
+            'sourceMajor': major_code,
+            'sourceSportKey': sport_key,
+            'sourceEventIds': sorted(player_data.get('eventIds', set())),
+            'sourceBookCount': len(player_data.get('bookmakers', set())),
+            'lastSyncedAt': datetime.utcnow().isoformat()
+        })
+
+    normalized_rows.sort(key=lambda row: row['averageOdds'] if row['averageOdds'] is not None else float('inf'))
+    return normalized_rows
+
+
+def fetch_major_odds_snapshot(major_code, sport_key=None, regions='us', markets='outrights', odds_format='american', date_format='iso', force_refresh=False):
+    """Fetch and normalize major outright odds snapshot from Odds API."""
+    resolved = None
+    if sport_key:
+        resolved = {
+            'majorCode': major_code,
+            'sportKey': sport_key,
+            'confidence': 'explicit',
+            'matchedFrom': 'request_param',
+        }
+    else:
+        resolved, resolve_error = resolve_major_sport_key(major_code, force_refresh=force_refresh, include_all=False)
+        if resolve_error:
+            return None, resolve_error
+
+    target_sport_key = resolved.get('sportKey')
+    expected_cost = compute_odds_api_expected_cost(regions, markets)
+    params = {
+        'regions': regions,
+        'markets': markets,
+        'oddsFormat': odds_format,
+        'dateFormat': date_format,
+    }
+
+    odds_events, error = make_odds_api_request(
+        f"/sports/{target_sport_key}/odds/",
+        params=params,
+        expected_cost=expected_cost,
+        request_source=f"odds_api_major_odds_{major_code}"
+    )
+    if error:
+        return None, error
+
+    if not isinstance(odds_events, list):
+        return None, f"Unexpected odds response shape for sportKey {target_sport_key}"
+
+    normalized = normalize_odds_api_outrights(odds_events, target_sport_key, major_code=major_code)
+    normalized = enrich_player_odds_with_headshots(normalized)
+
+    return {
+        'majorCode': major_code,
+        'sportKey': target_sport_key,
+        'resolution': resolved,
+        'eventCount': len(odds_events),
+        'playerCount': len(normalized),
+        'players': normalized,
+    }, None
+
 # --- Tournament Status Detection Functions ---
 def get_tournament_status_from_api(api_response):
     """Extract tournament status from RapidAPI response"""
@@ -321,23 +1398,77 @@ def get_tournament_status_from_api(api_response):
         }
 
 # --- Persistent Score Storage Functions ---
+def _sanitize_for_firestore(value):
+    """Recursively unwrap BSON Extended JSON wrappers, strip '$'-prefixed keys,
+    and coerce all map keys to str so Firestore's protobuf encoder accepts the value.
+    Firestore raises 'TypeError: bad argument type for built-in operation' when a
+    nested map contains non-string keys or unsupported keys like '$numberInt'."""
+    if isinstance(value, dict):
+        # Unwrap common BSON Extended JSON shapes to native scalars
+        if len(value) == 1:
+            only_key = next(iter(value))
+            if only_key == '$numberInt' or only_key == '$numberLong':
+                try:
+                    return int(value[only_key])
+                except (TypeError, ValueError):
+                    return value[only_key]
+            if only_key == '$numberDouble' or only_key == '$numberDecimal':
+                try:
+                    return float(value[only_key])
+                except (TypeError, ValueError):
+                    return value[only_key]
+            if only_key == '$oid':
+                return str(value[only_key])
+            if only_key == '$date':
+                inner = value[only_key]
+                if isinstance(inner, dict) and '$numberLong' in inner:
+                    try:
+                        return int(inner['$numberLong'])
+                    except (TypeError, ValueError):
+                        return inner['$numberLong']
+                return inner
+        out = {}
+        for k, v in value.items():
+            if k is None:
+                continue
+            key_str = k if isinstance(k, str) else str(k)
+            if key_str.startswith('$'):
+                continue
+            out[key_str] = _sanitize_for_firestore(v)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_for_firestore(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    # Fallback: coerce unknown types (Decimal, datetime, bytes, etc.) to a string
+    try:
+        return str(value)
+    except Exception:
+        return None
+
 def store_calculated_scores(tournament_id, leaderboard_data, team_scores, metadata):
     """Store calculated team scores in Firestore for persistence"""
     if not db:
         return False
     
     try:
+        # Sanitize inputs to remove BSON Extended JSON wrappers and '$'-prefixed keys
+        # which Firestore rejects (raises TypeError: bad argument type for built-in operation).
+        safe_leaderboard = _sanitize_for_firestore(leaderboard_data)
+        safe_team_scores = _sanitize_for_firestore(team_scores)
+        safe_metadata = _sanitize_for_firestore(metadata)
+
         # Create score snapshot document
         score_snapshot = {
             'tournamentId': tournament_id,
-            'leaderboardData': leaderboard_data,
-            'teamScores': team_scores,
-            'metadata': metadata,
+            'leaderboardData': safe_leaderboard,
+            'teamScores': safe_team_scores,
+            'metadata': safe_metadata,
             'calculatedAt': firestore.SERVER_TIMESTAMP,
-            'tournamentStatus': leaderboard_data.get('tournamentStatus', {}),
-            'isOfficialComplete': leaderboard_data.get('isOfficiallyComplete', False),
-            'roundId': leaderboard_data.get('roundId'),
-            'dataHash': hashlib.md5(str(leaderboard_data.get('leaderboardRows', [])).encode()).hexdigest()
+            'tournamentStatus': safe_leaderboard.get('tournamentStatus', {}) if isinstance(safe_leaderboard, dict) else {},
+            'isOfficialComplete': safe_leaderboard.get('isOfficiallyComplete', False) if isinstance(safe_leaderboard, dict) else False,
+            'roundId': safe_leaderboard.get('roundId') if isinstance(safe_leaderboard, dict) else None,
+            'dataHash': hashlib.md5(str(safe_leaderboard.get('leaderboardRows', []) if isinstance(safe_leaderboard, dict) else []).encode()).hexdigest()
         }
         
         # Store in tournament_scores collection
@@ -347,16 +1478,16 @@ def store_calculated_scores(tournament_id, leaderboard_data, team_scores, metada
         # Also store in tournament document for easy access
         tournament_ref = db.collection('tournaments').document(tournament_id)
         tournament_ref.update({
-            'lastCalculatedScores': team_scores,
+            'lastCalculatedScores': safe_team_scores,
             'lastScoreCalculation': firestore.SERVER_TIMESTAMP,
-            'lastScoreMetadata': metadata
+            'lastScoreMetadata': safe_metadata
         })
         
         app.logger.info(f"Stored calculated scores for tournament {tournament_id}")
         return True
         
     except Exception as e:
-        app.logger.error(f"Error storing calculated scores: {e}")
+        app.logger.error(f"Error storing calculated scores: {e}", exc_info=True)
         return False
 
 def get_stored_scores(tournament_id, max_age_minutes=45):
@@ -557,19 +1688,33 @@ def sum_best_n_scores(scores_array, n):
 def calculate_team_scores(players, team_assignments, current_par):
     """Calculate team scores with correct cut player penalty"""
     teams_list = []
-    
-    # Debug logging
-    app.logger.info(f"Number of teams: {len(team_assignments) if team_assignments else 0}")
-    if team_assignments:
-        for i, t in enumerate(team_assignments):
-            t_keys = list(t.keys()) if isinstance(t, dict) else dir(t)
-            app.logger.info(f"Team {i} keys={t_keys}, type={type(t).__name__}")
-            # Log all possible name fields
-            for key in ['teamName', 'name', 'team_name', 'team']:
-                val = t.get(key) if isinstance(t, dict) else getattr(t, key, None)
-                if val is not None:
-                    app.logger.info(f"  Team {i} {key}='{val}' (type={type(val).__name__})")
-    
+
+    # Debug-only diagnostics. Was previously logged at info level on every request
+    # which produced O(teams * teams) info lines under Cloud Run load.
+    if app.logger.isEnabledFor(logging.DEBUG):
+        app.logger.debug(f"Number of teams: {len(team_assignments) if team_assignments else 0}")
+        if team_assignments:
+            for i, t in enumerate(team_assignments):
+                t_keys = list(t.keys()) if isinstance(t, dict) else dir(t)
+                app.logger.debug(f"Team {i} keys={t_keys}, type={type(t).__name__}")
+                for key in ['teamName', 'name', 'team_name', 'team']:
+                    val = t.get(key) if isinstance(t, dict) else getattr(t, key, None)
+                    if val is not None:
+                        app.logger.debug(f"  Team {i} {key}='{val}' (type={type(val).__name__})")
+
+    # O(1) name lookup index. Avoids the previous O(P) `next(...)` scan per golfer slot
+    # which made the whole function O(T * G * P).
+    players_list = players or []
+    name_index = {}
+    last_name_index = {}
+    for p in players_list:
+        full = normalize_name(f"{p.get('firstName', '')} {p.get('lastName', '')}")
+        if full and full not in name_index:
+            name_index[full] = p
+        last = normalize_name(p.get('lastName', ''))
+        if last:
+            last_name_index.setdefault(last, []).append(p)
+
     # Calculate worst score per round for penalty calculation
     # Cut players get the worst score from that specific round + 1 stroke
     # IMPORTANT: Can only calculate penalty AFTER the round is completed
@@ -579,7 +1724,7 @@ def calculate_team_scores(players, team_assignments, current_par):
         worst_score = None
         round_has_completed_scores = False
         
-        for player in players or []:
+        for player in players_list:
             # Only consider non-cut players who completed the round
             if player.get('status') != 'cut':
                 round_score = get_golfer_round_score(player, round_num, current_par)
@@ -603,22 +1748,22 @@ def calculate_team_scores(players, team_assignments, current_par):
         for golfer_name in team_def.get('golferNames', []):
             # Normalize the stored golfer name (handles Unicode, hyphens, etc.)
             normalized_stored_name = normalize_name(golfer_name)
-            
-            # Try exact match first using normalized names
-            found_player = next((p for p in players or [] 
-                               if normalize_name(f"{p.get('firstName', '')} {p.get('lastName', '')}") == normalized_stored_name), None)
-            
-            # If no exact match, try matching on last name only (handles Chris vs Christopher, Alex vs Alexander, etc.)
+
+            # O(1) exact full-name lookup.
+            found_player = name_index.get(normalized_stored_name)
+
+            # Last-name fallback (handles Chris vs Christopher, Alex vs Alexander, etc.).
             if not found_player:
                 name_parts = normalized_stored_name.split()
                 if len(name_parts) >= 2:
-                    last_name = name_parts[-1]  # Take the last word as last name
-                    found_player = next((p for p in players or [] 
-                                       if normalize_name(p.get('lastName', '')) == last_name and 
-                                       any(part in normalize_name(p.get('firstName', '')) or
-                                           normalize_name(p.get('firstName', '')) in part
-                                           for part in name_parts[:-1])), None)
-            
+                    last_name = name_parts[-1]
+                    candidates = last_name_index.get(last_name, [])
+                    for candidate in candidates:
+                        first = normalize_name(candidate.get('firstName', ''))
+                        if any(part in first or first in part for part in name_parts[:-1]):
+                            found_player = candidate
+                            break
+
             # Log if still not found
             if not found_player:
                 app.logger.warning(f"Could not find player '{golfer_name}' in leaderboard data")
@@ -741,46 +1886,411 @@ def calculate_team_scores(players, team_assignments, current_par):
     
     return teams_list
 
+def parse_tournament_start_date(start_date_value):
+    """Parse tournament start date from Firestore fields into a date object."""
+    if not start_date_value:
+        return None
+
+    try:
+        if isinstance(start_date_value, datetime):
+            return start_date_value.date()
+
+        start_date_str = str(start_date_value).strip()
+        if not start_date_str:
+            return None
+
+        # Most tournament docs store dates as YYYY-MM-DD
+        if len(start_date_str) >= 10:
+            return datetime.strptime(start_date_str[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+    return None
+
+def build_not_started_team_scores(team_assignments):
+    """Return placeholder team score rows so leaderboard tables stay visible pre-tournament."""
+    placeholder_rows = []
+
+    for idx, team_def in enumerate(team_assignments or []):
+        team_name = None
+        for name_key in ['teamName', 'name', 'team_name', 'team']:
+            if isinstance(team_def, dict):
+                val = team_def.get(name_key)
+            else:
+                val = getattr(team_def, name_key, None)
+            if val and str(val).strip():
+                team_name = str(val).strip()
+                break
+
+        if not team_name:
+            team_name = f"Team {idx + 1}"
+
+        golfers = []
+        for golfer_name in (team_def.get('golferNames', []) if isinstance(team_def, dict) else []):
+            golfers.append({
+                'name': golfer_name,
+                'status': '',
+                'thru': '',
+                'r1': {'score': None, 'isLive': False, 'isPenalty': False},
+                'r2': {'score': None, 'isLive': False, 'isPenalty': False},
+                'r3': {'score': None, 'isLive': False, 'isPenalty': False},
+                'r4': {'score': None, 'isLive': False, 'isPenalty': False},
+                'total': None,
+                'isCut': False,
+                'cutPenaltyScore': None,
+            })
+
+        placeholder_rows.append({
+            'teamName': team_name,
+            'totalScore': None,
+            'players': golfers,
+            'cutPlayersCount': 0,
+            'penaltyStrokesApplied': 0,
+            'worstRoundScores': {'r1': None, 'r2': None, 'r3': None, 'r4': None},
+            'validRounds': 0,
+            'roundDetails': {
+                'r1': {'score': None, 'penaltyScores': 0, 'validScores': 0},
+                'r2': {'score': None, 'penaltyScores': 0, 'validScores': 0},
+                'r3': {'score': None, 'penaltyScores': 0, 'validScores': 0},
+                'r4': {'score': None, 'penaltyScores': 0, 'validScores': 0},
+            }
+        })
+
+    return placeholder_rows
+
 # --- Optimized RapidAPI Integration Functions ---
+
+# Circuit breaker for RapidAPI. When the upstream is flapping (e.g. 5xx or timeouts),
+# tripping the breaker prevents us from spending the rate-limit budget and request
+# latency on guaranteed-failing calls. Closed -> Open after `FAILURE_THRESHOLD` failures
+# in `WINDOW_SEC`. Stays Open for `COOLDOWN_SEC`, then Half-Open (one probe allowed).
+_RAPIDAPI_BREAKER = {
+    'failures': [],          # list of failure timestamps within the window
+    'state': 'closed',       # 'closed' | 'open' | 'half_open'
+    'opened_at': 0.0,
+}
+_BREAKER_FAILURE_THRESHOLD = 5
+_BREAKER_WINDOW_SEC = 60
+_BREAKER_COOLDOWN_SEC = 30
+
+
+def _breaker_record_success():
+    _RAPIDAPI_BREAKER['failures'].clear()
+    _RAPIDAPI_BREAKER['state'] = 'closed'
+    _RAPIDAPI_BREAKER['opened_at'] = 0.0
+
+
+def _breaker_record_failure():
+    now = time.time()
+    failures = _RAPIDAPI_BREAKER['failures']
+    failures.append(now)
+    cutoff = now - _BREAKER_WINDOW_SEC
+    _RAPIDAPI_BREAKER['failures'] = [t for t in failures if t >= cutoff]
+    if len(_RAPIDAPI_BREAKER['failures']) >= _BREAKER_FAILURE_THRESHOLD:
+        if _RAPIDAPI_BREAKER['state'] != 'open':
+            app.logger.warning(
+                f"RapidAPI circuit breaker OPEN after {len(_RAPIDAPI_BREAKER['failures'])} failures"
+            )
+        _RAPIDAPI_BREAKER['state'] = 'open'
+        _RAPIDAPI_BREAKER['opened_at'] = now
+
+
+def _breaker_should_block():
+    """Returns (blocked, reason) for the current request."""
+    state = _RAPIDAPI_BREAKER['state']
+    if state == 'closed':
+        return False, None
+    now = time.time()
+    if state == 'open':
+        if now - _RAPIDAPI_BREAKER['opened_at'] >= _BREAKER_COOLDOWN_SEC:
+            # Move to half-open: allow this one request through as a probe.
+            _RAPIDAPI_BREAKER['state'] = 'half_open'
+            return False, None
+        return True, 'circuit_open'
+    # half_open: a probe is already in flight; block additional concurrent calls
+    return True, 'circuit_half_open'
+
+
 def make_rapidapi_request(endpoint, params=None, bypass_rate_limit=False, request_source="api_call"):
     """Make a rate-limited request to RapidAPI using response headers for rate limiting"""
     if not bypass_rate_limit and not check_rate_limit():
         rate_status = get_rate_limit_status()
         app.logger.warning(f"Rate limit exceeded for {request_source}: {rate_status}")
         return None, f"Rate limit exceeded. Remaining: {rate_status['rapidapi_remaining']}/{rate_status['rapidapi_limit']}"
-    
+
+    blocked, reason = _breaker_should_block()
+    if blocked:
+        app.logger.warning(f"RapidAPI circuit breaker blocking request ({reason}) for {request_source}")
+        return None, f"Upstream temporarily unavailable ({reason})"
+
     headers = {
         "X-RapidAPI-Key": RAPIDAPI_KEY,
         "X-RapidAPI-Host": RAPIDAPI_HOST
     }
-    
+
     try:
         log_api_call()  # For compatibility (now a no-op)
         app.logger.info(f"Making RapidAPI request to {endpoint} (source: {request_source})")
-        response = requests.get(f"{RAPIDAPI_BASE_URL}{endpoint}", headers=headers, params=params)
-        
+        response = requests.get(f"{RAPIDAPI_BASE_URL}{endpoint}", headers=headers, params=params, timeout=15)
+
         # Update rate limit info from response headers
         update_rate_limit_info(response.headers)
-        
+
         response.raise_for_status()
+        _breaker_record_success()
         app.logger.info(f"RapidAPI request successful: {response.status_code}")
         return response.json(), None
     except requests.exceptions.RequestException as e:
         error_msg = f"RapidAPI request failed for {request_source}: {e}"
+        status_code = None
         if hasattr(e, 'response') and e.response is not None:
-            error_msg += f" | Status: {e.response.status_code} | Content: {e.response.text}"
-            # Still try to update rate limit info even on error
-            if hasattr(e, 'response') and e.response is not None:
-                update_rate_limit_info(e.response.headers)
+            status_code = e.response.status_code
+            error_msg += f" | Status: {status_code} | Content: {e.response.text}"
+            update_rate_limit_info(e.response.headers)
+        # Treat 5xx, timeouts, and connection errors as failures for the breaker;
+        # do NOT count 4xx (those are caller errors, not upstream outages).
+        is_upstream_failure = (
+            isinstance(e, (requests.exceptions.Timeout, requests.exceptions.ConnectionError))
+            or (status_code is not None and 500 <= status_code < 600)
+        )
+        if is_upstream_failure:
+            _breaker_record_failure()
         app.logger.error(error_msg)
         return None, error_msg
 
 # --- Enhanced API Routes ---
 
+@app.route('/healthz', methods=['GET'])
+def healthz():
+    """Liveness probe. Returns 200 without touching Firestore or RapidAPI so the
+    container can pass health checks even if downstreams are temporarily down."""
+    return jsonify({'status': 'ok', 'firestore': db is not None}), 200
+
+
 @app.route('/api/rate_limit_status', methods=['GET'])
 def get_api_rate_limit_status():
     """Get current API rate limit status"""
     return jsonify(get_rate_limit_status())
+
+
+@app.route('/api/odds_api_status', methods=['GET'])
+def get_odds_api_status():
+    """Get Odds API monthly usage state and local guardrail status."""
+    return jsonify(get_odds_api_rate_limit_status(refresh_from_firestore=True))
+
+
+@app.route('/api/odds_api/sports', methods=['GET'])
+def get_odds_api_sports():
+    """Step 1 helper: list in-season sports from Odds API with quota-safe controls."""
+    include_all = request.args.get('all', 'false').lower() == 'true'
+    params = {'all': 'true'} if include_all else {}
+
+    # /sports is a zero-cost endpoint according to Odds API docs.
+    data, error = make_odds_api_request(
+        '/sports/',
+        params=params,
+        expected_cost=0,
+        request_source='odds_api_sports_discovery'
+    )
+    if error:
+        return jsonify({'error': error}), 500
+
+    if not isinstance(data, list):
+        return jsonify({'error': 'Unexpected Odds API sports response shape'}), 500
+
+    return jsonify({
+        'sports': data,
+        'count': len(data),
+        'oddsApiUsage': get_odds_api_rate_limit_status(refresh_from_firestore=False)
+    })
+
+
+@app.route('/api/odds_api/major_sport_keys', methods=['GET'])
+def get_odds_api_major_sport_keys():
+    """Phase 1 endpoint: discover golf sports and map them to the 4 majors."""
+    include_all = request.args.get('all', 'false').lower() == 'true'
+    force_refresh = request.args.get('forceRefresh', 'false').lower() == 'true'
+    persist_healthy = request.args.get('persist', 'true').lower() == 'true'
+
+    discovery, error = get_discovered_odds_golf_sports(include_all=include_all, force_refresh=force_refresh)
+    if error:
+        # On discovery failure, try a stale cache payload first.
+        cache_key = ('odds_api_sports_discovery', bool(include_all))
+        stale_payload = None
+        if cache_key in CACHE:
+            stale_payload = CACHE[cache_key][0]
+
+        if not stale_payload:
+            return jsonify({'error': error}), 500
+
+        discovery = stale_payload
+
+    discovered_sports = discovery.get('sports', []) if isinstance(discovery, dict) else []
+    saved_mapping = get_saved_odds_major_mapping()
+    mapping = map_four_majors_to_sport_keys(discovered_sports, saved_mapping=saved_mapping)
+
+    # If active-only discovery leaves gaps, auto-fallback to all=true discovery.
+    all_sports_fallback_used = False
+    if not include_all and mapping.get('unresolvedMajors'):
+        all_discovery, all_error = get_discovered_odds_golf_sports(include_all=True, force_refresh=force_refresh)
+        if not all_error and isinstance(all_discovery, dict):
+            all_sports = all_discovery.get('sports', [])
+            all_mapping = map_four_majors_to_sport_keys(all_sports, saved_mapping=saved_mapping)
+
+            if isinstance(all_mapping, dict) and isinstance(all_mapping.get('majors'), list):
+                by_major_all = {row['majorCode']: row for row in all_mapping['majors'] if isinstance(row, dict) and row.get('majorCode')}
+                for row in mapping['majors']:
+                    if row.get('sportKey'):
+                        continue
+                    replacement = by_major_all.get(row.get('majorCode'))
+                    if replacement and replacement.get('sportKey'):
+                        row.update(replacement)
+                        row['matchedFrom'] = f"{replacement.get('matchedFrom')}_all_sports_fallback"
+                        row['notes'] = (replacement.get('notes') or '') + ' | Resolved via all=true discovery fallback'
+                        all_sports_fallback_used = True
+
+                mapping['unresolvedMajors'] = [r['majorCode'] for r in mapping['majors'] if not r.get('sportKey')]
+                mapping['isHealthy'] = len(mapping['unresolvedMajors']) == 0
+
+    # If unresolved, keep previous saved key for unresolved majors when available.
+    if not mapping['isHealthy'] and saved_mapping:
+        key_to_sport = {sport.get('key'): sport for sport in discovered_sports}
+        for row in mapping['majors']:
+            if row.get('sportKey'):
+                continue
+            fallback_key = saved_mapping.get(row['majorCode'])
+            if fallback_key and fallback_key in key_to_sport:
+                sport = key_to_sport[fallback_key]
+                row.update({
+                    'sportKey': fallback_key,
+                    'confidence': 'fallback_saved',
+                    'matchedFrom': 'saved_mapping_unresolved_fallback',
+                    'matchScore': 50,
+                    'active': sport.get('active'),
+                    'hasOutrights': sport.get('has_outrights'),
+                    'notes': 'Recovered from saved mapping due to unresolved live match'
+                })
+
+        mapping['unresolvedMajors'] = [r['majorCode'] for r in mapping['majors'] if not r.get('sportKey')]
+        mapping['isHealthy'] = len(mapping['unresolvedMajors']) == 0
+
+    if persist_healthy and mapping['isHealthy']:
+        to_save = {row['majorCode']: row['sportKey'] for row in mapping['majors'] if row.get('sportKey')}
+        save_odds_major_mapping(to_save)
+
+    return jsonify({
+        'majors': mapping['majors'],
+        'unresolvedMajors': mapping['unresolvedMajors'],
+        'isHealthy': mapping['isHealthy'],
+        'sportsCandidateCount': len(discovered_sports),
+        'discoveredAt': discovery.get('discoveredAt') if isinstance(discovery, dict) else None,
+        'includeAll': include_all,
+        'forceRefresh': force_refresh,
+        'usedAllSportsFallback': all_sports_fallback_used,
+        'savedMappingCount': len(saved_mapping),
+        'oddsApiUsage': get_odds_api_rate_limit_status(refresh_from_firestore=False)
+    })
+
+
+@app.route('/api/odds_api/major_odds', methods=['GET'])
+def get_odds_api_major_odds():
+    """Phase 2 endpoint: fetch normalized outright odds for a major."""
+    major_code = (request.args.get('majorCode') or '').strip()
+    sport_key = (request.args.get('sportKey') or '').strip() or None
+    regions = (request.args.get('regions') or 'us').strip()
+    markets = (request.args.get('markets') or 'outrights').strip()
+    odds_format = (request.args.get('oddsFormat') or 'american').strip()
+    date_format = (request.args.get('dateFormat') or 'iso').strip()
+    force_refresh = request.args.get('forceRefresh', 'false').lower() == 'true'
+
+    if not major_code:
+        return jsonify({'error': 'Missing required parameter: majorCode'}), 400
+
+    snapshot, error = fetch_major_odds_snapshot(
+        major_code=major_code,
+        sport_key=sport_key,
+        regions=regions,
+        markets=markets,
+        odds_format=odds_format,
+        date_format=date_format,
+        force_refresh=force_refresh,
+    )
+    if error:
+        return jsonify({'error': error}), 500
+
+    return jsonify({
+        'majorCode': snapshot['majorCode'],
+        'sportKey': snapshot['sportKey'],
+        'resolution': snapshot['resolution'],
+        'eventCount': snapshot['eventCount'],
+        'playerCount': snapshot['playerCount'],
+        'players': snapshot['players'],
+        'oddsApiUsage': get_odds_api_rate_limit_status(refresh_from_firestore=False)
+    })
+
+
+@app.route('/api/tournaments/<tournament_id>/sync_odds_api', methods=['POST'])
+@require_tournament_admin()
+def sync_tournament_odds_from_odds_api(tournament_id):
+    """Phase 2 sync endpoint: write normalized Odds API odds into tournament DraftLockedOdds."""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+
+    body = request.get_json(silent=True) or {}
+    major_code = (body.get('majorCode') or '').strip()
+    sport_key = (body.get('sportKey') or '').strip() or None
+    regions = (body.get('regions') or 'us').strip()
+    markets = (body.get('markets') or 'outrights').strip()
+    odds_format = (body.get('oddsFormat') or 'american').strip()
+    date_format = (body.get('dateFormat') or 'iso').strip()
+    force_refresh = bool(body.get('forceRefresh', False))
+    persist_draft_locked_odds = bool(body.get('persistDraftLockedOdds', True))
+
+    if not major_code:
+        return jsonify({'error': 'Missing required field in body: majorCode'}), 400
+
+    doc_ref = db.collection('tournaments').document(tournament_id)
+    doc = doc_ref.get()
+    if not doc.exists:
+        return jsonify({'error': 'Tournament not found'}), 404
+
+    snapshot, error = fetch_major_odds_snapshot(
+        major_code=major_code,
+        sport_key=sport_key,
+        regions=regions,
+        markets=markets,
+        odds_format=odds_format,
+        date_format=date_format,
+        force_refresh=force_refresh,
+    )
+    if error:
+        return jsonify({'error': error}), 500
+
+    update_data = {
+        'oddsSource': 'odds_api',
+        'oddsMajorCode': major_code,
+        'oddsSportKey': snapshot['sportKey'],
+        'oddsSyncStatus': 'success',
+        'oddsSourceVersion': 'v2_phase2',
+        'oddsLastSyncAt': firestore.SERVER_TIMESTAMP,
+        'oddsEventCount': snapshot['eventCount'],
+        'oddsPlayerCount': snapshot['playerCount'],
+    }
+    if persist_draft_locked_odds:
+        update_data['DraftLockedOdds'] = snapshot['players']
+
+    doc_ref.update(update_data)
+
+    return jsonify({
+        'message': f"Synced Odds API odds for tournament {tournament_id}",
+        'tournamentId': tournament_id,
+        'majorCode': major_code,
+        'sportKey': snapshot['sportKey'],
+        'eventCount': snapshot['eventCount'],
+        'playerCount': snapshot['playerCount'],
+        'persistDraftLockedOdds': persist_draft_locked_odds,
+        'oddsApiUsage': get_odds_api_rate_limit_status(refresh_from_firestore=False)
+    })
 
 @app.route('/api/debug_rate_limit', methods=['GET'])
 def debug_rate_limit():
@@ -840,6 +2350,190 @@ def get_tournament_schedule():
     
     return jsonify(data)
 
+@app.route('/api/odds_tournaments', methods=['GET'])
+def get_odds_tournaments():
+    """Get SportsData.io tournament list for a season to help admins pick oddsId"""
+    year = request.args.get('year', str(datetime.now().year))
+    url = f"https://api.sportsdata.io/golf/v2/json/Tournaments/{year}"
+    params = {"key": SPORTSDATA_IO_API_KEY}
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        tournaments = resp.json()
+        result = [
+            {
+                "oddsId": str(t["TournamentID"]),
+                "name": t.get("Name", ""),
+                "startDate": t.get("StartDate", ""),
+                "endDate": t.get("EndDate", ""),
+            }
+            for t in tournaments
+            if isinstance(t, dict) and t.get("TournamentID")
+        ]
+        return jsonify(result)
+    except requests.exceptions.RequestException as e:
+        app.logger.error(f"Error fetching SportsData.io tournaments for year {year}: {e}")
+        return jsonify({"error": str(e)}), 500
+    except (ValueError, KeyError) as e:
+        app.logger.error(f"Error parsing SportsData.io tournaments response: {e}")
+        return jsonify({"error": "Failed to parse tournament data"}), 500
+
+# ---------------------------------------------------------------------------
+# Season Config endpoints
+# ---------------------------------------------------------------------------
+SEASON_CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'season_config.json')
+
+def _normalize_name(name):
+    """Lowercase, strip non-alphanumeric for fuzzy name matching."""
+    import re
+    return re.sub(r'[^a-z0-9]', '', name.lower())
+
+def _deduplicate_team_names(teams):
+    """If multiple teams have the same name, append the email prefix to make each unique."""
+    from collections import Counter
+    name_counts = Counter(t['name'] for t in teams)
+    seen = {}
+    for team in teams:
+        if name_counts[team['name']] > 1:
+            email = team.get('ownerEmail', '')
+            suffix = email.split('@')[0] if email else team.get('ownerUid', '')[:6]
+            base = team['name']
+            unique = f"{base} ({suffix})"
+            # Handle the rare case where even the suffix collides
+            if unique in seen:
+                unique = f"{base} ({team.get('ownerUid', '')[:8]})"
+            team['name'] = unique
+            seen[unique] = True
+    return teams
+
+def _deduplicate_team_names(teams):
+    """If multiple teams have the same name, append the email prefix to make each unique."""
+    from collections import Counter
+    name_counts = Counter(t['name'] for t in teams)
+    seen = {}
+    for team in teams:
+        if name_counts[team['name']] > 1:
+            email = team.get('ownerEmail', '')
+            suffix = email.split('@')[0] if email else team.get('ownerUid', '')[:6]
+            base = team['name']
+            unique = f"{base} ({suffix})"
+            # Handle the rare case where even the suffix collides
+            if unique in seen:
+                unique = f"{base} ({team.get('ownerUid', '')[:8]})"
+            team['name'] = unique
+            seen[unique] = True
+    return teams
+
+def _parse_rapidapi_date(raw):
+    """Parse a RapidAPI date value (str or MongoDB extended JSON dict) to a YYYY-MM-DD string."""
+    if isinstance(raw, str):
+        return raw[:10] or None
+    elif isinstance(raw, dict):
+        ms_val = raw.get('$date') or raw.get('$numberLong')
+        if isinstance(ms_val, dict):
+            ms_val = ms_val.get('$numberLong')
+        try:
+            return datetime.utcfromtimestamp(int(ms_val) / 1000).strftime('%Y-%m-%d')
+        except (TypeError, ValueError):
+            return None
+    return None
+
+@app.route('/api/season_config', methods=['GET'])
+def get_season_config():
+    """Return the pre-configured tournament list for a given year from season_config.json."""
+    year = request.args.get('year', str(datetime.now().year))
+    try:
+        with open(SEASON_CONFIG_PATH, 'r') as f:
+            config = json.load(f)
+        return jsonify(config.get(year, []))
+    except FileNotFoundError:
+        return jsonify([])
+    except Exception as e:
+        app.logger.error(f"Error reading season_config.json: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/season_config/build', methods=['GET'])
+def build_season_config():
+    """Auto-build a season config suggestion by fetching both APIs and name-matching.
+    Returns a list of matched entries the admin can paste into season_config.json."""
+    year = request.args.get('year', str(datetime.now().year))
+    org_id = request.args.get('orgId', '1')
+
+    try:
+        # Fetch PGA schedule (RapidAPI) — bypass rate limit since this is a one-time admin tool
+        schedule_data, sched_error = make_rapidapi_request(
+            '/schedule', {'year': year, 'orgId': org_id},
+            bypass_rate_limit=True,
+            request_source="season_config_build"
+        )
+        if sched_error:
+            return jsonify({"error": f"Schedule fetch failed: {sched_error}"}), 500
+        schedule_items = schedule_data.get('schedule', []) if schedule_data else []
+
+        # Fetch SportsData.io odds tournament list (non-fatal: proceed without if it fails)
+        odds_items = []
+        odds_error = None
+        try:
+            odds_resp = requests.get(
+                f"https://api.sportsdata.io/golf/v2/json/Tournaments/{year}",
+                params={"key": SPORTSDATA_IO_API_KEY},
+                timeout=10
+            )
+            odds_resp.raise_for_status()
+            odds_items = [
+                {"oddsId": str(t["TournamentID"]), "name": t.get("Name", ""), "startDate": t.get("StartDate", "")}
+                for t in odds_resp.json()
+                if isinstance(t, dict) and t.get("TournamentID")
+            ]
+        except Exception as e:
+            odds_error = str(e)
+            app.logger.warning(f"SportsData.io fetch failed (non-fatal): {e}")
+
+        # Name-match schedule items to odds items
+        result = []
+        for item in schedule_items:
+            sched_name = item.get('name', '')
+            norm = _normalize_name(sched_name)
+
+            # Parse start/end dates from schedule item
+            date_field = item.get('date', {})
+            if isinstance(date_field, str):
+                start_date = _parse_rapidapi_date(date_field)
+                end_date = None
+            elif isinstance(date_field, dict):
+                start_date = _parse_rapidapi_date(date_field.get('start'))
+                end_date = _parse_rapidapi_date(date_field.get('end'))
+            else:
+                start_date = None
+                end_date = None
+
+            match = (
+                next((t for t in odds_items if _normalize_name(t['name']) == norm), None) or
+                next((t for t in odds_items if _normalize_name(t['name'])[:8] == norm[:8]), None) or
+                next((t for t in odds_items if norm[:8] in _normalize_name(t['name'])), None)
+            )
+
+            entry = {
+                "name": sched_name,
+                "year": year,
+                "tournId": item.get('tournId', ''),
+                "startDate": start_date,
+                "endDate": end_date,
+                "oddsId": match['oddsId'] if match else "",
+                "oddsName": match['name'] if match else "",
+                "matched": bool(match),
+            }
+            result.append(entry)
+
+        response_data = {"tournaments": result, "count": len(result)}
+        if odds_error:
+            response_data["oddsWarning"] = f"SportsData.io unavailable ({odds_error}) — oddsId fields are empty"
+        return jsonify(response_data)
+
+    except Exception as e:
+        app.logger.error(f"build_season_config error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/api/tournament_info', methods=['GET'])
 @cache.cached(timeout=TOURNAMENT_CACHE_TTL)
 def get_tournament_info():
@@ -861,6 +2555,26 @@ def get_tournament_info():
     
     return jsonify(data)
 
+def _leaderboard_response(payload):
+    """Wrap a leaderboard payload with Cache-Control headers based on data freshness.
+
+    - live  -> short browser cache + SWR window so quick re-loads are instant
+    - stored / not_started / official complete -> longer cache
+    The server-side `CACHE` is still authoritative; these headers just help
+    browsers and any future CDN absorb duplicate page loads.
+    """
+    resp = jsonify(payload)
+    freshness = (payload or {}).get('dataFreshness')
+    is_complete = (payload or {}).get('isOfficiallyComplete', False)
+    if freshness == 'live' and not is_complete:
+        resp.headers['Cache-Control'] = 'public, max-age=30, stale-while-revalidate=300'
+    elif freshness in ('stored', 'not_started') or is_complete:
+        resp.headers['Cache-Control'] = 'public, max-age=600'
+    else:
+        resp.headers['Cache-Control'] = 'public, max-age=30'
+    return resp
+
+
 @app.route('/api/leaderboard', methods=['GET'])
 def get_optimized_leaderboard():
     """Get optimized leaderboard with team score calculations"""
@@ -873,12 +2587,13 @@ def get_optimized_leaderboard():
     tournament_id = request.args.get('tournamentId')  # For team calculations
     force_refresh = request.args.get('forceRefresh', 'false').lower() == 'true'
     
-    # Create cache key
+    # Create cache key. Normalize falsy round_id to empty string so callers passing
+    # `roundId=` and callers omitting the param share the same cache slot.
     cache_key_params = {
         'orgId': org_id,
         'tournId': tourn_id,
         'year': year,
-        'roundId': round_id,
+        'roundId': round_id or '',
         'calculateTeams': calculate_teams,
         'tournamentId': tournament_id
     }
@@ -888,12 +2603,12 @@ def get_optimized_leaderboard():
     if not force_refresh and cache_key in CACHE:
         cached_data, timestamp = CACHE[cache_key]
         if (time.time() - timestamp) < LEADERBOARD_CACHE_TTL:
-            app.logger.info("Returning cached leaderboard data")
-            return jsonify(cached_data)
+            app.logger.debug("Returning cached leaderboard data")
+            return _leaderboard_response(cached_data)
         else:
-            app.logger.info("Cache expired, fetching fresh data")
+            app.logger.debug("Cache expired, fetching fresh data")
     else:
-        app.logger.info("No cache data or force refresh requested, fetching fresh data")
+        app.logger.debug("No cache data or force refresh requested, fetching fresh data")
     
     # --- Skip RapidAPI if tournament is complete or not started ---
     if tournament_id and db:
@@ -915,15 +2630,18 @@ def get_optimized_leaderboard():
                             'dataFreshness': 'stored'
                         }
                         CACHE[cache_key] = (result, time.time())
-                        return jsonify(result)
+                        return _leaderboard_response(result)
 
                 is_active = t_data.get('isActive', False)
                 is_draft_complete = t_data.get('IsDraftComplete', False)
                 has_stored_scores = t_data.get('lastCalculatedScores') is not None
-                if not is_complete and not is_active and not has_stored_scores and not is_draft_complete:
+                tournament_start_date = parse_tournament_start_date(t_data.get('startDate'))
+                tournament_not_started_by_date = bool(tournament_start_date and tournament_start_date > datetime.now().date())
+                if not is_complete and not has_stored_scores and (tournament_not_started_by_date or (not is_active and not is_draft_complete)):
                     app.logger.info(f"Tournament {tournament_id} has not started — skipping RapidAPI call")
-                    return jsonify({
-                        'teamScores': [],
+                    placeholder_scores = build_not_started_team_scores(t_data.get('teams', []))
+                    return _leaderboard_response({
+                        'teamScores': placeholder_scores,
                         'isOfficiallyComplete': False,
                         'tournamentStatus': {'status': 'Not Started', 'isOfficialComplete': False, 'isInProgress': False},
                         'dataFreshness': 'not_started',
@@ -942,12 +2660,20 @@ def get_optimized_leaderboard():
                                        bypass_rate_limit=False, 
                                        request_source="user_leaderboard_request")
     if error:
-        # If we hit rate limits, try to return cached data even if expired
-        if "Rate limit" in error and cache_key in CACHE:
+        # On any upstream failure (rate limit, 5xx, timeout, circuit breaker), prefer
+        # returning the previous good payload (even if expired) over an error page.
+        if cache_key in CACHE:
             cached_data, timestamp = CACHE[cache_key]
-            app.logger.warning(f"Rate limited, returning expired cache data from {timestamp}")
-            return jsonify({**cached_data, 'fromExpiredCache': True, 'cacheWarning': 'Data may be outdated due to API rate limits'})
-        return jsonify({"error": error}), 429 if "Rate limit" in error else 500
+            app.logger.warning(
+                f"Upstream error '{error}', returning expired cache data from {timestamp}"
+            )
+            return _leaderboard_response({
+                **cached_data,
+                'fromExpiredCache': True,
+                'cacheWarning': f'Upstream temporarily unavailable: {error}',
+            })
+        status_code = 429 if "Rate limit" in error else 503 if "circuit" in error.lower() else 500
+        return jsonify({"error": error}), status_code
     
     # Add tournament status information
     tournament_status = get_tournament_status_from_api(data)
@@ -1009,10 +2735,11 @@ def get_optimized_leaderboard():
     
     # Cache the result
     CACHE[cache_key] = (enhanced_data, time.time())
-    
-    return jsonify(enhanced_data)
+
+    return _leaderboard_response(enhanced_data)
 
 @app.route('/api/tournaments/<tournament_id>/leaderboard', methods=['GET'])
+@require_tournament_member()
 def get_tournament_leaderboard(tournament_id):
     """Get leaderboard data for a specific tournament (backwards compatibility)"""
     if not db:
@@ -1067,10 +2794,13 @@ def get_tournament_leaderboard(tournament_id):
         is_active = tournament_data.get('isActive', False)
         is_draft_complete = tournament_data.get('IsDraftComplete', False)
         has_stored_scores = tournament_data.get('lastCalculatedScores') is not None
-        if not is_active and not has_stored_scores and not is_draft_complete:
+        tournament_start_date = parse_tournament_start_date(tournament_data.get('startDate'))
+        tournament_not_started_by_date = bool(tournament_start_date and tournament_start_date > datetime.now().date())
+        if not has_stored_scores and (tournament_not_started_by_date or (not is_active and not is_draft_complete)):
             app.logger.info(f"Tournament {tournament_id} has not started — skipping RapidAPI call")
+            placeholder_scores = build_not_started_team_scores(tournament_data.get('teams', []))
             return jsonify({
-                'teamScores': [],
+                'teamScores': placeholder_scores,
                 'isOfficiallyComplete': False,
                 'tournamentStatus': {'status': 'Not Started', 'isOfficialComplete': False, 'isInProgress': False},
                 'dataFreshness': 'not_started',
@@ -1157,6 +2887,7 @@ def get_tournament_leaderboard(tournament_id):
 
 
 @app.route('/api/tournaments/<tournament_id>/player_scores', methods=['GET'])
+@require_tournament_member()
 def get_tournament_player_scores(tournament_id):
     """Get individual player leaderboard scores for a tournament (for Tournament Scores view)"""
     if not db:
@@ -1179,32 +2910,46 @@ def get_tournament_player_scores(tournament_id):
 
         cache_key = ('player_scores', tournament_id)
 
-        # For completed tournaments, return stored leaderboard rows
+        # For completed tournaments, return stored leaderboard rows. We read the
+        # detailed `tournament_scores/<id>_latest` snapshot directly because
+        # `get_stored_scores()` prefers the tournament doc's `lastCalculatedScores`
+        # (team-level only — no `leaderboardData`). If neither snapshot has rows,
+        # we fall through to the live-fetch path below and persist the result so
+        # the final scoreboard becomes permanent.
         is_complete = tournament_data.get('isOfficiallyComplete', False) or tournament_data.get('isComplete', False)
         if is_complete:
             if cache_key in CACHE:
                 cached_data, _ = CACHE[cache_key]
-                return jsonify(cached_data)
-            stored_results = get_stored_scores(tournament_id, max_age_minutes=None)
+                if cached_data.get('leaderboardRows'):
+                    return jsonify(cached_data)
+
             rows = []
-            if stored_results:
-                leaderboard_data = stored_results.get('leaderboardData', {})
-                rows = leaderboard_data.get('leaderboardRows', [])
-            result = {
-                'leaderboardRows': rows,
-                'isOfficiallyComplete': True,
-                'isInProgress': False,
-                'tournamentStatus': 'Official',
-                'dataFreshness': 'stored'
-            }
-            CACHE[cache_key] = (result, time.time())
-            return jsonify(result)
+            try:
+                snapshot = db.collection('tournament_scores').document(f"{tournament_id}_latest").get()
+                if snapshot.exists:
+                    snapshot_data = snapshot.to_dict() or {}
+                    rows = (snapshot_data.get('leaderboardData') or {}).get('leaderboardRows') or []
+            except Exception as snap_err:
+                app.logger.warning(f"Could not read tournament_scores snapshot for {tournament_id}: {snap_err}")
+
+            if rows:
+                result = {
+                    'leaderboardRows': rows,
+                    'isOfficiallyComplete': True,
+                    'isInProgress': False,
+                    'tournamentStatus': 'Official',
+                    'dataFreshness': 'stored'
+                }
+                CACHE[cache_key] = (result, time.time())
+                return jsonify(result)
+            # else: no stored rows — fall through to live fetch + persist below.
+            app.logger.info(f"Completed tournament {tournament_id} has no stored leaderboard rows; fetching live and persisting.")
 
         # For tournaments that have not started
         is_draft_complete = tournament_data.get('IsDraftComplete', False)
         is_active = tournament_data.get('isActive', False)
         has_stored_scores = tournament_data.get('lastCalculatedScores') is not None
-        if not is_active and not has_stored_scores and not is_draft_complete:
+        if not is_complete and not is_active and not has_stored_scores and not is_draft_complete:
             return jsonify({
                 'leaderboardRows': [],
                 'isOfficiallyComplete': False,
@@ -1253,8 +2998,128 @@ def get_tournament_player_scores(tournament_id):
         return jsonify({'error': str(e)}), 500
 
 # Helper function to calculate average odds
+def extract_player_photo_url(player_entry):
+    """Best-effort extraction of a player headshot URL from SportsData odds payload."""
+    if not isinstance(player_entry, dict):
+        return None
+
+    direct_keys = [
+        'PhotoUrl',
+        'PhotoURL',
+        'PlayerImageUrl',
+        'PlayerImageURL',
+        'HeadshotUrl',
+        'HeadshotURL',
+        'ImageUrl',
+        'ImageURL',
+        'Photo',
+    ]
+
+    for key in direct_keys:
+        value = player_entry.get(key)
+        if isinstance(value, str) and value.strip().lower().startswith('http'):
+            return value.strip()
+
+    # Fallback: scan any field that looks like image/photo/headshot URL.
+    for key, value in player_entry.items():
+        if not isinstance(value, str):
+            continue
+        key_l = str(key).lower()
+        if ('photo' in key_l or 'image' in key_l or 'headshot' in key_l) and value.strip().lower().startswith('http'):
+            return value.strip()
+
+    return None
+
+
+def fetch_sportsdata_headshot_maps(force_refresh=False):
+    """Fetch and cache SportsData headshots, returning maps by normalized name and player id."""
+    cache_key = ('sportsdata_headshots', 'v1')
+
+    if not force_refresh and cache_key in CACHE:
+        cached_data, timestamp = CACHE[cache_key]
+        if (time.time() - timestamp) < HEADSHOT_CACHE_TTL_SECONDS:
+            return cached_data
+
+    try:
+        response = requests.get(
+            SPORTSDATA_HEADSHOTS_ENDPOINT,
+            params={"key": SPORTSDATA_IO_API_KEY},
+            timeout=20
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as e:
+        app.logger.warning(f"Failed to fetch SportsData headshots: {e}")
+        return {'by_name': {}, 'by_id': {}}
+
+    if not isinstance(payload, list):
+        app.logger.warning("SportsData headshots response was not a list")
+        return {'by_name': {}, 'by_id': {}}
+
+    by_name = {}
+    by_id = {}
+    for entry in payload:
+        if not isinstance(entry, dict):
+            continue
+
+        photo_url = extract_player_photo_url(entry)
+        if not photo_url:
+            continue
+
+        player_id = entry.get('PlayerID') or entry.get('PlayerId') or entry.get('PgaPlayerID')
+        player_name = entry.get('Name') or entry.get('PlayerName') or entry.get('DisplayName')
+
+        normalized_name = normalize_player_name(player_name)
+        if normalized_name and normalized_name not in by_name:
+            by_name[normalized_name] = photo_url
+
+        if player_id is not None:
+            by_id[str(player_id)] = photo_url
+
+    maps = {'by_name': by_name, 'by_id': by_id}
+    CACHE[cache_key] = (maps, time.time())
+    return maps
+
+
+def enrich_player_odds_with_headshots(player_rows):
+    """Ensure player odds rows include photoUrl when possible via SportsData headshots API."""
+    if not isinstance(player_rows, list) or not player_rows:
+        return player_rows
+
+    headshot_maps = fetch_sportsdata_headshot_maps()
+    by_name = headshot_maps.get('by_name', {})
+    by_id = headshot_maps.get('by_id', {})
+
+    enriched = []
+    for row in player_rows:
+        if not isinstance(row, dict):
+            enriched.append(row)
+            continue
+
+        updated = dict(row)
+        current_photo = updated.get('photoUrl') or updated.get('PhotoUrl')
+        player_id = updated.get('playerId') or updated.get('PlayerID') or updated.get('PlayerId')
+        player_name = updated.get('name') or updated.get('Name') or updated.get('playerName')
+
+        if not current_photo:
+            lookup_photo = None
+            if player_id is not None:
+                lookup_photo = by_id.get(str(player_id))
+            if not lookup_photo:
+                lookup_photo = by_name.get(normalize_player_name(player_name))
+
+            if lookup_photo:
+                updated['photoUrl'] = lookup_photo
+
+        enriched.append(updated)
+
+    return enriched
+
+
 def calculate_average_odds(player_odds_data):
     player_odds_map = {}
+    player_metadata_map = {}
+
     for player_entry in player_odds_data:
         player_name = player_entry.get("Name")
         odds_to_win = player_entry.get("OddsToWin")
@@ -1265,19 +3130,63 @@ def calculate_average_odds(player_odds_data):
                     player_odds_map[player_name].append(numeric_odds)
                 else:
                     player_odds_map[player_name] = [numeric_odds]
+
+                if player_name not in player_metadata_map:
+                    player_metadata_map[player_name] = {
+                        'playerId': player_entry.get('PlayerID') or player_entry.get('PlayerId'),
+                        'photoUrl': extract_player_photo_url(player_entry)
+                    }
+                else:
+                    # Preserve first non-empty metadata, fill gaps from later entries.
+                    if not player_metadata_map[player_name].get('playerId'):
+                        player_metadata_map[player_name]['playerId'] = player_entry.get('PlayerID') or player_entry.get('PlayerId')
+                    if not player_metadata_map[player_name].get('photoUrl'):
+                        player_metadata_map[player_name]['photoUrl'] = extract_player_photo_url(player_entry)
             except ValueError:
                 app.logger.warning(f"Could not parse odds for {player_name}: {odds_to_win}")
                 continue
+
     averaged_odds = []
     for player_name, odds_array in player_odds_map.items():
         valid_odds = [odds for odds in odds_array if odds > 0]
+        metadata = player_metadata_map.get(player_name, {})
         if valid_odds:
             average = sum(valid_odds) / len(valid_odds)
-            averaged_odds.append({"name": player_name, "averageOdds": average})
+            averaged_odds.append({
+                "name": player_name,
+                "averageOdds": average,
+                "playerId": metadata.get('playerId'),
+                "photoUrl": metadata.get('photoUrl')
+            })
         else:
-            averaged_odds.append({"name": player_name, "averageOdds": None})
+            averaged_odds.append({
+                "name": player_name,
+                "averageOdds": None,
+                "playerId": metadata.get('playerId'),
+                "photoUrl": metadata.get('photoUrl')
+            })
+
     averaged_odds.sort(key=lambda x: x['averageOdds'] if x['averageOdds'] is not None else float('inf'))
     return averaged_odds
+
+
+def fetch_normalized_player_odds(odds_id):
+    """Fetch live odds from SportsData.io for `odds_id` and normalize them into the
+    same `[{name, averageOdds, playerId, photoUrl, headshot}, ...]` shape used by
+    `DraftLockedOdds`. Returns (odds_list, tournament_meta). Raises on HTTP / data errors."""
+    if not odds_id:
+        raise ValueError("odds_id is required")
+    endpoint = f"https://api.sportsdata.io/v3/golf/odds/json/TournamentOdds/{odds_id}"
+    response = requests.get(endpoint, params={"key": SPORTSDATA_IO_API_KEY}, timeout=15)
+    response.raise_for_status()
+    data = response.json() or {}
+    raw_player_odds = data.get("PlayerTournamentOdds") or []
+    if not raw_player_odds:
+        raise ValueError("SportsData.io response missing PlayerTournamentOdds")
+    averaged = calculate_average_odds(raw_player_odds)
+    averaged = enrich_player_odds_with_headshots(averaged)
+    return averaged, data.get("Tournament") or {}
+
 
 # --- Player Odds API Route (ENHANCED) ---
 @app.route('/api/player_odds', methods=['GET'])
@@ -1297,54 +3206,57 @@ def get_player_odds():
 
         if tournament_doc and tournament_doc.exists:
             tournament_data = tournament_doc.to_dict()
-            if tournament_data.get('IsDraftStarted') and tournament_data.get('DraftLockedOdds'):
-                app.logger.info(f"Returning LOCKED draft odds for tournament with oddsId: {odds_id}")
-                return jsonify(tournament_data['DraftLockedOdds'])
+            locked_odds = tournament_data.get('DraftLockedOdds')
+            if locked_odds:
+                app.logger.info(f"Returning locked draft odds from Firestore for oddsId: {odds_id}")
+                locked_odds = enrich_player_odds_with_headshots(tournament_data['DraftLockedOdds'])
+                return jsonify(locked_odds)
 
     except Exception as e:
         app.logger.error(f"Error checking Firestore for locked odds for oddsId {odds_id}: {e}")
 
-    # Fetch fresh player odds from SportsData.io if not locked
-    cache_key_params = request.args.to_dict()
-    cache_key = ('player_odds', tuple(sorted(cache_key_params.items())))
+    # Odds not yet locked — return empty list (draft board not yet available)
+    app.logger.info(f"Draft odds not yet locked for oddsId: {odds_id}, returning empty list")
+    return jsonify([]), 200
 
-    if cache_key in CACHE:
-        cached_data, timestamp = CACHE[cache_key]
-        if (time.time() - timestamp) < CACHE_TTL_SECONDS:
-            app.logger.info("Returning cached data for player odds (live).")
-            return jsonify(cached_data)
 
-    app.logger.info("Fetching fresh player odds from SportsData.io.")
-    dynamic_odds_api_endpoint = f"https://api.sportsdata.io/v3/golf/odds/json/TournamentOdds/{odds_id}"
-    params = {"key": SPORTSDATA_IO_API_KEY}
-    
-    try:
-        response = requests.get(dynamic_odds_api_endpoint, params=params)
-        response.raise_for_status()
-        data = response.json()
-        if not data or not data.get("PlayerTournamentOdds"):
-            app.logger.warning("SportsData.io response missing PlayerTournamentOdds for oddsId: %s", odds_id)
-            return jsonify({"error": "Unexpected API response structure for player odds."}), 500
+@app.route('/api/player_headshots', methods=['GET'])
+def get_player_headshots():
+    """Return cached player headshots, optionally filtered by a comma-separated names query."""
+    names_param = (request.args.get('names') or '').strip()
+    force_refresh = request.args.get('forceRefresh', 'false').lower() == 'true'
 
-        raw_player_odds = data["PlayerTournamentOdds"]
-        averaged_odds_list = calculate_average_odds(raw_player_odds)
-        CACHE[cache_key] = (averaged_odds_list, time.time())
-        return jsonify(averaged_odds_list)
-    except requests.exceptions.RequestException as e:
-        app.logger.error(f"Error fetching player odds from SportsData.io for oddsId {odds_id}: {e}")
-        details = str(e)
-        if e.response is not None:
-            details += f" | Status: {e.response.status_code} | Content: {e.response.text}"
-        return jsonify({"error": "Failed to fetch player odds data", "details": details}), 500
-    except ValueError:
-        app.logger.error("Failed to parse JSON response from SportsData.io (player odds) for oddsId %s", odds_id)
-        return jsonify({"error": "Invalid JSON response from external API"}), 500
+    headshot_maps = fetch_sportsdata_headshot_maps(force_refresh=force_refresh)
+    by_name = headshot_maps.get('by_name', {})
+
+    # If no names are provided, return full normalized map.
+    if not names_param:
+        return jsonify({
+            'headshotsByName': by_name,
+            'count': len(by_name),
+            'cacheTtlSeconds': HEADSHOT_CACHE_TTL_SECONDS
+        })
+
+    requested_names = [name.strip() for name in names_param.split(',') if name and name.strip()]
+    filtered = {}
+    for raw_name in requested_names:
+        normalized_name = normalize_player_name(raw_name)
+        if normalized_name and normalized_name in by_name:
+            filtered[normalized_name] = by_name[normalized_name]
+
+    return jsonify({
+        'headshotsByName': filtered,
+        'requestedCount': len(requested_names),
+        'matchedCount': len(filtered),
+        'cacheTtlSeconds': HEADSHOT_CACHE_TTL_SECONDS
+    })
 
 # --- Annual Championship Calculation API ---
 # OLD annual championship endpoint removed - see line 2555 for new year-filtered version
 
 # --- Debug API Routes ---
 @app.route('/api/tournaments/<tournament_id>/debug', methods=['GET'])
+@require_tournament_admin()
 def debug_tournament_structure(tournament_id):
     """Debug endpoint to see the actual tournament structure in Firestore"""
     if not db:
@@ -1374,6 +3286,7 @@ def debug_tournament_structure(tournament_id):
 
 # --- Stored Scores Management API ---
 @app.route('/api/tournaments/<tournament_id>/stored_scores', methods=['GET'])
+@require_tournament_admin()
 def get_tournament_stored_scores(tournament_id):
     """Get stored team scores for a tournament"""
     if not db:
@@ -1401,6 +3314,7 @@ def get_tournament_stored_scores(tournament_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/tournaments/<tournament_id>/recalculate_scores', methods=['POST'])
+@require_tournament_admin()
 def force_recalculate_scores(tournament_id):
     """Force recalculation and storage of team scores"""
     if not db:
@@ -1499,6 +3413,7 @@ def get_global_teams():
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/global_teams', methods=['POST'])
+@require_any_league_admin
 def create_global_team():
     """Create a new global team for a specific year"""
     if not db:
@@ -1539,6 +3454,7 @@ def create_global_team():
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/global_teams/<team_id>', methods=['PUT'])
+@require_any_league_admin
 def update_global_team(team_id):
     """Update a global team"""
     if not db:
@@ -1601,6 +3517,7 @@ def update_global_team(team_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/global_teams/<team_id>', methods=['DELETE'])
+@require_any_league_admin
 def delete_global_team(team_id):
     """Delete a global team"""
     if not db:
@@ -1619,6 +3536,7 @@ def delete_global_team(team_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/global_teams/copy_year', methods=['POST'])
+@require_any_league_admin
 def copy_global_teams_year():
     """Copy all global teams from one year to another"""
     if not db:
@@ -1705,6 +3623,7 @@ def get_team_preferred_tournaments(team_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/global_teams/<team_id>/preferred_tournaments', methods=['PUT'])
+@require_any_league_admin
 def update_team_preferred_tournaments(team_id):
     """Update preferred tournaments for a specific team"""
     if not db:
@@ -1749,6 +3668,7 @@ def update_team_preferred_tournaments(team_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/global_teams/<team_id>/preferred_tournaments/<tournament_id>', methods=['POST'])
+@require_any_league_admin
 def add_preferred_tournament(team_id, tournament_id):
     """Add a tournament to team's preferred tournaments"""
     if not db:
@@ -1794,6 +3714,7 @@ def add_preferred_tournament(team_id, tournament_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/global_teams/<team_id>/preferred_tournaments/<tournament_id>', methods=['DELETE'])
+@require_any_league_admin
 def remove_preferred_tournament(team_id, tournament_id):
     """Remove a tournament from team's preferred tournaments"""
     if not db:
@@ -1834,6 +3755,7 @@ def remove_preferred_tournament(team_id, tournament_id):
 # --- Tournament Team Assignment API Routes ---
 
 @app.route('/api/tournaments/<tournament_id>/team_assignments', methods=['GET'])
+@require_tournament_member()
 def get_tournament_team_assignments(tournament_id):
     """Get team assignments for a tournament"""
     if not db:
@@ -1853,6 +3775,7 @@ def get_tournament_team_assignments(tournament_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/tournaments/<tournament_id>/team_assignments', methods=['PUT'])
+@require_tournament_admin()
 def update_tournament_team_assignments(tournament_id):
     """Update team assignments for a tournament (which global teams participate)"""
     if not db:
@@ -1889,6 +3812,7 @@ def update_tournament_team_assignments(tournament_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/tournaments/<tournament_id>/sync_teams', methods=['POST'])
+@require_tournament_admin()
 def sync_tournament_teams(tournament_id):
     """Sync tournament teams from global_teams (only allowed before draft starts)"""
     if not db:
@@ -1958,6 +3882,8 @@ def sync_tournament_teams(tournament_id):
 # --- Tournament Management API Routes (MODIFIED) ---
 
 @app.route('/api/tournaments', methods=['POST'])
+@require_auth
+@limiter.limit("10 per minute; 100 per hour")
 def create_tournament():
     if not db:
         app.logger.error("Firestore DB not initialized.")
@@ -1967,14 +3893,52 @@ def create_tournament():
         if not data or 'name' not in data:
             return jsonify({"error": "Missing 'name' for new tournament"}), 400
 
+        league_id = (data.get('leagueId', '') or '').strip()
+        if not league_id:
+            return jsonify({"error": "Missing 'leagueId' for new tournament"}), 400
+        if not _is_league_admin(request.uid, league_id):
+            return jsonify({"error": "League admin access required"}), 403
+
         tournament_name = data['name'].strip()
+        if not tournament_name:
+            return jsonify({"error": "Tournament name is required"}), 400
+        if len(tournament_name) > 120:
+            return jsonify({"error": "Tournament name too long (max 120 characters)"}), 400
         org_id = data.get('orgId', '1').strip()
         tourn_id = data.get('tournId', '').strip()
         year = data.get('year', '').strip()
         odds_id = data.get('oddsId', '').strip()
+        league_id = data.get('leagueId', '').strip()
+        start_date = (data.get('startDate') or '').strip()[:10]
+        end_date = (data.get('endDate') or '').strip()[:10]
 
         if not tournament_name or not tourn_id or not year or not odds_id:
             return jsonify({"error": "Missing tournament name, Tourn ID, Year, or Odds ID in request data"}), 400
+
+        # If dates not supplied (e.g. Quick Create from config), look them up from the PGA schedule API
+        if (not start_date or not end_date) and tourn_id and year:
+            try:
+                schedule_data, _ = make_rapidapi_request(
+                    '/schedule', {'year': year, 'orgId': org_id},
+                    bypass_rate_limit=True,
+                    request_source="create_tournament_date_lookup"
+                )
+                if schedule_data:
+                    match_item = next(
+                        (s for s in schedule_data.get('schedule', [])
+                         if str(s.get('tournId', '')) == tourn_id),
+                        None
+                    )
+                    if match_item:
+                        date_field = match_item.get('date', {})
+                        if isinstance(date_field, str):
+                            start_date = start_date or _parse_rapidapi_date(date_field) or ''
+                        elif isinstance(date_field, dict):
+                            start_date = start_date or _parse_rapidapi_date(date_field.get('start')) or ''
+                            end_date = end_date or _parse_rapidapi_date(date_field.get('end')) or ''
+                        app.logger.info(f"Resolved dates for tournId {tourn_id}: {start_date} – {end_date}")
+            except Exception as date_err:
+                app.logger.warning(f"Could not resolve tournament dates from schedule: {date_err}")
 
         new_tournament_data = {
             "name": tournament_name,
@@ -1982,17 +3946,40 @@ def create_tournament():
             "tournId": tourn_id,
             "year": year,
             "oddsId": odds_id,
+            "leagueId": league_id,
+            "startDate": start_date,
+            "endDate": end_date,
+            "par": 72,
             "teams": [],  # Legacy field for backward compatibility
             "teamAssignments": [],  # New field for global team references
-            "IsDraftStarted": False, # NEW: Initialize IsDraftStarted to false
-            "IsDraftComplete": False, # NEW: Initialize IsDraftComplete to false
-            "DraftLockedOdds": [],   # NEW: Initialize empty array for locked odds
+            "IsDraftStarted": False,
+            "IsDraftComplete": False,
+            "DraftLockedOdds": [],
+            "PreviewOdds": [],
+            "PreviewOddsUpdatedAt": None,
             "createdAt": firestore.SERVER_TIMESTAMP
         }
         doc_ref = db.collection('tournaments').add(new_tournament_data)
         tournament_id = doc_ref[1].id
 
+        # Best-effort seed of preview odds so the new tournament has something to
+        # render on the pre-lock draft board. Failure here must NOT block creation.
+        if odds_id:
+            try:
+                preview_odds, _ = fetch_normalized_player_odds(odds_id)
+                doc_ref[1].update({
+                    "PreviewOdds": preview_odds,
+                    "PreviewOddsUpdatedAt": firestore.SERVER_TIMESTAMP,
+                })
+                app.logger.info(f"Seeded {len(preview_odds)} preview odds for new tournament {tournament_id}")
+            except Exception as preview_err:
+                app.logger.warning(f"Could not seed preview odds for new tournament {tournament_id}: {preview_err}")
+
         # Auto-assign all global teams for this year to the new tournament
+        # Skip for league-based tournaments — teams[] will be populated at lock_draft_odds time
+        if league_id:
+            return jsonify({"message": "Tournament created successfully", "id": tournament_id, "name": tournament_name, "teamsAssigned": 0}), 201
+
         try:
             # Fetch teams for the year (removed order_by to avoid composite index requirement)
             global_teams_ref = db.collection('global_teams').where('year', '==', year).get()
@@ -2056,18 +4043,29 @@ def get_tournament_years():
 
 
 @app.route('/api/tournaments', methods=['GET'])
+@require_auth
 def get_tournaments():
     if not db:
         app.logger.error("Firestore DB not initialized.")
         return jsonify({"error": "Firestore not initialized"}), 500
     try:
         year_filter = request.args.get('year')
+        league_id_filter = request.args.get('leagueId')
+        # Restrict to leagues the caller belongs to (super-admin sees all → None).
+        allowed_league_ids = _user_league_ids(request.uid)
+        if league_id_filter and allowed_league_ids is not None and league_id_filter not in allowed_league_ids:
+            return jsonify([]), 200
         tournaments_ref = db.collection('tournaments').order_by('createdAt').get()
         tournaments_list = []
         for doc in tournaments_ref:
             tournament_data = doc.to_dict()
             tournament_year = tournament_data.get('year', '')
+            t_league_id = tournament_data.get('leagueId', '')
             if year_filter and tournament_year != year_filter:
+                continue
+            if league_id_filter and t_league_id != league_id_filter:
+                continue
+            if allowed_league_ids is not None and t_league_id not in allowed_league_ids:
                 continue
             tournaments_list.append({
                 "id": doc.id,
@@ -2080,6 +4078,7 @@ def get_tournaments():
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/tournaments/<tournament_id>', methods=['GET'])
+@require_tournament_member()
 def get_single_tournament(tournament_id):
     if not db:
         app.logger.error("Firestore DB not initialized.")
@@ -2095,63 +4094,148 @@ def get_single_tournament(tournament_id):
         tournament_data = doc.to_dict()
         odds_id = tournament_data.get("oddsId")
 
-        # Initialize default values for API-derived status
-        is_in_progress_from_api = False
-        is_over_from_api = False
-        tournament_par = tournament_data.get("par", 71)
-        odds_api_data = {}  # Initialize to prevent UnboundLocalError
+        # Derive IsInProgress / IsOver from stored dates — no SportsData.io call at runtime
+        today = datetime.utcnow().date()
+        start_str = tournament_data.get('startDate', '')
+        end_str = tournament_data.get('endDate', '')
 
-        # Fetch IsInProgress and IsOver from SportsData.io Tournament Odds API
-        if odds_id:
-            sportsdata_io_tournament_odds_endpoint = f"https://api.sportsdata.io/v3/golf/odds/json/TournamentOdds/{odds_id}"
-            params = {"key": SPORTSDATA_IO_API_KEY}
+        # Lazy date backfill: older tournaments may have been created without dates
+        # (before the schedule lookup existed). Fetch from RapidAPI /tournament once.
+        dates_missing = not start_str or not end_str
+        if (
+            dates_missing
+            and not tournament_data.get('DatesFetchAttempted')
+            and tournament_data.get('tournId')
+        ):
             try:
-                cache_key = ('sportsdata_tournament_details', odds_id)
-                if cache_key in CACHE:
-                    cached_odds_data, timestamp = CACHE[cache_key]
-                    if (time.time() - timestamp) < CACHE_TTL_SECONDS:
-                        app.logger.info(f"Returning cached SportsData.io tournament details for oddsId {odds_id}.")
-                        odds_api_data = cached_odds_data
+                td, te = make_rapidapi_request(
+                    '/tournament',
+                    {
+                        'orgId': tournament_data.get('orgId', '1'),
+                        'tournId': tournament_data.get('tournId'),
+                        'year': tournament_data.get('year', '2025'),
+                    },
+                    request_source=f"tournament_dates_backfill_{tournament_id}",
+                )
+                update_payload = {'DatesFetchAttempted': True}
+                if td and not te:
+                    date_field = td.get('date') or {}
+                    if isinstance(date_field, dict):
+                        new_start = _parse_rapidapi_date(date_field.get('start')) or ''
+                        new_end = _parse_rapidapi_date(date_field.get('end')) or ''
+                    elif isinstance(date_field, str):
+                        new_start = _parse_rapidapi_date(date_field) or ''
+                        new_end = ''
                     else:
-                        del CACHE[cache_key]
-                        app.logger.warning(f"Cached SportsData.io data for {odds_id} expired, refetching.")
-                        response = requests.get(sportsdata_io_tournament_odds_endpoint, params=params)
-                        response.raise_for_status()
-                        odds_api_data = response.json()
-                        CACHE[cache_key] = (odds_api_data, time.time())
-                else:
-                    app.logger.info(f"Fetching live SportsData.io tournament details for oddsId {odds_id}.")
-                    response = requests.get(sportsdata_io_tournament_odds_endpoint, params=params)
-                    response.raise_for_status()
-                    odds_api_data = response.json()
-                    CACHE[cache_key] = (odds_api_data, time.time())
+                        new_start = ''
+                        new_end = ''
+                    if not start_str and new_start:
+                        start_str = new_start
+                        update_payload['startDate'] = new_start
+                    if not end_str and new_end:
+                        end_str = new_end
+                        update_payload['endDate'] = new_end
+                doc_ref.update(update_payload)
+            except Exception as date_err:
+                app.logger.warning(f"Could not backfill dates for {tournament_id}: {date_err}")
 
-
-                if odds_api_data and odds_api_data.get("Tournament"):
-                    is_in_progress_from_api = odds_api_data["Tournament"].get("IsInProgress", False)
-                    is_over_from_api = odds_api_data["Tournament"].get("IsOver", False)
-                    tournament_par = odds_api_data["Tournament"].get("Par", tournament_par)
-                else:
-                    app.logger.warning(f"SportsData.io response missing 'Tournament' info for oddsId: {odds_id}")
-
-            except requests.exceptions.RequestException as e:
-                app.logger.error(f"Error fetching live tournament status from SportsData.io for oddsId {odds_id}: {e}")
+        is_in_progress = False
+        is_over = False
+        if start_str:
+            try:
+                start_d = datetime.strptime(start_str[:10], '%Y-%m-%d').date()
+                end_d = datetime.strptime(end_str[:10], '%Y-%m-%d').date() if end_str else start_d + timedelta(days=3)
+                is_in_progress = start_d <= today <= end_d
+                is_over = today > end_d
             except ValueError:
-                app.logger.error(f"Failed to parse JSON response from SportsData.io (tournament status) for oddsId {odds_id}")
+                pass
 
-        # Combine logic: Frontend should show leaderboard if in progress OR over
-        show_leaderboard_on_frontend = is_in_progress_from_api or is_over_from_api
+        tournament_par = tournament_data.get('par', 72)
 
-        # Combine Firestore data with the live status and potential updated Par
+        # Build Tournament info from stored Firestore metadata (populated at lock time)
+        stored_meta = tournament_data.get('tournamentMeta', {})
+
+        # Lazy course-name backfill: ensure the course name is available regardless
+        # of tournament lifecycle status. If the stored metadata doesn't have a course
+        # name and we haven't already tried to fetch it, ask RapidAPI's /tournament
+        # endpoint once and persist the result. We use a `CourseFetchAttempted` flag
+        # to avoid repeated calls when the upstream simply doesn't have a course.
+        course_name = stored_meta.get('CourseName', '')
+        if (
+            not course_name
+            and not stored_meta.get('CourseFetchAttempted')
+            and tournament_data.get('tournId')
+        ):
+            try:
+                t_data, t_err = make_rapidapi_request(
+                    '/tournament',
+                    {
+                        'orgId': tournament_data.get('orgId', '1'),
+                        'tournId': tournament_data.get('tournId'),
+                        'year': tournament_data.get('year', '2025'),
+                    },
+                    request_source=f"tournament_info_backfill_{tournament_id}",
+                )
+                if t_data and not t_err:
+                    # Common field names across providers; pick the first non-empty value.
+                    course_name = (
+                        t_data.get('courseName')
+                        or t_data.get('CourseName')
+                        or (t_data.get('courses', [{}])[0].get('courseName') if isinstance(t_data.get('courses'), list) and t_data.get('courses') else '')
+                        or (t_data.get('Courses', [{}])[0].get('Name') if isinstance(t_data.get('Courses'), list) and t_data.get('Courses') else '')
+                        or ''
+                    )
+                # Persist whatever we found (even empty), plus the attempt flag, so we
+                # don't hammer the upstream on every read for tournaments without a course.
+                new_meta = dict(stored_meta)
+                new_meta['CourseName'] = course_name
+                new_meta['CourseFetchAttempted'] = True
+                doc_ref.update({'tournamentMeta': new_meta})
+                stored_meta = new_meta
+            except Exception as course_err:
+                app.logger.warning(f"Could not backfill course name for {tournament_id}: {course_err}")
+
+        tournament_info_obj = {
+            "Name": tournament_data.get('name', ''),
+            "StartDate": start_str,
+            "EndDate": end_str,
+            "Par": tournament_par,
+            "Venue": stored_meta.get('Venue', ''),
+            "CourseName": course_name or stored_meta.get('CourseName', ''),
+            "Status": tournament_data.get('status', ''),
+            "CurrentRound": stored_meta.get('CurrentRound'),
+            "Courses": stored_meta.get('Courses', []),
+        }
+
+        # Canonical lifecycleState - single source of truth for tournament phase.
+        # Order matters: finished > live > draft_complete > draft_active > odds_locked > created.
+        is_finished_finalized = bool(
+            tournament_data.get('isOfficiallyComplete')
+            or tournament_data.get('isComplete')
+        )
+        if is_over or is_finished_finalized:
+            lifecycle_state = 'finished'
+        elif is_in_progress or tournament_data.get('isActive'):
+            lifecycle_state = 'live'
+        elif tournament_data.get('IsDraftComplete'):
+            lifecycle_state = 'draft_complete'
+        elif tournament_data.get('IsDraftStarted'):
+            lifecycle_state = 'draft_active'
+        elif tournament_data.get('oddsId'):
+            lifecycle_state = 'odds_locked'
+        else:
+            lifecycle_state = 'created'
+
         response_data = {
             "id": doc.id,
             **tournament_data,
-            "IsInProgress": show_leaderboard_on_frontend,
-            "IsOver": is_over_from_api,
+            "IsInProgress": is_in_progress or is_over,
+            "IsOver": is_over,
             "par": tournament_par,
             "IsDraftStarted": tournament_data.get('IsDraftStarted', False),
-            "Tournament": odds_api_data.get("Tournament", {}),
-            "status": odds_api_data.get("Tournament", {}).get("Status", "")
+            "Tournament": tournament_info_obj,
+            "status": tournament_data.get('status', ''),
+            "lifecycleState": lifecycle_state,
         }
         return jsonify(response_data), 200
 
@@ -2160,6 +4244,7 @@ def get_single_tournament(tournament_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/tournaments/<tournament_id>/teams', methods=['PUT'])
+@require_tournament_admin()
 def update_tournament_teams(tournament_id):
     if not db:
         app.logger.error("Firestore DB not initialized.")
@@ -2212,6 +4297,7 @@ def update_tournament_teams(tournament_id):
 
 # NEW: API endpoint to start the draft and lock in odds
 @app.route('/api/tournaments/<tournament_id>/start_draft', methods=['POST'])
+@require_tournament_admin()
 def start_draft(tournament_id):
     if not db:
         app.logger.error("Firestore DB not initialized.")
@@ -2246,13 +4332,33 @@ def start_draft(tournament_id):
 
             raw_player_odds = data["PlayerTournamentOdds"]
             averaged_odds_list = calculate_average_odds(raw_player_odds)
+            averaged_odds_list = enrich_player_odds_with_headshots(averaged_odds_list)
 
-            # Store the locked odds and set the flag
+            # Store tournament metadata from this one-time API call so we never need to call again
+            tourn_meta = data.get("Tournament", {})
+            meta_update = {}
+            if tourn_meta:
+                meta_update['tournamentMeta'] = {
+                    'Venue': tourn_meta.get('Venue') or tourn_meta.get('Location', ''),
+                    'Courses': tourn_meta.get('Courses', []),
+                    'CurrentRound': tourn_meta.get('CurrentRound'),
+                }
+                if tourn_meta.get('Par'):
+                    meta_update['par'] = tourn_meta['Par']
+
             doc_ref.update({
                 "IsDraftStarted": True,
                 "DraftLockedOdds": averaged_odds_list,
-                "DraftStartedAt": firestore.SERVER_TIMESTAMP # Optional: Timestamp when draft started
+                "DraftStartedAt": firestore.SERVER_TIMESTAMP,
+                **meta_update,
             })
+
+            # Push notifications: notify all team owners + first picker.
+            try:
+                fresh = doc_ref.get().to_dict() or {}
+                draft_notifications.notify_draft_started(db, tournament_id, fresh)
+            except Exception as notify_err:
+                app.logger.warning(f"notify_draft_started failed for {tournament_id}: {notify_err}")
 
             return jsonify({"message": f"Draft started and odds locked for tournament {tournament_id}."}), 200
 
@@ -2271,6 +4377,7 @@ def start_draft(tournament_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/tournaments/<tournament_id>/start_draft_flag', methods=['POST'])
+@require_tournament_admin()
 def start_draft_flag(tournament_id):
     if not db:
         app.logger.error("Firestore DB not initialized.")
@@ -2287,17 +4394,25 @@ def start_draft_flag(tournament_id):
             "IsDraftStarted": True,
             "DraftStartedAt": firestore.SERVER_TIMESTAMP
         })
+        try:
+            fresh = doc_ref.get().to_dict() or {}
+            draft_notifications.notify_draft_started(db, tournament_id, fresh)
+        except Exception as notify_err:
+            app.logger.warning(f"notify_draft_started failed for {tournament_id}: {notify_err}")
         return jsonify({"message": f"Draft started for tournament {tournament_id}."}), 200
     except Exception as e:
         app.logger.error(f"Error starting draft flag for tournament {tournament_id}: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/tournaments/<tournament_id>/lock_draft_odds', methods=['POST'])
+@require_tournament_admin()
 def lock_draft_odds(tournament_id):
+    """Lock odds, build team list from enrolled league members (opt-out model), randomize draft order."""
     if not db:
         app.logger.error("Firestore DB not initialized.")
         return jsonify({"error": "Firestore not initialized"}), 500
     try:
+        import random as _random
         doc_ref = db.collection('tournaments').document(tournament_id)
         doc = doc_ref.get()
         if not doc.exists:
@@ -2306,26 +4421,217 @@ def lock_draft_odds(tournament_id):
         odds_id = tournament_data.get("oddsId")
         if not odds_id:
             return jsonify({"error": "Tournament does not have an Odds ID configured."}), 400
-        dynamic_odds_api_endpoint = f"https://api.sportsdata.io/v3/golf/odds/json/TournamentOdds/{odds_id}"
-        params = {"key": SPORTSDATA_IO_API_KEY}
-        response = requests.get(dynamic_odds_api_endpoint, params=params)
-        response.raise_for_status()
-        data = response.json()
-        if not data or not data.get("PlayerTournamentOdds"):
-            return jsonify({"error": "Could not retrieve live odds to lock in. API response missing player data."}), 500
-        raw_player_odds = data["PlayerTournamentOdds"]
-        averaged_odds_list = calculate_average_odds(raw_player_odds)
+
+        # --- 1. Build enrolled team list from league members (opt-out model) ---
+        league_id = tournament_data.get("leagueId", "")
+        teams = []
+        if league_id:
+            members_ref = db.collection('leagues').document(league_id).collection('members').stream()
+            for member_doc in members_ref:
+                m = member_doc.to_dict()
+                uid = member_doc.id
+                # Exclude members who have opted out of this tournament
+                opted_out = db.collection('users').document(uid).get()
+                opted_out_ids = []
+                member_participates_in_annual = bool(m.get('participatesInAnnual', True))
+                if opted_out.exists:
+                    user_data = opted_out.to_dict()
+                    opted_out_ids = user_data.get('optedOutTournaments', [])
+                if tournament_id not in opted_out_ids:
+                    teams.append({
+                        "name": m.get("teamName") or m.get("displayName") or m.get("email", uid),
+                        "ownerUid": uid,
+                        "ownerEmail": m.get("email", ""),
+                        "golferNames": [],
+                        "draftOrder": None,
+                        "participatesInAnnual": member_participates_in_annual,
+                    })
+
+        if not teams:
+            return jsonify({"error": "No enrolled participants found for this tournament."}), 400
+
+        # Ensure every team has a unique name — append email prefix on collision
+        teams = _deduplicate_team_names(teams)
+
+        # --- 2. Randomize draft order ---
+        order = list(range(1, len(teams) + 1))
+        _random.shuffle(order)
+        for i, team in enumerate(teams):
+            team["draftOrder"] = order[i]
+        teams.sort(key=lambda t: t["draftOrder"])
+
+        # --- 3. Fetch and lock odds ---
+        try:
+            averaged_odds_list, tourn_meta = fetch_normalized_player_odds(odds_id)
+        except Exception as fetch_err:
+            return jsonify({"error": f"Could not retrieve live odds to lock in: {fetch_err}"}), 500
+
+        # Store how many players form the "tiered" draft pool (4 × num_teams),
+        # but keep the full list in DraftLockedOdds so search works across all players.
+        num_teams = len(teams)
+        draft_pool_size = 4 * num_teams
+
+        # Store tournament metadata from this one-time API call so get_single_tournament never re-calls
+        meta_update = {}
+        if tourn_meta:
+            meta_update['tournamentMeta'] = {
+                'Venue': tourn_meta.get('Venue') or tourn_meta.get('Location', ''),
+                'Courses': tourn_meta.get('Courses', []),
+                'CurrentRound': tourn_meta.get('CurrentRound'),
+            }
+            if tourn_meta.get('Par'):
+                meta_update['par'] = tourn_meta['Par']
+
         doc_ref.update({
+            "teams": teams,
+            "draftPicks": [],
             "DraftLockedOdds": averaged_odds_list,
-            "DraftOddsLockedAt": firestore.SERVER_TIMESTAMP
+            "draftPoolSize": draft_pool_size,
+            "DraftOddsLockedAt": firestore.SERVER_TIMESTAMP,
+            "numTeams": num_teams,
+            **meta_update,
         })
-        return jsonify({"message": f"Draft odds locked for tournament {tournament_id}."}), 200
+        app.logger.info(f"Draft odds locked for {tournament_id}: {num_teams} teams, {len(averaged_odds_list)} players ({draft_pool_size} in tier pool)")
+        return jsonify({
+            "message": f"Draft odds locked for tournament {tournament_id}.",
+            "numTeams": num_teams,
+            "teams": [{"name": t["name"], "draftOrder": t["draftOrder"]} for t in teams],
+        }), 200
     except Exception as e:
         app.logger.error(f"Error locking draft odds for tournament {tournament_id}: {e}")
         return jsonify({"error": str(e)}), 500
 
+
+# --- Preview Odds (pre-lock-in draft board) ---
+
+PREVIEW_ODDS_REFRESH_AGE = timedelta(days=7)
+
+
+def _refresh_preview_odds_for_doc(doc_ref, tournament_data):
+    """Internal helper: fetch + persist preview odds for one tournament doc.
+    Returns (success, message). Does NOT validate lifecycle — caller must check."""
+    odds_id = tournament_data.get("oddsId")
+    if not odds_id:
+        return False, "Tournament has no oddsId configured"
+    try:
+        preview_odds, _ = fetch_normalized_player_odds(odds_id)
+    except Exception as e:
+        return False, f"Could not fetch odds: {e}"
+    doc_ref.update({
+        "PreviewOdds": preview_odds,
+        "PreviewOddsUpdatedAt": firestore.SERVER_TIMESTAMP,
+    })
+    return True, f"Refreshed {len(preview_odds)} preview odds"
+
+
+@app.route('/api/tournaments/<tournament_id>/preview_odds', methods=['GET'])
+@require_tournament_member()
+def get_preview_odds(tournament_id):
+    """Public read of pre-lock-in draft odds + the timestamp they were captured.
+    Once draft odds are locked, callers should use /api/player_odds instead."""
+    if not db:
+        return jsonify({"error": "Firestore not initialized"}), 500
+    try:
+        doc_ref = db.collection('tournaments').document(tournament_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return jsonify({"error": "Tournament not found"}), 404
+        data = doc.to_dict()
+        is_locked = bool(data.get("DraftLockedOdds"))
+
+        # Lazy refresh: if odds are missing or older than PREVIEW_ODDS_REFRESH_AGE
+        # and the draft is not yet locked, refresh them on read. No user action required.
+        if not is_locked:
+            updated_at_raw = data.get("PreviewOddsUpdatedAt")
+            has_odds = bool(data.get("PreviewOdds"))
+            is_stale = True
+            if has_odds and hasattr(updated_at_raw, 'tzinfo'):
+                try:
+                    ts = updated_at_raw if updated_at_raw.tzinfo else updated_at_raw.replace(tzinfo=timezone.utc)
+                    is_stale = (datetime.now(timezone.utc) - ts) > PREVIEW_ODDS_REFRESH_AGE
+                except Exception:
+                    is_stale = True
+            if not has_odds or is_stale:
+                ok, message = _refresh_preview_odds_for_doc(doc_ref, data)
+                if ok:
+                    doc = doc_ref.get()
+                    data = doc.to_dict()
+                else:
+                    app.logger.info(f"Lazy preview-odds refresh skipped for {tournament_id}: {message}")
+
+        updated_at = data.get("PreviewOddsUpdatedAt")
+        return jsonify({
+            "odds": data.get("PreviewOdds") or [],
+            "updatedAt": updated_at.isoformat() if hasattr(updated_at, 'isoformat') else None,
+            "isLocked": is_locked,
+        }), 200
+    except Exception as e:
+        app.logger.error(f"Error fetching preview odds for {tournament_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/tournaments/<tournament_id>/refresh_preview_odds', methods=['POST'])
+@require_tournament_admin()
+def refresh_preview_odds(tournament_id):
+    """Manually refresh preview odds for a tournament that has not yet locked its draft."""
+    if not db:
+        return jsonify({"error": "Firestore not initialized"}), 500
+    try:
+        doc_ref = db.collection('tournaments').document(tournament_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return jsonify({"error": "Tournament not found"}), 404
+        data = doc.to_dict()
+        if data.get("DraftLockedOdds"):
+            return jsonify({"error": "Draft odds are already locked for this tournament."}), 400
+        ok, message = _refresh_preview_odds_for_doc(doc_ref, data)
+        status_code = 200 if ok else 502
+        return jsonify({"message": message}), status_code
+    except Exception as e:
+        app.logger.error(f"Error refreshing preview odds for {tournament_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+def refresh_stale_preview_odds():
+    """Scheduled job: refresh preview odds for any unlocked tournament whose
+    `PreviewOddsUpdatedAt` is older than `PREVIEW_ODDS_REFRESH_AGE`, or missing."""
+    if not db:
+        app.logger.warning("Preview-odds refresh skipped: Firestore not initialized")
+        return
+    try:
+        cutoff = datetime.now(timezone.utc) - PREVIEW_ODDS_REFRESH_AGE
+        refreshed = 0
+        skipped = 0
+        # We can't easily query on (DraftLockedOdds == []) so we stream candidates and filter.
+        # Limit to tournaments created in the past 18 months to bound the scan cost.
+        recent_cutoff = datetime.now(timezone.utc) - timedelta(days=540)
+        docs = db.collection('tournaments').where('createdAt', '>=', recent_cutoff).stream()
+        for doc in docs:
+            data = doc.to_dict()
+            if data.get('DraftLockedOdds'):
+                continue  # locked — skip
+            if not data.get('oddsId'):
+                continue
+            updated_at = data.get('PreviewOddsUpdatedAt')
+            if updated_at and hasattr(updated_at, 'replace'):
+                # Firestore timestamps come back as timezone-aware datetimes.
+                if updated_at > cutoff:
+                    skipped += 1
+                    continue
+            ok, message = _refresh_preview_odds_for_doc(doc.reference, data)
+            if ok:
+                refreshed += 1
+                app.logger.info(f"Preview odds refreshed for {doc.id}: {message}")
+            else:
+                app.logger.warning(f"Preview odds refresh failed for {doc.id}: {message}")
+        app.logger.info(f"Preview odds refresh complete: {refreshed} refreshed, {skipped} still fresh")
+    except Exception as e:
+        app.logger.error(f"Error in refresh_stale_preview_odds: {e}")
+
 @app.route('/api/tournaments/<tournament_id>/draft_status', methods=['GET'])
+@require_tournament_member()
 def get_draft_status(tournament_id):
+    """Return draft state including picks, whose turn it is, and tier info."""
     if not db:
         app.logger.error("Firestore DB not initialized.")
         return jsonify({"error": "Firestore not initialized"}), 500
@@ -2335,20 +4641,186 @@ def get_draft_status(tournament_id):
         if not doc.exists:
             return jsonify({"error": "Tournament not found"}), 404
         tournament_data = doc.to_dict()
+
         is_draft_started = tournament_data.get('IsDraftStarted', False)
         draft_locked_odds = tournament_data.get('DraftLockedOdds', [])
-        is_draft_locked = bool(draft_locked_odds and len(draft_locked_odds) > 0)
+        is_draft_locked = bool(draft_locked_odds)
         is_draft_complete = tournament_data.get('IsDraftComplete', False)
+
+        teams = tournament_data.get('teams', [])
+        num_teams = len(teams)
+        draft_picks = tournament_data.get('draftPicks', [])
+        draft_pool_size = tournament_data.get('draftPoolSize', 4 * num_teams)
+
+        # Determine whose turn it is using snake draft
+        current_pick_team = None
+        current_round = None
+        current_tier = None
+        if is_draft_started and not is_draft_complete and num_teams > 0:
+            next_pick_number = len(draft_picks) + 1  # 1-based
+            total_picks = 4 * num_teams
+            if next_pick_number <= total_picks:
+                round_idx = (next_pick_number - 1) // num_teams   # 0-based round (0-3)
+                pick_in_round = (next_pick_number - 1) % num_teams # 0-based within round
+                sorted_teams = sorted(teams, key=lambda t: t.get('draftOrder', 999))
+                if round_idx % 2 == 0:  # odd round (0,2): forward order
+                    team = sorted_teams[pick_in_round]
+                else:                    # even round (1,3): reverse order
+                    team = sorted_teams[num_teams - 1 - pick_in_round]
+                current_pick_team = {
+                    "name": team.get("name"),
+                    "ownerUid": team.get("ownerUid"),
+                    "ownerEmail": team.get("ownerEmail", ""),
+                    "draftOrder": team.get("draftOrder"),
+                }
+                current_round = round_idx + 1   # 1-based
+                current_tier = round_idx + 1    # tier == round in this scheme
+
         return jsonify({
             "IsDraftStarted": is_draft_started,
             "IsDraftLocked": is_draft_locked,
-            "IsDraftComplete": is_draft_complete
+            "IsDraftComplete": is_draft_complete,
+            "numTeams": num_teams,
+            "draftPoolSize": draft_pool_size,
+            "draftPicks": draft_picks,
+            "teams": teams,
+            "DraftLockedOdds": draft_locked_odds,
+            "currentPickTeam": current_pick_team,
+            "currentRound": current_round,
+            "currentTier": current_tier,
         }), 200
     except Exception as e:
         app.logger.error(f"Error fetching draft status for tournament {tournament_id}: {e}")
         return jsonify({"error": str(e)}), 500
 
+
+@app.route('/api/tournaments/<tournament_id>/picks', methods=['POST'])
+@require_auth
+def make_draft_pick(tournament_id):
+    """Submit a draft pick. Caller must be the team whose turn it is (or admin)."""
+    if not db:
+        return jsonify({"error": "Firestore not initialized"}), 500
+    try:
+        data = request.json or {}
+        player_name = (data.get('playerName') or '').strip()
+        if not player_name:
+            return jsonify({"error": "playerName is required"}), 400
+
+        doc_ref = db.collection('tournaments').document(tournament_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return jsonify({"error": "Tournament not found"}), 404
+        tournament_data = doc.to_dict()
+
+        if not tournament_data.get('IsDraftStarted'):
+            return jsonify({"error": "Draft has not started yet"}), 400
+        if tournament_data.get('IsDraftComplete'):
+            return jsonify({"error": "Draft is already complete"}), 400
+
+        teams = tournament_data.get('teams', [])
+        num_teams = len(teams)
+        draft_picks = tournament_data.get('draftPicks', [])
+        locked_odds = tournament_data.get('DraftLockedOdds', [])
+        total_picks = 4 * num_teams
+
+        if len(draft_picks) >= total_picks:
+            return jsonify({"error": "All picks have been made"}), 400
+
+        # Determine whose turn
+        next_pick_number = len(draft_picks) + 1
+        round_idx = (next_pick_number - 1) // num_teams
+        pick_in_round = (next_pick_number - 1) % num_teams
+        sorted_teams = sorted(teams, key=lambda t: t.get('draftOrder', 999))
+        if round_idx % 2 == 0:
+            current_team = sorted_teams[pick_in_round]
+        else:
+            current_team = sorted_teams[num_teams - 1 - pick_in_round]
+
+        # Check caller is admin or the team owner
+        caller_uid = request.uid
+        is_admin_caller = False
+        user_doc = db.collection('users').document(caller_uid).get()
+        if user_doc.exists and user_doc.to_dict().get('role') == 'admin':
+            is_admin_caller = True
+
+        if not is_admin_caller and current_team.get('ownerUid') != caller_uid:
+            return jsonify({
+                "error": f"It is not your turn. Current pick belongs to: {current_team.get('name')}"
+            }), 403
+
+        # Validate player exists in the locked odds list
+        all_picked = {p['playerName'] for p in draft_picks}
+        if player_name in all_picked:
+            return jsonify({"error": f"{player_name} has already been picked"}), 400
+
+        locked_names = [p['name'] for p in locked_odds]
+        if player_name not in locked_names:
+            return jsonify({"error": f"{player_name} is not in the draft board. You must pick a golfer from the locked odds list."}), 400
+
+        # Slot index is determined by the current round (0-3), not player position in odds list.
+        # This allows free-pick from any tier — the round determines which golferNames slot to fill.
+        actual_tier_idx = round_idx  # round_idx is already 0-based (0–3)
+
+        # Validate slot availability for the current team
+        target_team = next((t for t in teams if t.get('ownerUid') == current_team.get('ownerUid')), None)
+        if target_team is None:
+            return jsonify({"error": "Team not found for current user"}), 400
+
+        golfer_names = list(target_team.get('golferNames') or [])
+        while len(golfer_names) < 4:
+            golfer_names.append(None)
+
+        if golfer_names[actual_tier_idx]:
+            return jsonify({"error": f"Round {actual_tier_idx + 1} slot is already filled for your team"}), 400
+
+        # Record pick
+        new_pick = {
+            "pickNumber": next_pick_number,
+            "playerName": player_name,
+            "teamName": current_team.get('name'),
+            "ownerUid": current_team.get('ownerUid'),
+            "round": round_idx + 1,
+            "tier": actual_tier_idx + 1,
+            "isAutoPick": False,
+            "pickedAt": datetime.now().isoformat(),
+        }
+        draft_picks.append(new_pick)
+
+        # Update team's golferNames (tier-indexed)
+        golfer_names[actual_tier_idx] = player_name
+        target_team['golferNames'] = golfer_names
+
+        update_data = {
+            "draftPicks": draft_picks,
+            "teams": teams,
+        }
+
+        # Auto-complete if all picks made
+        if len(draft_picks) >= total_picks:
+            update_data["IsDraftComplete"] = True
+            update_data["DraftCompletedAt"] = firestore.SERVER_TIMESTAMP
+
+        doc_ref.update(update_data)
+        app.logger.info(f"Pick #{next_pick_number}: {player_name} → {current_team.get('name')} (tournament {tournament_id})")
+
+        # Push notifications: either next picker is on the clock or the draft completed.
+        try:
+            fresh = doc_ref.get().to_dict() or {}
+            if fresh.get('IsDraftComplete'):
+                draft_notifications.notify_draft_complete(db, tournament_id, fresh)
+            else:
+                draft_notifications.notify_your_turn(db, tournament_id, fresh)
+        except Exception as notify_err:
+            app.logger.warning(f"draft notify failed for {tournament_id}: {notify_err}")
+
+        return jsonify({"message": "Pick recorded", "pick": new_pick, "draftComplete": len(draft_picks) >= total_picks}), 200
+
+    except Exception as e:
+        app.logger.error(f"Error recording pick for tournament {tournament_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/api/tournaments/<tournament_id>/complete_draft', methods=['POST'])
+@require_tournament_admin()
 def complete_draft(tournament_id):
     if not db:
         app.logger.error("Firestore DB not initialized.")
@@ -2362,13 +4834,120 @@ def complete_draft(tournament_id):
             "IsDraftComplete": True,
             "DraftCompletedAt": firestore.SERVER_TIMESTAMP
         })
+        try:
+            fresh = doc_ref.get().to_dict() or {}
+            draft_notifications.notify_draft_complete(db, tournament_id, fresh)
+        except Exception as notify_err:
+            app.logger.warning(f"notify_draft_complete failed for {tournament_id}: {notify_err}")
         return jsonify({"message": f"Draft marked complete for tournament {tournament_id}."}), 200
     except Exception as e:
         app.logger.error(f"Error marking draft complete for tournament {tournament_id}: {e}")
         return jsonify({"error": str(e)}), 500
 
+
+@app.route('/api/tournaments/<tournament_id>/admin_edit_pick', methods=['POST'])
+@require_tournament_admin()
+def admin_edit_pick(tournament_id):
+    """Admin-only: add or remove a golfer from any team's draft picks."""
+    if not db:
+        return jsonify({"error": "Firestore not initialized"}), 500
+    try:
+        caller_uid = request.uid
+        user_doc = db.collection('users').document(caller_uid).get()
+        if not user_doc.exists or user_doc.to_dict().get('role') != 'admin':
+            return jsonify({"error": "Admin access required"}), 403
+
+        data = request.json or {}
+        action = data.get('action')  # "add" or "remove"
+        owner_uid = (data.get('ownerUid') or '').strip()
+        player_name = (data.get('playerName') or '').strip()
+
+        if action not in ('add', 'remove'):
+            return jsonify({"error": "action must be 'add' or 'remove'"}), 400
+        if not owner_uid or not player_name:
+            return jsonify({"error": "ownerUid and playerName are required"}), 400
+
+        doc_ref = db.collection('tournaments').document(tournament_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return jsonify({"error": "Tournament not found"}), 404
+        tournament_data = doc.to_dict()
+
+        if not tournament_data.get('IsDraftLocked'):
+            return jsonify({"error": "Draft must be locked before editing picks"}), 400
+
+        teams = list(tournament_data.get('teams', []))
+        draft_picks = list(tournament_data.get('draftPicks', []))
+        locked_odds = tournament_data.get('DraftLockedOdds', [])
+        num_teams = len(teams)
+        total_picks = 4 * num_teams
+
+        target_team = next((t for t in teams if t.get('ownerUid') == owner_uid), None)
+        if target_team is None:
+            return jsonify({"error": "Team not found for given ownerUid"}), 404
+
+        golfer_names = list(target_team.get('golferNames') or [])
+        while len(golfer_names) < 4:
+            golfer_names.append(None)
+
+        if action == 'remove':
+            if player_name not in golfer_names:
+                return jsonify({"error": f"{player_name} is not on this team"}), 400
+            slot_idx = golfer_names.index(player_name)
+            golfer_names[slot_idx] = None
+            target_team['golferNames'] = golfer_names
+            draft_picks = [p for p in draft_picks if not (
+                p.get('playerName') == player_name and p.get('ownerUid') == owner_uid
+            )]
+            update_data = {"teams": teams, "draftPicks": draft_picks, "IsDraftComplete": False}
+            doc_ref.update(update_data)
+            app.logger.info(f"Admin removed {player_name} from {target_team.get('name')} (tournament {tournament_id})")
+            return jsonify({"message": f"Removed {player_name} from {target_team.get('name')}"}), 200
+
+        else:  # add
+            locked_names = {p['name'] for p in locked_odds}
+            if player_name not in locked_names:
+                return jsonify({"error": f"{player_name} is not in the locked draft board"}), 400
+            all_picked = {p['playerName'] for p in draft_picks}
+            if player_name in all_picked:
+                return jsonify({"error": f"{player_name} has already been picked by another team"}), 400
+            # Find first empty slot
+            try:
+                slot_idx = golfer_names.index(None)
+            except ValueError:
+                return jsonify({"error": "This team already has 4 picks"}), 400
+
+            golfer_names[slot_idx] = player_name
+            target_team['golferNames'] = golfer_names
+            new_pick = {
+                "pickNumber": len(draft_picks) + 1,
+                "playerName": player_name,
+                "teamName": target_team.get('name'),
+                "ownerUid": owner_uid,
+                "round": slot_idx + 1,
+                "tier": slot_idx + 1,
+                "isAutoPick": False,
+                "isAdminPick": True,
+                "pickedAt": datetime.now().isoformat(),
+            }
+            draft_picks.append(new_pick)
+            is_complete = len(draft_picks) >= total_picks
+            update_data = {"teams": teams, "draftPicks": draft_picks}
+            if is_complete:
+                update_data["IsDraftComplete"] = True
+                update_data["DraftCompletedAt"] = firestore.SERVER_TIMESTAMP
+            doc_ref.update(update_data)
+            app.logger.info(f"Admin added {player_name} to {target_team.get('name')} slot {slot_idx} (tournament {tournament_id})")
+            return jsonify({"message": f"Added {player_name} to {target_team.get('name')}", "draftComplete": is_complete}), 200
+
+    except Exception as e:
+        app.logger.error(f"Error in admin_edit_pick for tournament {tournament_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 # NEW: API endpoint to get draft order information
 @app.route('/api/tournaments/<tournament_id>/draft_order', methods=['GET'])
+@require_tournament_member()
 def get_draft_order(tournament_id):
     if not db:
         app.logger.error("Firestore DB not initialized.")
@@ -2477,6 +5056,7 @@ def optimize_response(data, request_args=None):
 
 # --- Batch API Endpoint ---
 @app.route('/api/batch', methods=['POST'])
+@require_admin
 @performance_monitor
 def batch_requests():
     """Handle multiple API requests in a single call"""
@@ -2790,6 +5370,91 @@ class TournamentMonitor:
         except Exception as e:
             self.app.logger.error(f"Error in tournament monitoring: {e}")
 
+def auto_pick_expired_drafts():
+    """At 8 PM the evening before a tournament starts, auto-pick remaining slots
+    for any draft that is started but not yet complete.
+    Rule: pick the best available player (lowest averageOdds) in the current tier."""
+    if not db:
+        return
+    try:
+        tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
+        # Find tournaments whose draft is started but not complete
+        tournaments_ref = db.collection('tournaments') \
+            .where('IsDraftStarted', '==', True) \
+            .where('IsDraftComplete', '==', False).stream()
+
+        for t_doc in tournaments_ref:
+            t_data = t_doc.to_dict()
+            t_id = t_doc.id
+
+            # Only auto-pick if tournament starts tomorrow
+            start_date = t_data.get('startDate') or t_data.get('StartDate') or ''
+            if not start_date or str(start_date)[:10] != tomorrow:
+                continue
+
+            teams = t_data.get('teams', [])
+            num_teams = len(teams)
+            if num_teams == 0:
+                continue
+            locked_odds = t_data.get('DraftLockedOdds', [])
+            draft_picks = t_data.get('draftPicks', [])
+            total_picks = 4 * num_teams
+
+            app.logger.info(f"Auto-pick: filling {total_picks - len(draft_picks)} remaining picks for tournament {t_id}")
+
+            all_picked = {p['playerName'] for p in draft_picks}
+            sorted_teams = sorted(teams, key=lambda t: t.get('draftOrder', 999))
+
+            while len(draft_picks) < total_picks:
+                next_pick_number = len(draft_picks) + 1
+                round_idx = (next_pick_number - 1) // num_teams
+                pick_in_round = (next_pick_number - 1) % num_teams
+                if round_idx % 2 == 0:
+                    current_team = sorted_teams[pick_in_round]
+                else:
+                    current_team = sorted_teams[num_teams - 1 - pick_in_round]
+
+                tier_start = round_idx * num_teams
+                tier_end = (round_idx + 1) * num_teams
+                tier_players = locked_odds[tier_start:tier_end]
+
+                # Best available = first in tier not yet picked
+                chosen = next((p['name'] for p in tier_players if p['name'] not in all_picked), None)
+                if not chosen:
+                    app.logger.warning(f"Auto-pick: no available player in tier {round_idx+1} for tournament {t_id}")
+                    break
+
+                new_pick = {
+                    "pickNumber": next_pick_number,
+                    "playerName": chosen,
+                    "teamName": current_team.get('name'),
+                    "ownerUid": current_team.get('ownerUid'),
+                    "round": round_idx + 1,
+                    "tier": round_idx + 1,
+                    "isAutoPick": True,
+                    "pickedAt": datetime.now().isoformat(),
+                }
+                draft_picks.append(new_pick)
+                all_picked.add(chosen)
+
+                for team in teams:
+                    if team.get('ownerUid') == current_team.get('ownerUid'):
+                        golfer_names = list(team.get('golferNames') or [])
+                        while len(golfer_names) < 4:
+                            golfer_names.append(None)
+                        golfer_names[round_idx] = chosen
+                        team['golferNames'] = golfer_names
+                        break
+
+            update_data = {"draftPicks": draft_picks, "teams": teams, "IsDraftComplete": True,
+                           "DraftCompletedAt": firestore.SERVER_TIMESTAMP}
+            db.collection('tournaments').document(t_id).update(update_data)
+            app.logger.info(f"Auto-pick complete for tournament {t_id}")
+
+    except Exception as e:
+        app.logger.error(f"Error in auto_pick_expired_drafts: {e}")
+
+
 def start_tournament_monitoring():
     """Start the automated tournament monitoring system with tournament-day scheduling"""
     from apscheduler.schedulers.background import BackgroundScheduler
@@ -2824,7 +5489,26 @@ def start_tournament_monitoring():
     scheduler.start()
     app.logger.info(f"Tournament monitoring system started - {len(tournament_times)} daily checks during tournament hours")
     app.logger.info("Schedule: 07:30-21:00 (45-minute intervals) = 19 calls/day + 1 buffer")
-    
+
+    # Auto-pick job: 8 PM every evening — fills any incomplete drafts for tomorrow's tournaments
+    scheduler.add_job(
+        func=auto_pick_expired_drafts,
+        trigger=CronTrigger(hour=20, minute=0),
+        id='auto_pick_expired_drafts',
+        name='Auto-pick expired drafts at 20:00',
+        replace_existing=True
+    )
+
+    # Preview-odds refresh: 03:30 daily — refreshes preview odds for any unlocked
+    # tournament whose odds are older than 7 days (no-op for ones that are fresh).
+    scheduler.add_job(
+        func=refresh_stale_preview_odds,
+        trigger=CronTrigger(hour=3, minute=30),
+        id='refresh_stale_preview_odds',
+        name='Refresh stale preview odds (>7d) at 03:30',
+        replace_existing=True
+    )
+
     # Shut down the scheduler when exiting the app
     atexit.register(lambda: scheduler.shutdown())
 
@@ -2845,22 +5529,26 @@ def get_annual_championship():
     
     # Get year parameter from query string (default to current year)
     year = request.args.get('year', str(datetime.now().year))
+    league_id = request.args.get('leagueId', '').strip()
     force_refresh = request.args.get('refresh', 'false').lower() == 'true'
     include_in_progress = request.args.get('includeInProgress', 'false').lower() == 'true'
-    app.logger.info(f"Fetching annual championship data for year: {year}, includeInProgress: {include_in_progress}")
-    
-    # Create year-specific cache key (include includeInProgress in cache key)
-    cache_key = f'annual_championship_{year}:inProgress:{include_in_progress}'
+    app.logger.info(f"Fetching annual championship data for year: {year}, leagueId: {league_id or 'all'}")
+
+    # Create year+league+inProgress specific cache key
+    cache_key = f'annual_championship_{year}_{league_id or "global"}:inProgress:{include_in_progress}'
     cached_result = cache.get(cache_key)
     if cached_result and not force_refresh:
         app.logger.info(f"Returning cached annual championship data for year {year}")
         return jsonify(cached_result)
     
     try:
-        # Fetch tournaments for the specified year only
-        tournaments_ref = db.collection('tournaments').where('year', '==', year).get()
+        # Fetch tournaments for the specified year (and optionally leagueId)
+        query = db.collection('tournaments').where('year', '==', year)
+        if league_id:
+            query = query.where('leagueId', '==', league_id)
+        tournaments_ref = query.get()
         all_tournament_docs = list(tournaments_ref)
-        app.logger.info(f"Found {len(all_tournament_docs)} tournament(s) in Firestore for year '{year}'")
+        app.logger.info(f"Found {len(all_tournament_docs)} tournament(s) in Firestore for year '{year}'" + (f", leagueId '{league_id}'" if league_id else ""))
         annual_standings = {}
         processed_tournaments = []
         skipped_tournaments = []
@@ -3043,6 +5731,532 @@ def _generate_invite_code(length=8):
 
 LEAGUE_DOC = ('config', 'league')
 
+# ---------------------------------------------------------------------------
+# Multi-league endpoints  (/api/leagues/*)
+# Old single-league /api/league* endpoints remain below for V1 backward compat.
+# ---------------------------------------------------------------------------
+
+@app.route('/api/leagues', methods=['POST'])
+@require_auth
+@limiter.limit("5 per minute; 30 per hour")
+def create_league():
+    """Create a new league. Any authenticated user may create; the creator becomes that league's admin."""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+    try:
+        data = request.json or {}
+        name = (data.get('name', '') or '').strip() or 'My League'
+        if len(name) > 80:
+            return jsonify({'error': 'League name too long (max 80 characters)'}), 400
+        invite_code = _generate_invite_code()
+        league_data = {
+            'name': name,
+            'inviteCode': invite_code,
+            'adminUid': request.uid,
+            'memberCount': 0,
+            'createdAt': firestore.SERVER_TIMESTAMP,
+        }
+        _, doc_ref = db.collection('leagues').add(league_data)
+        # Auto-enrol the creator as a member so they appear in drafts
+        try:
+            firebase_user = firebase_auth.get_user(request.uid)
+            admin_display_name = firebase_user.display_name or ''
+            admin_email = firebase_user.email or ''
+        except Exception:
+            admin_display_name = ''
+            admin_email = ''
+        doc_ref.collection('members').document(request.uid).set({
+            'uid': request.uid,
+            'email': admin_email,
+            'displayName': admin_display_name,
+            'joinedAt': firestore.SERVER_TIMESTAMP,
+        })
+        doc_ref.update({'memberCount': firestore.Increment(1)})
+        db.collection('users').document(request.uid).set(
+            {'leagueIds': firestore.ArrayUnion([doc_ref.id]), 'inLeague': True},
+            merge=True
+        )
+        app.logger.info(f'League created by {request.uid}: {doc_ref.id} (admin auto-enrolled)')
+        return jsonify({'leagueId': doc_ref.id, 'name': name, 'inviteCode': invite_code, 'memberCount': 1}), 201
+    except Exception as e:
+        app.logger.error(f'Error creating league: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/leagues/mine', methods=['GET'])
+@require_auth
+def get_my_leagues():
+    """List all leagues owned (created) by the current user."""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+    try:
+        docs = db.collection('leagues').where('adminUid', '==', request.uid).get()
+        leagues = []
+        for doc in docs:
+            d = doc.to_dict()
+            leagues.append({
+                'leagueId': doc.id,
+                'name': d.get('name', ''),
+                'inviteCode': d.get('inviteCode', ''),
+                'memberCount': d.get('memberCount', 0),
+            })
+        return jsonify(leagues), 200
+    except Exception as e:
+        app.logger.error(f'Error fetching leagues: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/leagues/join', methods=['POST'])
+@require_auth
+@limiter.limit("10 per minute; 60 per hour")
+def join_league_by_code():
+    """Join a league by invite code — resolves which league from the code"""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+    try:
+        data = request.json or {}
+        invite_code = (data.get('inviteCode', '') or '').strip().upper()
+        if not invite_code:
+            return jsonify({'error': 'inviteCode is required'}), 400
+        # Invite codes are short alphanumeric tokens. Reject anything outside that
+        # shape early — keeps Firestore queries cheap and limits enumeration.
+        if not re.fullmatch(r'[A-Z0-9]{4,16}', invite_code):
+            return jsonify({'error': 'Invalid invite code format'}), 400
+
+        leagues_ref = db.collection('leagues').where('inviteCode', '==', invite_code).limit(1).get()
+        leagues_list = list(leagues_ref)
+        if not leagues_list:
+            return jsonify({'error': 'Invalid invite code'}), 403
+
+        league_doc = leagues_list[0]
+        league_id = league_doc.id
+        league_ref = db.collection('leagues').document(league_id)
+
+        member_ref = league_ref.collection('members').document(request.uid)
+        if member_ref.get().exists:
+            return jsonify({'message': 'Already a member', 'alreadyMember': True, 'leagueId': league_id}), 200
+
+        try:
+            firebase_user = firebase_auth.get_user(request.uid)
+            display_name = firebase_user.display_name or ''
+            email = firebase_user.email or request.user_email or ''
+        except Exception:
+            display_name = ''
+            email = request.user_email or ''
+
+        user_ref = db.collection('users').document(request.uid)
+        user_snapshot = user_ref.get()
+        user_data = user_snapshot.to_dict() if user_snapshot.exists else {}
+
+        incoming_team_name = (data.get('teamName', '') or '').strip()
+        team_name = incoming_team_name or (user_data.get('teamName') or '').strip() or display_name or email
+
+        # Keep annual preference scoped per league membership.
+        default_annual = user_data.get('participatesInAnnual', True)
+        if 'participatesInAnnual' in data:
+            default_annual = bool(data.get('participatesInAnnual'))
+
+        member_ref.set({
+            'uid': request.uid,
+            'email': email,
+            'displayName': display_name,
+            'teamName': team_name,
+            'participatesInAnnual': bool(default_annual),
+            'joinedAt': firestore.SERVER_TIMESTAMP,
+        })
+        league_ref.update({'memberCount': firestore.Increment(1)})
+
+        user_update = {
+            'leagueIds': firestore.ArrayUnion([league_id]),
+            'inLeague': True,  # backward compat
+            'leagueJoinedAt': firestore.SERVER_TIMESTAMP,
+            'teamName': team_name,
+        }
+        if 'participatesInAnnual' in data:
+            user_update['participatesInAnnual'] = bool(data.get('participatesInAnnual'))
+        user_ref.set(user_update, merge=True)
+
+        # If the user provided a new team name, align all league memberships to the global team identity.
+        if incoming_team_name:
+            league_ids = list(set((user_data.get('leagueIds', []) or []) + [league_id]))
+            for lid in league_ids:
+                try:
+                    db.collection('leagues').document(lid).collection('members').document(request.uid).set(
+                        {'teamName': team_name},
+                        merge=True
+                    )
+                except Exception as sync_err:
+                    app.logger.warning(f"Could not sync global teamName for user {request.uid} in league {lid}: {sync_err}")
+
+        app.logger.info(f'User {request.uid} joined league {league_id}')
+        return jsonify({'message': 'Successfully joined the league', 'leagueId': league_id}), 200
+    except Exception as e:
+        app.logger.error(f'Error joining league: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/user/profile', methods=['GET'])
+@require_auth
+def get_user_profile():
+    """Return the current user's profile: auth info + verified league memberships.
+    Cross-checks leagueIds against actual members subcollection records — stale entries are cleaned up."""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+    try:
+        try:
+            firebase_user = firebase_auth.get_user(request.uid)
+            email = firebase_user.email or request.user_email or ''
+            display_name = firebase_user.display_name or ''
+        except Exception:
+            email = request.user_email or ''
+            display_name = ''
+
+        user_doc = db.collection('users').document(request.uid).get()
+        league_ids = []
+        global_team_name = ''
+        if user_doc.exists:
+            user_data = user_doc.to_dict()
+            league_ids = user_data.get('leagueIds', [])
+            global_team_name = (user_data.get('teamName') or '').strip()
+
+        leagues = []
+        stale_ids = []
+        for lid in league_ids:
+            try:
+                league_doc = db.collection('leagues').document(lid).get()
+                if not league_doc.exists:
+                    stale_ids.append(lid)
+                    continue
+                member_doc = db.collection('leagues').document(lid).collection('members').document(request.uid).get()
+                if not member_doc.exists:
+                    stale_ids.append(lid)
+                    continue
+                m = member_doc.to_dict()
+                leagues.append({
+                    'leagueId': lid,
+                    'name': league_doc.to_dict().get('name', ''),
+                    'teamName': global_team_name or m.get('teamName', '') or m.get('displayName', ''),
+                    'participatesInAnnual': m.get('participatesInAnnual', True),
+                    'joinedAt': m.get('joinedAt').isoformat() if m.get('joinedAt') else None,
+                })
+            except Exception as e:
+                app.logger.warning(f"Could not verify league {lid} for user {request.uid}: {e}")
+
+        # Backfill a global team name from membership data if user profile does not have one yet.
+        if not global_team_name and leagues:
+            global_team_name = leagues[0].get('teamName', '') or ''
+            if global_team_name:
+                db.collection('users').document(request.uid).set({'teamName': global_team_name}, merge=True)
+
+        # Clean up stale leagueIds silently so they don't resurface
+        if stale_ids:
+            db.collection('users').document(request.uid).update({
+                'leagueIds': firestore.ArrayRemove(stale_ids)
+            })
+            app.logger.info(f"Cleaned up stale leagueIds {stale_ids} for user {request.uid}")
+
+        return jsonify({
+            'email': email,
+            'displayName': display_name,
+            'teamName': global_team_name,
+            'leagues': leagues,
+        }), 200
+    except Exception as e:
+        app.logger.error(f'Error fetching user profile for {request.uid}: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/user/settings', methods=['GET'])
+@require_auth
+def get_user_settings():
+    """Get the current user's settings (tournament enrolments, annual opt-in)"""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+    try:
+        doc = db.collection('users').document(request.uid).get()
+        if not doc.exists:
+            return jsonify({'enrolledTournaments': [], 'participatesInAnnual': True, 'leagueAnnualPreferences': {}}), 200
+        d = doc.to_dict()
+
+        league_annual_preferences = {}
+        league_ids = d.get('leagueIds', []) or []
+        for lid in league_ids:
+            try:
+                member_doc = db.collection('leagues').document(lid).collection('members').document(request.uid).get()
+                if member_doc.exists:
+                    league_annual_preferences[lid] = bool(member_doc.to_dict().get('participatesInAnnual', True))
+            except Exception as member_err:
+                app.logger.warning(f"Could not read annual preference for user {request.uid} in league {lid}: {member_err}")
+
+        return jsonify({
+            'enrolledTournaments': d.get('enrolledTournaments', []),
+            'participatesInAnnual': d.get('participatesInAnnual', True),
+            'leagueAnnualPreferences': league_annual_preferences,
+            'teamName': d.get('teamName', ''),
+            'notificationPreferences': d.get('notificationPreferences', {
+                'draftOnClock': True,
+                'draftReminder': True,
+                'emailUpdates': False,
+            }),
+        }), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/user/settings', methods=['PUT'])
+@require_auth
+def update_user_settings():
+    """Update the current user's settings (tournament enrolments, annual opt-in)"""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+    try:
+        data = request.json or {}
+        update = {}
+        if 'enrolledTournaments' in data:
+            if not isinstance(data['enrolledTournaments'], list):
+                return jsonify({'error': 'enrolledTournaments must be a list'}), 400
+            update['enrolledTournaments'] = data['enrolledTournaments']
+        if 'participatesInAnnual' in data:
+            update['participatesInAnnual'] = bool(data['participatesInAnnual'])
+
+        if 'notificationPreferences' in data:
+            prefs = data.get('notificationPreferences')
+            if not isinstance(prefs, dict):
+                return jsonify({'error': 'notificationPreferences must be an object'}), 400
+            update['notificationPreferences'] = {
+                'draftOnClock': bool(prefs.get('draftOnClock', True)),
+                'draftReminder': bool(prefs.get('draftReminder', True)),
+                'emailUpdates': bool(prefs.get('emailUpdates', False)),
+            }
+
+        team_name = None
+        if 'teamName' in data:
+            team_name = (data.get('teamName', '') or '').strip()
+            if not team_name:
+                return jsonify({'error': 'teamName cannot be empty'}), 400
+            update['teamName'] = team_name
+        league_annual_preferences = data.get('leagueAnnualPreferences')
+        if league_annual_preferences is not None and not isinstance(league_annual_preferences, dict):
+            return jsonify({'error': 'leagueAnnualPreferences must be an object keyed by leagueId'}), 400
+
+        if not update and league_annual_preferences is None:
+            return jsonify({'error': 'No valid fields provided'}), 400
+        user_ref = db.collection('users').document(request.uid)
+        user_ref.set(update, merge=True)
+
+        if isinstance(league_annual_preferences, dict):
+            for lid, participates in league_annual_preferences.items():
+                lid_text = (lid or '').strip()
+                if not lid_text:
+                    continue
+                member_ref = db.collection('leagues').document(lid_text).collection('members').document(request.uid)
+                member_doc = member_ref.get()
+                if member_doc.exists:
+                    member_ref.set({'participatesInAnnual': bool(participates)}, merge=True)
+
+        # Keep one team identity across all leagues for this user.
+        if team_name:
+            user_snapshot = user_ref.get()
+            league_ids = []
+            if user_snapshot.exists:
+                league_ids = user_snapshot.to_dict().get('leagueIds', []) or []
+            for lid in league_ids:
+                try:
+                    member_ref = db.collection('leagues').document(lid).collection('members').document(request.uid)
+                    if member_ref.get().exists:
+                        member_ref.set({'teamName': team_name}, merge=True)
+                except Exception as sync_err:
+                    app.logger.warning(f"Could not sync teamName for user {request.uid} in league {lid}: {sync_err}")
+
+        return jsonify({'message': 'Settings updated'}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/user/opt_out', methods=['POST'])
+@require_auth
+def opt_out_tournament():
+    """Opt the current user out of (or back into) a specific tournament."""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+    try:
+        data = request.json or {}
+        tournament_id = (data.get('tournamentId') or '').strip()
+        opt_out = data.get('optOut', True)  # True = opt out, False = opt back in
+        if not tournament_id:
+            return jsonify({'error': 'tournamentId is required'}), 400
+        if opt_out:
+            db.collection('users').document(request.uid).set(
+                {'optedOutTournaments': firestore.ArrayUnion([tournament_id])}, merge=True)
+        else:
+            db.collection('users').document(request.uid).set(
+                {'optedOutTournaments': firestore.ArrayRemove([tournament_id])}, merge=True)
+        return jsonify({'message': 'Preference saved', 'optOut': opt_out}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/user/fcm_token', methods=['POST'])
+@require_auth
+def register_fcm_token():
+    """Register an FCM token for the current user (called by the mobile app on login)."""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+    try:
+        data = request.json or {}
+        token = (data.get('token') or '').strip()
+        platform = (data.get('platform') or 'unknown').strip().lower()
+        if not token or len(token) > 4096:
+            return jsonify({'error': 'token is required'}), 400
+        if platform not in ('android', 'ios', 'web', 'unknown'):
+            platform = 'unknown'
+        db.collection('users').document(request.uid).collection('fcmTokens').document(token).set({
+            'platform': platform,
+            'createdAt': firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+        return jsonify({'message': 'Token registered'}), 200
+    except Exception as e:
+        app.logger.error(f"register_fcm_token error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/user/fcm_token', methods=['DELETE'])
+@require_auth
+def unregister_fcm_token():
+    """Remove an FCM token (called on sign-out or when the device invalidates it)."""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+    try:
+        data = request.json or {}
+        token = (data.get('token') or '').strip()
+        if not token:
+            return jsonify({'error': 'token is required'}), 400
+        db.collection('users').document(request.uid).collection('fcmTokens').document(token).delete()
+        return jsonify({'message': 'Token removed'}), 200
+    except Exception as e:
+        app.logger.error(f"unregister_fcm_token error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/leagues/<league_id>', methods=['GET'])
+@require_league_member()
+def get_league_by_id(league_id):
+    """Get league info by ID (members only)"""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+    try:
+        doc = db.collection('leagues').document(league_id).get()
+        if not doc.exists:
+            return jsonify({'error': 'League not found'}), 404
+        d = doc.to_dict()
+        return jsonify({
+            'leagueId': doc.id,
+            'name': d.get('name', ''),
+            'inviteCode': d.get('inviteCode', ''),
+            'memberCount': d.get('memberCount', 0),
+            'adminUid': d.get('adminUid', ''),
+        }), 200
+    except Exception as e:
+        app.logger.error(f'Error fetching league {league_id}: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/leagues/<league_id>', methods=['PUT'])
+@require_league_admin()
+def update_league_by_id(league_id):
+    """Update league name (admin only)"""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+    try:
+        data = request.json or {}
+        name = (data.get('name', '') or '').strip()
+        if not name:
+            return jsonify({'error': 'name is required'}), 400
+        ref = db.collection('leagues').document(league_id)
+        if not ref.get().exists:
+            return jsonify({'error': 'League not found'}), 404
+        ref.update({'name': name, 'updatedAt': firestore.SERVER_TIMESTAMP})
+        return jsonify({'name': name}), 200
+    except Exception as e:
+        app.logger.error(f'Error updating league {league_id}: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/leagues/<league_id>/regenerate_code', methods=['POST'])
+@require_league_admin()
+@limiter.limit("5 per minute; 20 per hour")
+def regenerate_league_code_by_id(league_id):
+    """Generate a new invite code (admin only)"""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+    try:
+        ref = db.collection('leagues').document(league_id)
+        if not ref.get().exists:
+            return jsonify({'error': 'League not found'}), 404
+        new_code = _generate_invite_code()
+        ref.update({'inviteCode': new_code, 'updatedAt': firestore.SERVER_TIMESTAMP})
+        return jsonify({'inviteCode': new_code}), 200
+    except Exception as e:
+        app.logger.error(f'Error regenerating code for {league_id}: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/leagues/<league_id>/members', methods=['GET'])
+@require_league_admin()
+def get_league_members_by_id(league_id):
+    """List all league members (admin only)"""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+    try:
+        members_ref = db.collection('leagues').document(league_id).collection('members').get()
+        members = []
+        for doc in members_ref:
+            d = doc.to_dict()
+            uid = doc.id
+            members.append({
+                'uid': uid,
+                'email': d.get('email', ''),
+                'displayName': d.get('displayName', ''),
+                'teamName': d.get('teamName', ''),
+                'joinedAt': d.get('joinedAt').isoformat() if d.get('joinedAt') else None,
+                'participatesInAnnual': d.get('participatesInAnnual', True),
+            })
+        members.sort(key=lambda m: m.get('joinedAt') or '')
+        return jsonify(members), 200
+    except Exception as e:
+        app.logger.error(f'Error fetching members for {league_id}: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/leagues/<league_id>/members/<member_uid>', methods=['DELETE'])
+@require_league_admin()
+def remove_league_member_by_id(league_id, member_uid):
+    """Remove a member from a league (admin only)"""
+    if not db:
+        return jsonify({'error': 'Firestore not initialized'}), 500
+    if member_uid == request.uid:
+        return jsonify({'error': 'Cannot remove yourself from the league'}), 400
+    try:
+        league_ref = db.collection('leagues').document(league_id)
+        member_ref = league_ref.collection('members').document(member_uid)
+        if not member_ref.get().exists:
+            return jsonify({'error': 'Member not found'}), 404
+        member_ref.delete()
+        league_ref.update({'memberCount': firestore.Increment(-1)})
+        db.collection('users').document(member_uid).set(
+            {'leagueIds': firestore.ArrayRemove([league_id])},
+            merge=True
+        )
+        app.logger.info(f'Member {member_uid} removed from league {league_id} by {request.uid}')
+        return jsonify({'message': 'Member removed'}), 200
+    except Exception as e:
+        app.logger.error(f'Error removing member {member_uid} from {league_id}: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Legacy single-league endpoints (/api/league*)  — V1 backward compat
+# ---------------------------------------------------------------------------
 
 @app.route('/api/league', methods=['GET'])
 def get_league():
@@ -3152,6 +6366,8 @@ def join_league():
         invite_code = (data.get('inviteCode', '') or '').strip().upper()
         if not invite_code:
             return jsonify({'error': 'inviteCode is required'}), 400
+        if not re.fullmatch(r'[A-Z0-9]{4,16}', invite_code):
+            return jsonify({'error': 'Invalid invite code format'}), 400
 
         league_ref = db.collection(LEAGUE_DOC[0]).document(LEAGUE_DOC[1])
         league_doc = league_ref.get()

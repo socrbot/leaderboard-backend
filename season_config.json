@@ -1,0 +1,28 @@
+{
+  "2026": [
+    {
+      "name": "The Masters",
+      "year": "2026",
+      "tournId": "014",
+      "oddsId": "688"
+    },
+    {
+      "name": "PGA Championship",
+      "year": "2026",
+      "tournId": "033",
+      "oddsId": "689"
+    },
+    {
+      "name": "U.S. Open",
+      "year": "2026",
+      "tournId": "026",
+      "oddsId": "690"
+    },
+    {
+      "name": "The Open Championship",
+      "year": "2026",
+      "tournId": "100",
+      "oddsId": "692"
+    }
+  ]
+}

@@ -70,7 +70,7 @@ jobs:
             --execution-environment=gen2
             --ingress=all
             --service-account=1056126670188-compute@developer.gserviceaccount.com
-            --set-secrets=RAPIDAPI_KEY=Rapid-API-RG:latest,SPORTSDATA_IO_API_KEY=Sportsdata-api-RG:latest,FIREBASE_SERVICE_ACCOUNT_KEY_PATH=FireBase_Admin:latest
+            --set-secrets=RAPIDAPI_KEY=Rapid-API-RG:latest,SPORTSDATA_IO_API_KEY=Sportsdata-api-RG:latest,ODDS_API_KEY=OddsAPI:latest,FIREBASE_SERVICE_ACCOUNT_KEY_PATH=FireBase_Admin:latest
 
       - name: Verify deployment
         run: |

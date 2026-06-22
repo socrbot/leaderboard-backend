@@ -4057,6 +4057,7 @@ def get_tournament_years():
 
 
 @app.route('/api/tournaments', methods=['GET'])
+@require_auth
 def get_tournaments():
     if not db:
         app.logger.error("Firestore DB not initialized.")
@@ -4064,14 +4065,8 @@ def get_tournaments():
     try:
         year_filter = request.args.get('year')
         league_id_filter = request.args.get('leagueId')
-        # Optional auth — filter by league if user has memberships, else show all.
-        # Falls back to showing all for anonymous users and pre-migration V1 users
-        # who haven't been backfilled with leagueIds yet.
-        uid = _optional_uid()
-        allowed_league_ids = _user_league_ids(uid) if uid else None
-        # If authenticated but user has no league memberships, show all (V1 backward compat)
-        if allowed_league_ids is not None and len(allowed_league_ids) == 0:
-            allowed_league_ids = None
+        # Restrict to leagues the caller belongs to (super-admin sees all → None).
+        allowed_league_ids = _user_league_ids(request.uid)
         if league_id_filter and allowed_league_ids is not None and league_id_filter not in allowed_league_ids:
             return jsonify([]), 200
         tournaments_ref = db.collection('tournaments').order_by('createdAt').get()

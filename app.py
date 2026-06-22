@@ -54,6 +54,8 @@ cache = Cache(app, config=cache_config)
 _default_cors_origins = ",".join([
     "https://alumni-golf-tournament.web.app",
     "https://alumni-golf-tournament.firebaseapp.com",
+    "https://alumni-golf-tournament-v2.web.app",
+    "https://alumni-golf-tournament-v2.firebaseapp.com",
     "https://aulmni-leaderboard-v2.web.app",
     "https://aulmni-leaderboard-v2.firebaseapp.com",
     "http://localhost:3000",

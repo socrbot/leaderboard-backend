@@ -268,9 +268,25 @@ Update team assignments for a tournament.
 - **Coverage Window:** 7:30 AM - 9:00 PM (13.5 hours)
 
 ### Tournament Status Detection
-- Automatic detection of tournament completion using "Official" status
+- Automatic detection of tournament status from RapidAPI
 - Real-time status monitoring and updates
 - Background job scheduling for continuous monitoring
+
+**Supported Tournament Status Values:**
+- **Scheduled**: Tournament is scheduled but has not yet started
+- **Not Started**: Tournament setup complete but play has not begun
+- **In Progress**: Tournament is currently active and play is ongoing
+- **Suspended**: Play is temporarily stopped (e.g., due to weather conditions)
+- **Complete**: All rounds are finished but not yet officially certified
+- **Official**: Final results are officially certified and complete
+- **Postponed**: Tournament has been postponed to a later date
+- **Cancelled**: Tournament has been cancelled and will not take place
+
+**Status Categories:**
+- **Completed Statuses**: Complete, Official (eligible for annual championship)
+- **Active Statuses**: In Progress, Suspended (tournament monitoring active)
+- **Scheduled Statuses**: Scheduled, Not Started (awaiting tournament start)
+- **Cancelled Statuses**: Cancelled, Postponed (tournament not played)
 
 ### Team Score Calculations
 - Best 3 of 4 players per round

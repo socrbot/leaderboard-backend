@@ -3130,39 +3130,104 @@ def enrich_player_odds_with_headshots(player_rows):
     return enriched
 
 
+def _parse_odds_timestamp(player_entry):
+    """Parse the best available timestamp from a SportsData player odds row."""
+    candidate_fields = [
+        'Updated',
+        'UpdatedUtc',
+        'LastUpdated',
+        'Created',
+        'CreatedUtc',
+    ]
+
+    for field in candidate_fields:
+        raw_value = player_entry.get(field)
+        if not raw_value:
+            continue
+
+        if isinstance(raw_value, datetime):
+            return raw_value
+
+        parsed_value = None
+        if isinstance(raw_value, str):
+            cleaned = raw_value.strip()
+            if cleaned.endswith('Z'):
+                cleaned = cleaned[:-1] + '+00:00'
+            try:
+                parsed_value = datetime.fromisoformat(cleaned)
+            except ValueError:
+                parsed_value = None
+
+        if parsed_value is not None:
+            if parsed_value.tzinfo is not None:
+                parsed_value = parsed_value.astimezone(timezone.utc).replace(tzinfo=None)
+            return parsed_value
+
+    return datetime.min
+
+
+def _sportsbook_key(player_entry):
+    """Return a stable sportsbook key; fallback to a single bucket when missing."""
+    for field in ('SportsbookID', 'Sportsbook', 'SportsbookName', 'Sportbook', 'SportbookName'):
+        raw_value = player_entry.get(field)
+        if raw_value is None:
+            continue
+        normalized = str(raw_value).strip()
+        if normalized:
+            return normalized
+    return '__default__'
+
+
 def calculate_average_odds(player_odds_data):
-    player_odds_map = {}
+    player_latest_rows = {}
     player_metadata_map = {}
 
     for player_entry in player_odds_data:
         player_name = player_entry.get("Name")
         odds_to_win = player_entry.get("OddsToWin")
-        if player_name and odds_to_win is not None:
-            try:
-                numeric_odds = float(odds_to_win)
-                if player_name in player_odds_map:
-                    player_odds_map[player_name].append(numeric_odds)
-                else:
-                    player_odds_map[player_name] = [numeric_odds]
+        if not player_name or odds_to_win is None:
+            continue
 
-                if player_name not in player_metadata_map:
-                    player_metadata_map[player_name] = {
-                        'playerId': player_entry.get('PlayerID') or player_entry.get('PlayerId'),
-                        'photoUrl': extract_player_photo_url(player_entry)
-                    }
-                else:
-                    # Preserve first non-empty metadata, fill gaps from later entries.
-                    if not player_metadata_map[player_name].get('playerId'):
-                        player_metadata_map[player_name]['playerId'] = player_entry.get('PlayerID') or player_entry.get('PlayerId')
-                    if not player_metadata_map[player_name].get('photoUrl'):
-                        player_metadata_map[player_name]['photoUrl'] = extract_player_photo_url(player_entry)
-            except ValueError:
-                app.logger.warning(f"Could not parse odds for {player_name}: {odds_to_win}")
-                continue
+        # Skip entries explicitly marked as unavailable (withdrawn, delisted, etc.).
+        # These often carry placeholder values (e.g. 950000) that corrupt averages.
+        if player_entry.get('IsAvailable') is False:
+            continue
+
+        try:
+            numeric_odds = float(odds_to_win)
+        except ValueError:
+            app.logger.warning(f"Could not parse odds for {player_name}: {odds_to_win}")
+            continue
+
+        if player_name not in player_latest_rows:
+            player_latest_rows[player_name] = {}
+
+        book_key = _sportsbook_key(player_entry)
+        timestamp = _parse_odds_timestamp(player_entry)
+
+        current = player_latest_rows[player_name].get(book_key)
+        if current is None or timestamp >= current['timestamp']:
+            player_latest_rows[player_name][book_key] = {
+                'odds': numeric_odds,
+                'timestamp': timestamp,
+            }
+
+        if player_name not in player_metadata_map:
+            player_metadata_map[player_name] = {
+                'playerId': player_entry.get('PlayerID') or player_entry.get('PlayerId'),
+                'photoUrl': extract_player_photo_url(player_entry)
+            }
+        else:
+            # Preserve first non-empty metadata, fill gaps from later entries.
+            if not player_metadata_map[player_name].get('playerId'):
+                player_metadata_map[player_name]['playerId'] = player_entry.get('PlayerID') or player_entry.get('PlayerId')
+            if not player_metadata_map[player_name].get('photoUrl'):
+                player_metadata_map[player_name]['photoUrl'] = extract_player_photo_url(player_entry)
 
     averaged_odds = []
-    for player_name, odds_array in player_odds_map.items():
-        valid_odds = [odds for odds in odds_array if odds > 0]
+    for player_name, sportsbook_map in player_latest_rows.items():
+        latest_odds = [entry['odds'] for entry in sportsbook_map.values()]
+        valid_odds = [odds for odds in latest_odds if odds > 0]
         metadata = player_metadata_map.get(player_name, {})
         if valid_odds:
             average = sum(valid_odds) / len(valid_odds)

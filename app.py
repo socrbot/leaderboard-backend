@@ -4848,8 +4848,6 @@ def make_draft_pick(tournament_id):
             return jsonify({"error": "Team not found for current user"}), 400
 
         golfer_names = list(target_team.get('golferNames') or [])
-        while len(golfer_names) < 4:
-            golfer_names.append(None)
 
         if golfer_names[actual_tier_idx]:
             return jsonify({"error": f"Round {actual_tier_idx + 1} slot is already filled for your team"}), 400
@@ -4868,7 +4866,10 @@ def make_draft_pick(tournament_id):
         draft_picks.append(new_pick)
 
         # Update team's golferNames (tier-indexed)
-        golfer_names[actual_tier_idx] = player_name
+        if actual_tier_idx < len(golfer_names):
+            golfer_names[actual_tier_idx] = player_name
+        else:
+            golfer_names.append(player_name)
         target_team['golferNames'] = golfer_names
 
         update_data = {
@@ -4968,8 +4969,6 @@ def admin_edit_pick(tournament_id):
             return jsonify({"error": "Team not found for given ownerUid"}), 404
 
         golfer_names = list(target_team.get('golferNames') or [])
-        while len(golfer_names) < 4:
-            golfer_names.append(None)
 
         if action == 'remove':
             if player_name not in golfer_names:
@@ -4992,13 +4991,18 @@ def admin_edit_pick(tournament_id):
             all_picked = {p['playerName'] for p in draft_picks}
             if player_name in all_picked:
                 return jsonify({"error": f"{player_name} has already been picked by another team"}), 400
-            # Find first empty slot
+            # Prefer the first empty slot if one exists; otherwise append the pick.
             try:
-                slot_idx = golfer_names.index(None)
-            except ValueError:
-                return jsonify({"error": "This team already has 4 picks"}), 400
+                slot_idx = next(idx for idx, golfer in enumerate(golfer_names) if not golfer)
+            except StopIteration:
+                if len(golfer_names) >= 4:
+                    return jsonify({"error": "This team already has 4 picks"}), 400
+                slot_idx = len(golfer_names)
 
-            golfer_names[slot_idx] = player_name
+            if slot_idx < len(golfer_names):
+                golfer_names[slot_idx] = player_name
+            else:
+                golfer_names.append(player_name)
             target_team['golferNames'] = golfer_names
             new_pick = {
                 "pickNumber": len(draft_picks) + 1,
@@ -5521,9 +5525,10 @@ def auto_pick_expired_drafts():
                 for team in teams:
                     if team.get('ownerUid') == current_team.get('ownerUid'):
                         golfer_names = list(team.get('golferNames') or [])
-                        while len(golfer_names) < 4:
-                            golfer_names.append(None)
-                        golfer_names[round_idx] = chosen
+                        if round_idx < len(golfer_names):
+                            golfer_names[round_idx] = chosen
+                        else:
+                            golfer_names.append(chosen)
                         team['golferNames'] = golfer_names
                         break
 

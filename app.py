@@ -4427,6 +4427,7 @@ def start_draft(tournament_id):
 
             doc_ref.update({
                 "IsDraftStarted": True,
+                "IsDraftLocked": True,
                 "DraftLockedOdds": averaged_odds_list,
                 "DraftStartedAt": firestore.SERVER_TIMESTAMP,
                 **meta_update,
@@ -4471,6 +4472,7 @@ def start_draft_flag(tournament_id):
             return jsonify({"message": "Draft has already started for this tournament."}), 409
         doc_ref.update({
             "IsDraftStarted": True,
+            "IsDraftLocked": True,
             "DraftStartedAt": firestore.SERVER_TIMESTAMP
         })
         try:
@@ -4952,7 +4954,7 @@ def admin_edit_pick(tournament_id):
             return jsonify({"error": "Tournament not found"}), 404
         tournament_data = doc.to_dict()
 
-        if not tournament_data.get('IsDraftLocked'):
+        if not (tournament_data.get('IsDraftLocked') or tournament_data.get('DraftLockedOdds')):
             return jsonify({"error": "Draft must be locked before editing picks"}), 400
 
         teams = list(tournament_data.get('teams', []))
